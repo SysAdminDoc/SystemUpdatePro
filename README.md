@@ -4,12 +4,12 @@
   <img src="https://img.shields.io/badge/PowerShell-5.1+-blue?logo=powershell&logoColor=white" alt="PowerShell 5.1+">
   <img src="https://img.shields.io/badge/Windows-10%20|%2011%20|%20Server-0078D6?logo=windows&logoColor=white" alt="Windows">
   <img src="https://img.shields.io/badge/License-MIT-green" alt="License">
-  <img src="https://img.shields.io/badge/Version-4.0.0-orange" alt="Version">
+  <img src="https://img.shields.io/badge/Version-4.1.0-orange" alt="Version">
 </p>
 
 **Enterprise-grade, bulletproof system update utility for MSPs and IT professionals.**
 
-SystemUpdatePro is a fully automated, self-healing PowerShell script that handles OEM driver/BIOS updates (Dell, Lenovo, HP), Windows Updates, and application updates via Winget—all without user interaction.
+SystemUpdatePro is a fully automated, self-healing PowerShell script that handles OEM driver/BIOS updates (Dell, Lenovo, HP), Windows Updates, and application updates via Winget---all without user interaction.
 
 ---
 
@@ -18,9 +18,9 @@ SystemUpdatePro is a fully automated, self-healing PowerShell script that handle
 ### Multi-OEM Support
 | Manufacturer | Tool Used | Auto-Install |
 |--------------|-----------|--------------|
-| Dell / Alienware | Dell Command Update CLI | ✅ via Winget |
-| Lenovo | LSUClient PowerShell Module | ✅ via PSGallery |
-| HP | HP Image Assistant | ✅ Auto-download |
+| Dell / Alienware | Dell Command Update CLI | via Winget |
+| Lenovo | LSUClient PowerShell Module | via PSGallery |
+| HP | HP Image Assistant | Auto-download |
 | Other | Windows Update + Winget only | N/A |
 
 ### Self-Healing Capabilities
@@ -35,6 +35,8 @@ SystemUpdatePro is a fully automated, self-healing PowerShell script that handle
 - **Battery Protection**: Blocks BIOS updates when on battery power
 - **BitLocker Awareness**: Handles BitLocker suspension for BIOS updates (Dell auto-suspends; Lenovo/HP skip BIOS when encrypted)
 - **Pending Reboot Detection**: Checks 5 different sources for pending reboots
+- **DryRun Mode**: Preview all available updates without installing anything
+- **Driver Backup**: Export current drivers before installing updates for rollback capability
 
 ### Enterprise Integration
 - **Event Log**: Writes to Windows Application log for RMM/SIEM visibility
@@ -42,6 +44,9 @@ SystemUpdatePro is a fully automated, self-healing PowerShell script that handle
 - **WSUS Bypass**: Option to bypass WSUS and connect directly to Microsoft
 - **Post-Reboot Continuation**: Scheduled task to resume updates after reboot
 - **Log Rotation**: Automatic cleanup of old log files
+- **HTML Reports**: Professional dark-themed HTML summary report after each run
+- **Webhook Notifications**: Send completion status to Slack, Teams, or any generic webhook
+- **Update History**: JSON-based history tracking of all update runs with formatted display
 
 ---
 
@@ -59,7 +64,7 @@ SystemUpdatePro is a fully automated, self-healing PowerShell script that handle
 ### Option 1: Direct Download
 ```powershell
 # Download the script
-Invoke-WebRequest -Uri "https://raw.githubusercontent.com/YOUR_USERNAME/SystemUpdatePro/main/SystemUpdatePro.ps1" -OutFile "SystemUpdatePro.ps1"
+Invoke-WebRequest -Uri "https://raw.githubusercontent.com/SysAdminDoc/SystemUpdatePro/main/SystemUpdatePro.ps1" -OutFile "SystemUpdatePro.ps1"
 
 # Run it
 .\SystemUpdatePro.ps1
@@ -67,7 +72,7 @@ Invoke-WebRequest -Uri "https://raw.githubusercontent.com/YOUR_USERNAME/SystemUp
 
 ### Option 2: Clone Repository
 ```powershell
-git clone https://github.com/YOUR_USERNAME/SystemUpdatePro.git
+git clone https://github.com/SysAdminDoc/SystemUpdatePro.git
 cd SystemUpdatePro
 .\SystemUpdatePro.ps1
 ```
@@ -91,6 +96,45 @@ cd SystemUpdatePro
 .\SystemUpdatePro.ps1 -SkipWindows -SkipWinget
 ```
 
+### Dry Run (Preview Mode)
+```powershell
+# See what updates are available without installing anything
+.\SystemUpdatePro.ps1 -DryRun
+
+# Dry run with BIOS check included
+.\SystemUpdatePro.ps1 -DryRun -IncludeBIOS
+```
+
+### Driver Backup
+```powershell
+# Backup drivers before updating
+.\SystemUpdatePro.ps1 -BackupDrivers
+
+# Backup drivers + include BIOS updates
+.\SystemUpdatePro.ps1 -BackupDrivers -IncludeBIOS -Reboot
+```
+
+### Webhook Notifications
+```powershell
+# Notify Slack on completion
+.\SystemUpdatePro.ps1 -WebhookUrl "https://hooks.slack.com/services/T00/B00/xxx"
+
+# Notify Microsoft Teams
+.\SystemUpdatePro.ps1 -WebhookUrl "https://outlook.office.com/webhook/..."
+
+# Generic webhook (any JSON-accepting endpoint)
+.\SystemUpdatePro.ps1 -WebhookUrl "https://your-api.example.com/webhook"
+```
+
+### Update History
+```powershell
+# Show last 10 update runs
+.\SystemUpdatePro.ps1 -ShowHistory
+
+# Show last 25 update runs
+.\SystemUpdatePro.ps1 -ShowHistory -HistoryCount 25
+```
+
 ### Advanced Usage
 ```powershell
 # Full provisioning workflow with post-reboot continuation
@@ -104,6 +148,9 @@ cd SystemUpdatePro
 
 # Custom configuration
 .\SystemUpdatePro.ps1 -MaxRetries 5 -MaxUpdatePasses 5 -MinDiskSpaceGB 20 -LogRetentionDays 60
+
+# Kitchen sink: backup drivers, dry run with webhook
+.\SystemUpdatePro.ps1 -DryRun -BackupDrivers -WebhookUrl "https://hooks.slack.com/services/..."
 ```
 
 ---
@@ -120,6 +167,11 @@ cd SystemUpdatePro
 | `-RepairWindowsUpdate` | Switch | False | Repair Windows Update components before updating |
 | `-CleanupAfter` | Switch | False | Run DISM component cleanup after updates |
 | `-ContinueAfterReboot` | Switch | False | Create scheduled task to continue after reboot |
+| `-DryRun` | Switch | False | Preview updates without installing |
+| `-BackupDrivers` | Switch | False | Export current drivers before updating |
+| `-ShowHistory` | Switch | False | Display previous update run history |
+| `-WebhookUrl` | String | (none) | Webhook URL for completion notification |
+| `-HistoryCount` | Int | 10 | Number of history entries to show |
 | `-MaxRetries` | Int | 3 | Maximum retry attempts for failed operations |
 | `-MaxUpdatePasses` | Int | 3 | Maximum Windows Update passes |
 | `-MinDiskSpaceGB` | Int | 10 | Minimum free disk space required (GB) |
@@ -171,10 +223,45 @@ Get-EventLog -LogName Application -Source "SystemUpdatePro" -Newest 10
 
 | Path | Purpose |
 |------|---------|
-| `C:\ProgramData\SystemUpdatePro\Logs\` | Log files |
+| `C:\ProgramData\SystemUpdatePro\Logs\` | Log files and HTML reports |
 | `C:\ProgramData\SystemUpdatePro\update.lock` | Lock file (prevents concurrent runs) |
 | `C:\ProgramData\SystemUpdatePro\state.json` | State file (for post-reboot continuation) |
+| `C:\ProgramData\SystemUpdatePro\update_history.json` | Update history log (last 100 runs) |
+| `C:\ProgramData\SystemUpdatePro\DriverBackups\` | Driver backup snapshots (last 3 kept) |
 | `C:\ProgramData\SystemUpdatePro\HPIA\` | HP Image Assistant installation |
+
+---
+
+## HTML Reports
+
+After each run, SystemUpdatePro generates a professional HTML report with:
+- System information (manufacturer, model, OS, BIOS version)
+- Color-coded status indicators (green/yellow/red)
+- OEM, Windows, and Winget update details
+- Errors and warnings log
+- Runtime statistics
+
+Reports are saved to the log directory and automatically open in your browser (unless running as SYSTEM or non-interactively).
+
+---
+
+## Webhook Payload
+
+When using `-WebhookUrl`, the following JSON payload is sent:
+
+```json
+{
+  "hostname": "PCNAME",
+  "status": "success|partial|failed",
+  "oem_updates": 3,
+  "windows_updates": 5,
+  "winget_updates": 12,
+  "errors": [],
+  "runtime_seconds": 180
+}
+```
+
+Slack and Teams webhooks are auto-detected by URL pattern and formatted appropriately.
 
 ---
 
@@ -237,51 +324,58 @@ Register-ScheduledTask -TaskName "SystemUpdatePro Weekly" -Action $action -Trigg
 ## How It Works
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    SystemUpdatePro v4.0                      │
-├─────────────────────────────────────────────────────────────┤
-│                                                              │
-│  1. PRE-FLIGHT CHECKS                                        │
-│     ├── Admin privileges                                     │
-│     ├── Lock file (prevent concurrent runs)                  │
-│     ├── Internet connectivity                                │
-│     ├── Disk space verification                              │
-│     ├── Pending reboot detection                             │
-│     ├── Battery status (for BIOS)                            │
-│     └── Metered connection warning                           │
-│                                                              │
-│  2. WINDOWS UPDATE REPAIR (if -RepairWindowsUpdate)          │
-│     ├── Stop WU services                                     │
-│     ├── Clear SoftwareDistribution cache                     │
-│     ├── Re-register 30+ DLLs                                 │
-│     ├── Reset Winsock                                        │
-│     └── Restart WU services                                  │
-│                                                              │
-│  3. OEM UPDATES (auto-detected)                              │
-│     ├── Dell: Install DCU → Apply updates                    │
-│     ├── Lenovo: Install LSUClient → Apply updates            │
-│     └── HP: Install HPIA → Apply updates                     │
-│                                                              │
-│  4. WINDOWS UPDATES                                          │
-│     ├── Install PSWindowsUpdate module                       │
-│     ├── Multi-pass update (catches dependent updates)        │
-│     └── Fallback to WUA COM API if needed                    │
-│                                                              │
-│  5. WINGET UPGRADES                                          │
-│     ├── Install Winget if missing (Win10 compatible)         │
-│     └── winget upgrade --all                                 │
-│                                                              │
-│  6. CLEANUP (if -CleanupAfter)                               │
-│     ├── DISM /StartComponentCleanup /ResetBase               │
-│     └── Disk Cleanup (update files, temp files)              │
-│                                                              │
-│  7. FINALIZATION                                             │
-│     ├── Write Event Log entry                                │
-│     ├── Create continuation task (if -ContinueAfterReboot)   │
-│     ├── Remove lock file                                     │
-│     └── Initiate reboot (if -Reboot and required)            │
-│                                                              │
-└─────────────────────────────────────────────────────────────┘
++-------------------------------------------------------------+
+|                  SystemUpdatePro v4.1.0                      |
++-------------------------------------------------------------+
+|                                                              |
+|  1. PRE-FLIGHT CHECKS                                       |
+|     +-- Admin privileges                                    |
+|     +-- Lock file (prevent concurrent runs)                 |
+|     +-- Internet connectivity                               |
+|     +-- Disk space verification                              |
+|     +-- Pending reboot detection                             |
+|     +-- Battery status (for BIOS)                            |
+|     +-- Metered connection warning                           |
+|                                                              |
+|  2. DRIVER BACKUP (if -BackupDrivers)                        |
+|     +-- Export-WindowsDriver to backup directory             |
+|     +-- Auto-cleanup old backups (keep 3)                    |
+|                                                              |
+|  3. WINDOWS UPDATE REPAIR (if -RepairWindowsUpdate)          |
+|     +-- Stop WU services                                    |
+|     +-- Clear SoftwareDistribution cache                    |
+|     +-- Re-register 30+ DLLs                                |
+|     +-- Reset Winsock                                        |
+|     +-- Restart WU services                                  |
+|                                                              |
+|  4. OEM UPDATES (auto-detected)                              |
+|     +-- Dell: Install DCU -> Apply updates                   |
+|     +-- Lenovo: Install LSUClient -> Apply updates           |
+|     +-- HP: Install HPIA -> Apply updates                    |
+|                                                              |
+|  5. WINDOWS UPDATES                                          |
+|     +-- Install PSWindowsUpdate module                       |
+|     +-- Multi-pass update (catches dependent updates)        |
+|     +-- Fallback to WUA COM API if needed                    |
+|                                                              |
+|  6. WINGET UPGRADES                                          |
+|     +-- Install Winget if missing (Win10 compatible)         |
+|     +-- winget upgrade --all                                 |
+|                                                              |
+|  7. CLEANUP (if -CleanupAfter)                               |
+|     +-- DISM /StartComponentCleanup /ResetBase               |
+|     +-- Disk Cleanup (update files, temp files)              |
+|                                                              |
+|  8. FINALIZATION                                             |
+|     +-- Save update history                                  |
+|     +-- Generate HTML report                                 |
+|     +-- Send webhook notification (if configured)            |
+|     +-- Write Event Log entry                                |
+|     +-- Create continuation task (if -ContinueAfterReboot)   |
+|     +-- Remove lock file                                     |
+|     +-- Initiate reboot (if -Reboot and required)            |
+|                                                              |
++-------------------------------------------------------------+
 ```
 
 ---
@@ -322,6 +416,9 @@ Get-Content "C:\ProgramData\SystemUpdatePro\Logs\SystemUpdatePro_Transcript_*.lo
 
 # DCU log (Dell)
 Get-Content "C:\ProgramData\SystemUpdatePro\Logs\DCU_*.log"
+
+# View update history
+.\SystemUpdatePro.ps1 -ShowHistory
 ```
 
 ---
@@ -350,9 +447,3 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - [LSUClient](https://github.com/jantari/LSUClient) - Lenovo System Update PowerShell module
 - [HP Image Assistant](https://ftp.ext.hp.com/pub/caps-softpaq/cmit/HPIA.html) - HP driver/BIOS management
 - [PSWindowsUpdate](https://www.powershellgallery.com/packages/PSWindowsUpdate) - Windows Update PowerShell module
-
----
-
-<p align="center">
-  Made with ☕ for MSPs who are tired of broken update tools
-</p>
