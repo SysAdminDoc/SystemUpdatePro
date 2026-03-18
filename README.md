@@ -1,3 +1,5 @@
+<p align="center"><img src="icon.svg" width="128" height="128" alt="SystemUpdatePro"></p>
+
 # SystemUpdatePro
 
 <p align="center">
