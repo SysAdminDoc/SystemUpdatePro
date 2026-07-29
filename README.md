@@ -1,4 +1,4 @@
-<p align="center"><img src="icon.svg" width="128" height="128" alt="SystemUpdatePro"></p>
+<p align="center"><img src="icon.png" width="128" height="128" alt="SystemUpdatePro"></p>
 
 # SystemUpdatePro
 
@@ -46,7 +46,7 @@ SystemUpdatePro is a fully automated, self-healing PowerShell script that handle
 - **WSUS Bypass**: Option to bypass WSUS and connect directly to Microsoft
 - **Post-Reboot Continuation**: Scheduled task to resume updates after reboot
 - **Log Rotation**: Automatic cleanup of old log files
-- **HTML Reports**: Professional dark-themed HTML summary report after each run
+- **HTML Reports**: Responsive operations-dashboard report with update channels, device profile, exceptions, and print styles
 - **Webhook Notifications**: Send completion status to Slack, Teams, or any generic webhook
 - **Update History**: JSON-based history tracking of all update runs with formatted display
 
@@ -236,12 +236,14 @@ Get-EventLog -LogName Application -Source "SystemUpdatePro" -Newest 10
 
 ## HTML Reports
 
-After each run, SystemUpdatePro generates a professional HTML report with:
-- System information (manufacturer, model, OS, BIOS version)
-- Color-coded status indicators (green/yellow/red)
-- OEM, Windows, and Winget update details
-- Errors and warnings log
-- Runtime statistics
+After each run, SystemUpdatePro generates a responsive, self-contained operations report with:
+- A decisive run-status summary and at-a-glance update metrics
+- OEM, Windows Update, and Winget channel breakdowns
+- A compact device inventory profile
+- Dedicated exceptions and follow-up guidance
+- Audit-friendly run metadata and log location
+- Responsive layouts for desktop and mobile plus print-optimized styles
+- HTML-encoded machine and update data for safe rendering
 
 Reports are saved to the log directory and automatically open in your browser (unless running as SYSTEM or non-interactively).
 

@@ -1749,75 +1749,194 @@ function New-HTMLReport {
         [hashtable]$RunData
     )
 
-    $reportFile = Join-Path $LogPath "SystemUpdatePro_Report_$(Get-Date -Format 'yyyyMMdd_HHmmss').html"
+    $generatedAt = Get-Date
+    $reportFile = Join-Path $LogPath "SystemUpdatePro_Report_$($generatedAt.ToString('yyyyMMdd_HHmmss')).html"
 
-    $overallStatus = switch ($RunData.ExitCode) {
+    $encode = {
+        param([AllowNull()][object]$Value)
+
+        if ($null -eq $Value) { return "" }
+        return [System.Net.WebUtility]::HtmlEncode([string]$Value)
+    }
+
+    $displayValue = {
+        param(
+            [AllowNull()][object]$Value,
+            [string]$Fallback = "Not reported"
+        )
+
+        if ($null -eq $Value -or [string]::IsNullOrWhiteSpace([string]$Value)) {
+            return & $encode $Fallback
+        }
+        return & $encode $Value
+    }
+
+    $exitCode = [int]$RunData.ExitCode
+    $statusKey = switch ($exitCode) {
+        0 { "success" }
+        1 { "reboot" }
+        2 { "partial" }
+        default { "failed" }
+    }
+    $overallStatus = switch ($exitCode) {
         0 { "SUCCESS" }
-        1 { "SUCCESS (Reboot Required)" }
-        2 { "PARTIAL" }
+        1 { "SUCCESS · REBOOT REQUIRED" }
+        2 { "PARTIAL SUCCESS" }
         default { "FAILED" }
     }
-
-    $statusColor = switch ($RunData.ExitCode) {
-        0 { "#a6e3a1" }  # green
-        1 { "#a6e3a1" }  # green
-        2 { "#f9e2af" }  # yellow
-        default { "#f38ba8" }  # red
+    $statusGlyph = switch ($statusKey) {
+        "success" { "&#10003;" }
+        "reboot" { "&#8635;" }
+        "partial" { "!" }
+        default { "&#215;" }
     }
 
-    $modeLabel = if ($DryRun) { " [DRY RUN]" } else { "" }
-    $durationMin = [math]::Round($RunData.DurationSeconds / 60, 1)
-
-    # Build error/warning rows
-    $errorRows = ""
-    if ($RunData.Errors -and $RunData.Errors.Count -gt 0) {
-        foreach ($err in $RunData.Errors) {
-            $escapedErr = [System.Net.WebUtility]::HtmlEncode($err)
-            $errorRows += "<tr><td class='status-error'>ERROR</td><td>$escapedErr</td></tr>`n"
-        }
-    }
-    if ($RunData.Warnings -and $RunData.Warnings.Count -gt 0) {
-        foreach ($warn in $RunData.Warnings) {
-            $escapedWarn = [System.Net.WebUtility]::HtmlEncode($warn)
-            $errorRows += "<tr><td class='status-warning'>WARNING</td><td>$escapedWarn</td></tr>`n"
-        }
-    }
-    if (-not $errorRows) {
-        $errorRows = "<tr><td colspan='2' style='color:#a6e3a1;text-align:center;'>No errors or warnings</td></tr>"
-    }
-
-    # Build OEM update rows
-    $oemRows = ""
-    if ($script:OEMUpdates.Count -gt 0) {
-        foreach ($item in $script:OEMUpdates) {
-            $escaped = [System.Net.WebUtility]::HtmlEncode($item)
-            $label = if ($DryRun) { "Available" } else { "Installed" }
-            $cls = if ($DryRun) { "status-warning" } else { "status-success" }
-            $oemRows += "<tr><td class='$cls'>$label</td><td>$escaped</td></tr>`n"
-        }
+    $durationSeconds = [math]::Max(0, [int]$RunData.DurationSeconds)
+    $duration = [TimeSpan]::FromSeconds($durationSeconds)
+    if ($duration.TotalHours -ge 1) {
+        $durationDisplay = "{0}h {1}m" -f [math]::Floor($duration.TotalHours), $duration.Minutes
+    } elseif ($duration.TotalMinutes -ge 1) {
+        $durationDisplay = "{0}m {1}s" -f [math]::Floor($duration.TotalMinutes), $duration.Seconds
     } else {
-        $oemLabel = if ($SkipOEM) { "Skipped" } else { "None found" }
-        $oemRows = "<tr><td colspan='2' style='text-align:center;'>$oemLabel</td></tr>"
+        $durationDisplay = "{0}s" -f $duration.Seconds
     }
 
-    # Build Windows Update rows
-    $wuRows = ""
-    if ($script:WindowsUpdates.Count -gt 0) {
-        foreach ($item in $script:WindowsUpdates) {
-            $escaped = [System.Net.WebUtility]::HtmlEncode($item)
-            $label = if ($DryRun) { "Available" } else { "Installed" }
-            $cls = if ($DryRun) { "status-warning" } else { "status-success" }
-            $wuRows += "<tr><td class='$cls'>$label</td><td>$escaped</td></tr>`n"
+    $oemCount = [math]::Max(0, [int]$RunData.OEMUpdates)
+    $windowsCount = [math]::Max(0, [int]$RunData.WindowsUpdates)
+    $wingetCount = [math]::Max(0, [int]$RunData.WingetUpdates)
+    $totalUpdates = $oemCount + $windowsCount + $wingetCount
+    $modeLabel = if ($DryRun) { "DRY RUN" } else { "LIVE RUN" }
+    $summaryVerb = if ($DryRun) { "identified" } else { "processed" }
+    $rebootLabel = if ($RunData.RebootRequired) { "Required" } else { "Not required" }
+    $rebootClass = if ($RunData.RebootRequired) { "metric--reboot" } else { "metric--clear" }
+
+    $getChannelState = {
+        param(
+            [int]$Count,
+            [bool]$Skipped
+        )
+
+        if ($Skipped) {
+            return @{ Label = "Skipped"; Class = "state--quiet" }
         }
-    } else {
-        $wuLabel = if ($SkipWindows) { "Skipped" } else { "None found" }
-        $wuRows = "<tr><td colspan='2' style='text-align:center;'>$wuLabel</td></tr>"
+        if ($Count -gt 0 -and $DryRun) {
+            return @{ Label = "Available"; Class = "state--attention" }
+        }
+        if ($Count -gt 0) {
+            return @{ Label = "Processed"; Class = "state--good" }
+        }
+        return @{ Label = "No changes"; Class = "state--quiet" }
     }
 
-    $biosDate = ""
+    $oemState = & $getChannelState $oemCount $SkipOEM.IsPresent
+    $windowsState = & $getChannelState $windowsCount $SkipWindows.IsPresent
+    $wingetState = & $getChannelState $wingetCount $SkipWinget.IsPresent
+
+    $buildUpdateList = {
+        param(
+            [AllowNull()][object[]]$Items,
+            [string]$EmptyMessage
+        )
+
+        $safeItems = @($Items | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+        if ($safeItems.Count -eq 0) {
+            return "<span class='channel-empty'>$(& $encode $EmptyMessage)</span>"
+        }
+
+        $listItems = ""
+        $visibleItems = @($safeItems | Select-Object -First 2)
+        foreach ($item in $visibleItems) {
+            $listItems += "<li>$(& $encode $item)</li>"
+        }
+        if ($safeItems.Count -gt $visibleItems.Count) {
+            $remaining = $safeItems.Count - $visibleItems.Count
+            $listItems += "<li class='more'>+$remaining more</li>"
+        }
+        return "<ul class='channel-details'>$listItems</ul>"
+    }
+
+    $oemEmpty = if ($SkipOEM) { "Channel skipped by run configuration" } elseif ($DryRun) { "No OEM updates available" } else { "No OEM changes recorded" }
+    $windowsEmpty = if ($SkipWindows) { "Channel skipped by run configuration" } elseif ($DryRun) { "No Windows updates available" } else { "No Windows changes recorded" }
+    $wingetEmpty = if ($SkipWinget) {
+        "Channel skipped by run configuration"
+    } elseif ($DryRun) {
+        "$wingetCount package upgrades detected by winget"
+    } elseif ($wingetCount -gt 0) {
+        "$wingetCount package upgrades processed by winget"
+    } else {
+        "No application package changes recorded"
+    }
+
+    $oemDetails = & $buildUpdateList @($script:OEMUpdates) $oemEmpty
+    $windowsDetails = & $buildUpdateList @($script:WindowsUpdates) $windowsEmpty
+    $wingetDetails = & $buildUpdateList @($script:WingetUpdates) $wingetEmpty
+
+    $noticeRows = ""
+    $errorCount = @($RunData.Errors).Count
+    $warningCount = @($RunData.Warnings).Count
+    $attentionCount = $errorCount + $warningCount
+
+    foreach ($err in @($RunData.Errors)) {
+        if ([string]::IsNullOrWhiteSpace([string]$err)) { continue }
+        $noticeRows += @"
+<li class="notice notice--error">
+  <span class="notice-icon" aria-hidden="true">!</span>
+  <div><strong>Error</strong><p>$(& $encode $err)</p></div>
+</li>
+"@
+    }
+    foreach ($warning in @($RunData.Warnings)) {
+        if ([string]::IsNullOrWhiteSpace([string]$warning)) { continue }
+        $noticeRows += @"
+<li class="notice notice--warning">
+  <span class="notice-icon" aria-hidden="true">!</span>
+  <div><strong>Warning</strong><p>$(& $encode $warning)</p></div>
+</li>
+"@
+    }
+    if ([string]::IsNullOrWhiteSpace($noticeRows)) {
+        $noticeRows = @"
+<li class="notice notice--clear">
+  <span class="notice-icon" aria-hidden="true">&#10003;</span>
+  <div><strong>No attention needed</strong><p>The run completed without recorded errors or warnings.</p></div>
+</li>
+"@
+    }
+
+    $attentionSummary = if ($attentionCount -eq 0) {
+        "All clear"
+    } elseif ($attentionCount -eq 1) {
+        "1 item"
+    } else {
+        "$attentionCount items"
+    }
+
+    $biosDate = "Not reported"
     if ($SysInfo.BIOSDate) {
-        try { $biosDate = ([DateTime]$SysInfo.BIOSDate).ToString("yyyy-MM-dd") } catch { $biosDate = "$($SysInfo.BIOSDate)" }
+        try {
+            $biosDate = ([DateTime]$SysInfo.BIOSDate).ToString("yyyy-MM-dd")
+        } catch {
+            $biosDate = [string]$SysInfo.BIOSDate
+        }
     }
+
+    $computerName = & $displayValue $env:COMPUTERNAME "Unknown endpoint"
+    $manufacturer = & $displayValue $SysInfo.Manufacturer
+    $model = & $displayValue $SysInfo.Model
+    $serialNumber = & $displayValue $SysInfo.SerialNumber
+    $osName = & $displayValue $SysInfo.OSName
+    $osBuild = & $displayValue $SysInfo.OSBuild
+    $biosVersion = & $displayValue $SysInfo.BIOSVersion
+    $biosDateDisplay = & $displayValue $biosDate
+    $processor = & $displayValue $SysInfo.Processor
+    $totalRam = if ($null -eq $SysInfo.TotalRAM -or [string]::IsNullOrWhiteSpace([string]$SysInfo.TotalRAM)) {
+        "Not reported"
+    } else {
+        "$(& $encode $SysInfo.TotalRAM) GB"
+    }
+    $logFileDisplay = & $displayValue $script:LogFile
+    $generatedDisplay = $generatedAt.ToString("yyyy-MM-dd HH:mm:ss")
+    $versionDisplay = & $encode $script:Version
 
     $html = @"
 <!DOCTYPE html>
@@ -1825,108 +1944,1090 @@ function New-HTMLReport {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>SystemUpdatePro Report - $($env:COMPUTERNAME)</title>
+<meta name="color-scheme" content="dark">
+<title>SystemUpdatePro Report - $computerName</title>
 <style>
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { background: #1e1e2e; color: #cdd6f4; font-family: 'Segoe UI', Tahoma, sans-serif; padding: 24px; }
-  .container { max-width: 900px; margin: 0 auto; }
-  .header { text-align: center; margin-bottom: 32px; padding: 24px; background: #181825; border-radius: 12px; border: 1px solid #313244; }
-  .header h1 { font-size: 28px; color: #89b4fa; margin-bottom: 4px; }
-  .header .version { color: #6c7086; font-size: 14px; }
-  .header .status-badge { display: inline-block; margin-top: 12px; padding: 6px 20px; border-radius: 20px; font-weight: 600; font-size: 16px; }
-  .card { background: #181825; border: 1px solid #313244; border-radius: 10px; margin-bottom: 20px; overflow: hidden; }
-  .card-title { background: #11111b; padding: 12px 20px; font-size: 16px; font-weight: 600; color: #89b4fa; border-bottom: 1px solid #313244; }
-  .card-body { padding: 16px 20px; }
-  table { width: 100%; border-collapse: collapse; }
-  table td { padding: 8px 12px; border-bottom: 1px solid #313244; vertical-align: top; }
-  table tr:last-child td { border-bottom: none; }
-  .label { color: #6c7086; width: 180px; font-weight: 500; }
-  .value { color: #cdd6f4; }
-  .status-success { color: #a6e3a1; font-weight: 600; }
-  .status-warning { color: #f9e2af; font-weight: 600; }
-  .status-error { color: #f38ba8; font-weight: 600; }
-  .footer { text-align: center; margin-top: 32px; color: #6c7086; font-size: 12px; }
-  .metric { display: inline-block; text-align: center; padding: 16px 24px; margin: 8px; background: #11111b; border-radius: 8px; border: 1px solid #313244; min-width: 140px; }
-  .metric .number { font-size: 32px; font-weight: 700; }
-  .metric .label2 { font-size: 12px; color: #6c7086; margin-top: 4px; }
-  .metrics-row { text-align: center; margin: 20px 0; }
+  :root {
+    color-scheme: dark;
+    --ink: #071019;
+    --ink-soft: #0a1520;
+    --surface: #0f1b27;
+    --surface-strong: #122231;
+    --surface-muted: #0b1722;
+    --line: #26394b;
+    --line-soft: #1b2c3b;
+    --text: #eef5fb;
+    --muted: #93a8ba;
+    --muted-strong: #b8c7d3;
+    --cyan: #36c5f0;
+    --mint: #52d6a7;
+    --amber: #f5b942;
+    --coral: #ff7a74;
+    --violet: #9f8cff;
+    --shadow: 0 20px 55px rgba(0, 0, 0, 0.22);
+  }
+
+  * {
+    box-sizing: border-box;
+  }
+
+  html {
+    background: var(--ink);
+  }
+
+  body {
+    margin: 0;
+    min-width: 320px;
+    background:
+      radial-gradient(circle at 8% -10%, rgba(54, 197, 240, 0.08), transparent 30rem),
+      var(--ink);
+    color: var(--text);
+    font-family: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, sans-serif;
+    font-size: 15px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .page-shell {
+    width: min(1320px, calc(100% - 48px));
+    margin: 0 auto;
+    padding: 28px 0 36px;
+  }
+
+  .brand-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 24px;
+    min-height: 44px;
+    margin-bottom: 18px;
+  }
+
+  .brand {
+    display: inline-flex;
+    align-items: center;
+    gap: 12px;
+    min-width: 0;
+  }
+
+  .brand-mark {
+    display: grid;
+    width: 38px;
+    height: 38px;
+    place-items: center;
+    color: var(--cyan);
+    background: rgba(54, 197, 240, 0.08);
+    border: 1px solid rgba(54, 197, 240, 0.34);
+    border-radius: 10px;
+  }
+
+  .brand-mark svg,
+  .metric-icon svg,
+  .channel-icon svg {
+    width: 100%;
+    height: 100%;
+  }
+
+  .brand-name {
+    font-size: 17px;
+    font-weight: 680;
+    letter-spacing: -0.015em;
+  }
+
+  .brand-version {
+    color: var(--muted);
+    font-family: "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
+    font-size: 12px;
+  }
+
+  .brand-meta {
+    color: var(--muted);
+    font-size: 12px;
+    text-align: right;
+  }
+
+  .hero {
+    --status-accent: var(--cyan);
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 28px;
+    min-height: 174px;
+    padding: 32px 34px;
+    overflow: hidden;
+    background:
+      linear-gradient(rgba(54, 197, 240, 0.035) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(54, 197, 240, 0.035) 1px, transparent 1px),
+      linear-gradient(120deg, #102130 0%, #0d1b28 58%, #0a1722 100%);
+    background-size: 32px 32px, 32px 32px, auto;
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    box-shadow: var(--shadow);
+  }
+
+  .hero::after {
+    position: absolute;
+    inset: auto -60px -120px auto;
+    width: 360px;
+    height: 260px;
+    background: radial-gradient(circle, color-mix(in srgb, var(--status-accent) 14%, transparent), transparent 68%);
+    content: "";
+    pointer-events: none;
+  }
+
+  .hero--success { --status-accent: var(--mint); }
+  .hero--reboot,
+  .hero--partial { --status-accent: var(--amber); }
+  .hero--failed { --status-accent: var(--coral); }
+
+  .hero-main {
+    position: relative;
+    z-index: 1;
+    display: flex;
+    align-items: center;
+    gap: 24px;
+    min-width: 0;
+  }
+
+  .status-symbol {
+    display: grid;
+    flex: 0 0 auto;
+    width: 74px;
+    height: 74px;
+    place-items: center;
+    color: var(--status-accent);
+    background: color-mix(in srgb, var(--status-accent) 9%, transparent);
+    border: 2px solid color-mix(in srgb, var(--status-accent) 72%, transparent);
+    border-radius: 22px;
+    font-family: "Cascadia Mono", Consolas, monospace;
+    font-size: 36px;
+    font-weight: 800;
+  }
+
+  .eyebrow {
+    margin: 0 0 4px;
+    color: var(--muted-strong);
+    font-family: "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
+    font-size: 13px;
+    font-weight: 650;
+    letter-spacing: 0.11em;
+    text-transform: uppercase;
+  }
+
+  .hero h1 {
+    margin: 0;
+    color: var(--status-accent);
+    font-size: clamp(30px, 4vw, 50px);
+    font-weight: 760;
+    letter-spacing: -0.035em;
+    line-height: 1.06;
+  }
+
+  .hero-summary {
+    margin: 10px 0 0;
+    color: var(--muted-strong);
+    font-size: 16px;
+  }
+
+  .hero-summary strong {
+    color: var(--cyan);
+    font-weight: 680;
+  }
+
+  .hero-side {
+    position: relative;
+    z-index: 1;
+    display: flex;
+    flex: 0 0 auto;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 10px;
+  }
+
+  .run-pill,
+  .exit-token,
+  .section-count,
+  .channel-state {
+    display: inline-flex;
+    align-items: center;
+    width: fit-content;
+    border-radius: 999px;
+    white-space: nowrap;
+  }
+
+  .run-pill {
+    gap: 8px;
+    padding: 9px 14px;
+    color: var(--status-accent);
+    background: color-mix(in srgb, var(--status-accent) 10%, transparent);
+    border: 1px solid color-mix(in srgb, var(--status-accent) 52%, transparent);
+    font-size: 12px;
+    font-weight: 750;
+    letter-spacing: 0.08em;
+  }
+
+  .run-pill::before {
+    width: 7px;
+    height: 7px;
+    background: currentColor;
+    border-radius: 50%;
+    box-shadow: 0 0 0 4px color-mix(in srgb, currentColor 12%, transparent);
+    content: "";
+  }
+
+  .exit-token {
+    padding: 5px 10px;
+    color: var(--muted);
+    background: rgba(7, 16, 25, 0.46);
+    border: 1px solid var(--line-soft);
+    font-family: "Cascadia Mono", Consolas, monospace;
+    font-size: 11px;
+  }
+
+  .metrics {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 14px;
+    margin: 16px 0;
+  }
+
+  .metric {
+    display: grid;
+    grid-template-columns: 46px 1fr;
+    gap: 14px;
+    align-items: center;
+    min-height: 96px;
+    padding: 18px;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+  }
+
+  .metric-icon {
+    display: grid;
+    width: 46px;
+    height: 46px;
+    place-items: center;
+    padding: 10px;
+    color: var(--cyan);
+    background: rgba(54, 197, 240, 0.08);
+    border: 1px solid rgba(54, 197, 240, 0.28);
+    border-radius: 11px;
+  }
+
+  .metric--windows .metric-icon {
+    color: #53a8ff;
+    background: rgba(83, 168, 255, 0.08);
+    border-color: rgba(83, 168, 255, 0.28);
+  }
+
+  .metric--apps .metric-icon {
+    color: var(--mint);
+    background: rgba(82, 214, 167, 0.08);
+    border-color: rgba(82, 214, 167, 0.28);
+  }
+
+  .metric--reboot .metric-icon {
+    color: var(--amber);
+    background: rgba(245, 185, 66, 0.08);
+    border-color: rgba(245, 185, 66, 0.32);
+  }
+
+  .metric--clear .metric-icon {
+    color: var(--mint);
+    background: rgba(82, 214, 167, 0.08);
+    border-color: rgba(82, 214, 167, 0.28);
+  }
+
+  .metric-value {
+    display: block;
+    color: var(--text);
+    font-size: 28px;
+    font-weight: 740;
+    letter-spacing: -0.03em;
+    line-height: 1.08;
+  }
+
+  .metric-value--text {
+    font-size: 18px;
+    letter-spacing: -0.015em;
+  }
+
+  .metric-label {
+    display: block;
+    margin-top: 5px;
+    color: var(--muted);
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.035em;
+    text-transform: uppercase;
+  }
+
+  .dashboard-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1.72fr) minmax(310px, 0.88fr);
+    gap: 16px;
+  }
+
+  .panel {
+    min-width: 0;
+    overflow: hidden;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+  }
+
+  .panel-heading {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 17px 20px;
+    background: var(--surface-muted);
+    border-bottom: 1px solid var(--line-soft);
+  }
+
+  .panel-heading h2 {
+    margin: 0;
+    font-size: 16px;
+    font-weight: 690;
+    letter-spacing: -0.012em;
+  }
+
+  .panel-heading p {
+    margin: 3px 0 0;
+    color: var(--muted);
+    font-size: 12px;
+  }
+
+  .section-count {
+    padding: 4px 9px;
+    color: var(--muted-strong);
+    background: rgba(147, 168, 186, 0.08);
+    border: 1px solid var(--line);
+    font-family: "Cascadia Mono", Consolas, monospace;
+    font-size: 11px;
+  }
+
+  .channels {
+    grid-column: 1;
+  }
+
+  .channel-list {
+    padding: 6px 18px 10px;
+  }
+
+  .channel {
+    display: grid;
+    grid-template-columns: 44px minmax(144px, 0.95fr) 72px 104px minmax(200px, 1.2fr);
+    gap: 14px;
+    align-items: center;
+    min-height: 96px;
+    padding: 16px 4px;
+    border-bottom: 1px solid var(--line-soft);
+  }
+
+  .channel:last-child {
+    border-bottom: 0;
+  }
+
+  .channel-icon {
+    display: grid;
+    width: 42px;
+    height: 42px;
+    place-items: center;
+    padding: 10px;
+    color: var(--violet);
+    background: rgba(159, 140, 255, 0.1);
+    border: 1px solid rgba(159, 140, 255, 0.28);
+    border-radius: 10px;
+  }
+
+  .channel--windows .channel-icon {
+    color: #53a8ff;
+    background: rgba(83, 168, 255, 0.09);
+    border-color: rgba(83, 168, 255, 0.28);
+  }
+
+  .channel--apps .channel-icon {
+    color: var(--mint);
+    background: rgba(82, 214, 167, 0.09);
+    border-color: rgba(82, 214, 167, 0.28);
+  }
+
+  .channel-title {
+    display: block;
+    color: var(--text);
+    font-weight: 660;
+  }
+
+  .channel-caption {
+    display: block;
+    margin-top: 3px;
+    color: var(--muted);
+    font-size: 12px;
+  }
+
+  .channel-count {
+    color: var(--text);
+    font-size: 26px;
+    font-weight: 730;
+    line-height: 1;
+    text-align: center;
+  }
+
+  .channel-count small {
+    display: block;
+    margin-top: 7px;
+    color: var(--muted);
+    font-size: 10px;
+    font-weight: 650;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+  }
+
+  .channel-state {
+    justify-content: center;
+    gap: 7px;
+    padding: 5px 9px;
+    border: 1px solid;
+    font-size: 10px;
+    font-weight: 760;
+    letter-spacing: 0.045em;
+    text-transform: uppercase;
+  }
+
+  .channel-state::before {
+    width: 6px;
+    height: 6px;
+    background: currentColor;
+    border-radius: 50%;
+    content: "";
+  }
+
+  .state--good {
+    color: var(--mint);
+    background: rgba(82, 214, 167, 0.07);
+    border-color: rgba(82, 214, 167, 0.24);
+  }
+
+  .state--attention {
+    color: var(--amber);
+    background: rgba(245, 185, 66, 0.07);
+    border-color: rgba(245, 185, 66, 0.26);
+  }
+
+  .state--quiet {
+    color: var(--muted-strong);
+    background: rgba(147, 168, 186, 0.06);
+    border-color: var(--line);
+  }
+
+  .channel-details {
+    min-width: 0;
+    margin: 0;
+    padding: 0;
+    color: var(--muted-strong);
+    font-family: "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
+    font-size: 11px;
+    line-height: 1.55;
+    list-style: none;
+  }
+
+  .channel-details li {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .channel-details .more,
+  .channel-empty {
+    color: var(--muted);
+  }
+
+  .channel-empty {
+    font-size: 12px;
+  }
+
+  .device-profile {
+    grid-column: 2;
+    grid-row: 1 / span 2;
+  }
+
+  .profile-list {
+    margin: 0;
+    padding: 8px 20px 12px;
+  }
+
+  .profile-row {
+    display: grid;
+    grid-template-columns: minmax(100px, 0.78fr) minmax(0, 1.22fr);
+    gap: 16px;
+    margin: 0;
+    padding: 11px 0;
+    border-bottom: 1px solid var(--line-soft);
+  }
+
+  .profile-row:last-child {
+    border-bottom: 0;
+  }
+
+  .profile-row dt {
+    color: var(--muted);
+  }
+
+  .profile-row dd {
+    min-width: 0;
+    margin: 0;
+    overflow-wrap: anywhere;
+    color: var(--text);
+    font-family: "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
+    font-size: 12px;
+  }
+
+  .attention {
+    grid-column: 1;
+  }
+
+  .notice-list {
+    margin: 0;
+    padding: 10px 18px 14px;
+    list-style: none;
+  }
+
+  .notice {
+    display: grid;
+    grid-template-columns: 30px 1fr;
+    gap: 12px;
+    align-items: start;
+    margin-top: 8px;
+    padding: 12px 14px;
+    border: 1px solid;
+    border-radius: 9px;
+  }
+
+  .notice-icon {
+    display: grid;
+    width: 26px;
+    height: 26px;
+    place-items: center;
+    border: 1px solid currentColor;
+    border-radius: 8px;
+    font-family: "Cascadia Mono", Consolas, monospace;
+    font-size: 13px;
+    font-weight: 800;
+  }
+
+  .notice strong {
+    display: block;
+    margin-bottom: 2px;
+    font-size: 12px;
+    letter-spacing: 0.045em;
+    text-transform: uppercase;
+  }
+
+  .notice p {
+    margin: 0;
+    color: var(--muted-strong);
+    font-size: 13px;
+  }
+
+  .notice--error {
+    color: var(--coral);
+    background: rgba(255, 122, 116, 0.06);
+    border-color: rgba(255, 122, 116, 0.22);
+  }
+
+  .notice--warning {
+    color: var(--amber);
+    background: rgba(245, 185, 66, 0.06);
+    border-color: rgba(245, 185, 66, 0.22);
+  }
+
+  .notice--clear {
+    color: var(--mint);
+    background: rgba(82, 214, 167, 0.06);
+    border-color: rgba(82, 214, 167, 0.2);
+  }
+
+  .run-details {
+    grid-column: 1 / -1;
+  }
+
+  .detail-grid {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    margin: 0;
+    padding: 18px 20px;
+  }
+
+  .detail-item {
+    min-width: 0;
+    margin: 0;
+    padding: 0 18px;
+    border-left: 1px solid var(--line-soft);
+  }
+
+  .detail-item:first-child {
+    padding-left: 0;
+    border-left: 0;
+  }
+
+  .detail-item dt {
+    margin-bottom: 5px;
+    color: var(--muted);
+    font-size: 10px;
+    font-weight: 650;
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+  }
+
+  .detail-item dd {
+    margin: 0;
+    color: var(--text);
+    font-family: "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
+    font-size: 12px;
+    overflow-wrap: anywhere;
+  }
+
+  .log-path {
+    grid-column: 1 / -1;
+    display: grid;
+    grid-template-columns: 112px minmax(0, 1fr);
+    gap: 14px;
+    margin: 16px 20px 20px;
+    padding-top: 16px;
+    border-top: 1px solid var(--line-soft);
+  }
+
+  .log-path span {
+    color: var(--muted);
+    font-size: 11px;
+    font-weight: 650;
+    letter-spacing: 0.055em;
+    text-transform: uppercase;
+  }
+
+  .log-path code {
+    color: var(--muted-strong);
+    font-family: "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
+    font-size: 11px;
+    overflow-wrap: anywhere;
+  }
+
+  .footer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 20px;
+    margin-top: 20px;
+    padding: 0 2px;
+    color: var(--muted);
+    font-size: 11px;
+  }
+
+  .footer strong {
+    color: var(--muted-strong);
+    font-weight: 650;
+  }
+
+  @media (max-width: 980px) {
+    .metrics {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .dashboard-grid {
+      grid-template-columns: 1fr;
+    }
+
+    .channels,
+    .device-profile,
+    .attention,
+    .run-details {
+      grid-column: 1;
+      grid-row: auto;
+    }
+
+    .device-profile {
+      order: 3;
+    }
+
+    .run-details {
+      order: 4;
+    }
+  }
+
+  @media (max-width: 700px) {
+    .page-shell {
+      width: min(100% - 24px, 1320px);
+      padding-top: 16px;
+    }
+
+    .brand-meta {
+      display: none;
+    }
+
+    .hero {
+      align-items: flex-start;
+      min-height: 0;
+      padding: 24px;
+    }
+
+    .hero-main {
+      align-items: flex-start;
+    }
+
+    .status-symbol {
+      width: 52px;
+      height: 52px;
+      border-radius: 15px;
+      font-size: 26px;
+    }
+
+    .hero-side {
+      position: absolute;
+      top: 18px;
+      right: 18px;
+    }
+
+    .exit-token {
+      display: none;
+    }
+
+    .eyebrow {
+      padding-right: 108px;
+      font-size: 11px;
+    }
+
+    .hero h1 {
+      font-size: clamp(26px, 8vw, 38px);
+    }
+
+    .metrics {
+      gap: 10px;
+    }
+
+    .metric {
+      grid-template-columns: 38px 1fr;
+      min-height: 82px;
+      padding: 14px;
+    }
+
+    .metric-icon {
+      width: 38px;
+      height: 38px;
+      padding: 8px;
+    }
+
+    .metric-value {
+      font-size: 23px;
+    }
+
+    .metric-value--text {
+      font-size: 15px;
+    }
+
+    .channel {
+      grid-template-columns: 42px minmax(0, 1fr) 64px;
+      gap: 12px;
+    }
+
+    .channel-state {
+      grid-column: 2;
+      justify-self: start;
+    }
+
+    .channel > :last-child {
+      grid-column: 2 / -1;
+    }
+
+    .detail-grid {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 18px 0;
+    }
+
+    .detail-item:nth-child(odd) {
+      padding-left: 0;
+      border-left: 0;
+    }
+  }
+
+  @media (max-width: 480px) {
+    .brand-version {
+      display: none;
+    }
+
+    .hero-main {
+      gap: 14px;
+    }
+
+    .status-symbol {
+      display: none;
+    }
+
+    .eyebrow {
+      padding-right: 94px;
+    }
+
+    .run-pill {
+      padding: 7px 10px;
+      font-size: 10px;
+    }
+
+    .metrics {
+      grid-template-columns: 1fr;
+    }
+
+    .profile-row {
+      grid-template-columns: 1fr;
+      gap: 4px;
+    }
+
+    .detail-grid {
+      grid-template-columns: 1fr;
+    }
+
+    .detail-item,
+    .detail-item:nth-child(odd) {
+      padding: 0;
+      border: 0;
+    }
+
+    .log-path {
+      grid-template-columns: 1fr;
+      gap: 5px;
+    }
+
+    .footer {
+      align-items: flex-start;
+      flex-direction: column;
+      gap: 4px;
+    }
+  }
+
+  @media print {
+    :root {
+      color-scheme: light;
+      --ink: #ffffff;
+      --ink-soft: #ffffff;
+      --surface: #ffffff;
+      --surface-strong: #f7f9fb;
+      --surface-muted: #f3f6f8;
+      --line: #c9d2d9;
+      --line-soft: #dde3e8;
+      --text: #13202b;
+      --muted: #526779;
+      --muted-strong: #334a5c;
+      --shadow: none;
+    }
+
+    @page {
+      size: landscape;
+      margin: 10mm;
+    }
+
+    body {
+      background: #ffffff;
+      print-color-adjust: exact;
+      -webkit-print-color-adjust: exact;
+    }
+
+    .page-shell {
+      width: 100%;
+      padding: 0;
+    }
+
+    .hero {
+      background: #f3f6f8;
+    }
+
+    .hero::after {
+      display: none;
+    }
+
+    .panel,
+    .metric,
+    .hero {
+      break-inside: avoid;
+      box-shadow: none;
+    }
+  }
 </style>
 </head>
 <body>
-<div class="container">
-  <div class="header">
-    <h1>SystemUpdatePro Report$modeLabel</h1>
-    <div class="version">v$($script:Version) - $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')</div>
-    <div class="status-badge" style="background:$statusColor;color:#1e1e2e;">$overallStatus</div>
-  </div>
-
-  <div class="metrics-row">
-    <div class="metric"><div class="number" style="color:#89b4fa;">$($RunData.OEMUpdates)</div><div class="label2">OEM Updates</div></div>
-    <div class="metric"><div class="number" style="color:#a6e3a1;">$($RunData.WindowsUpdates)</div><div class="label2">Windows Updates</div></div>
-    <div class="metric"><div class="number" style="color:#cba6f7;">$($RunData.WingetUpdates)</div><div class="label2">Winget Updates</div></div>
-    <div class="metric"><div class="number" style="color:#f9e2af;">$durationMin m</div><div class="label2">Runtime</div></div>
-  </div>
-
-  <div class="card">
-    <div class="card-title">System Information</div>
-    <div class="card-body">
-      <table>
-        <tr><td class="label">Hostname</td><td class="value">$($env:COMPUTERNAME)</td></tr>
-        <tr><td class="label">Manufacturer</td><td class="value">$($SysInfo.Manufacturer)</td></tr>
-        <tr><td class="label">Model</td><td class="value">$($SysInfo.Model)</td></tr>
-        <tr><td class="label">Serial Number</td><td class="value">$($SysInfo.SerialNumber)</td></tr>
-        <tr><td class="label">OS</td><td class="value">$($SysInfo.OSName)</td></tr>
-        <tr><td class="label">OS Build</td><td class="value">$($SysInfo.OSBuild)</td></tr>
-        <tr><td class="label">BIOS Version</td><td class="value">$($SysInfo.BIOSVersion)</td></tr>
-        <tr><td class="label">BIOS Date</td><td class="value">$biosDate</td></tr>
-        <tr><td class="label">Processor</td><td class="value">$($SysInfo.Processor)</td></tr>
-        <tr><td class="label">RAM</td><td class="value">$($SysInfo.TotalRAM) GB</td></tr>
-      </table>
+<main class="page-shell">
+  <header class="brand-bar">
+    <div class="brand" aria-label="SystemUpdatePro">
+      <span class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none">
+          <path d="M12 2.7 19 5.4v5.4c0 4.7-2.7 8.5-7 10.5-4.3-2-7-5.8-7-10.5V5.4L12 2.7Z" stroke="currentColor" stroke-width="1.7"/>
+          <path d="m8.6 11.9 2.1 2.1 4.7-5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </span>
+      <span class="brand-name">SystemUpdatePro</span>
+      <span class="brand-version">v$versionDisplay</span>
     </div>
-  </div>
+    <div class="brand-meta">Generated $generatedDisplay</div>
+  </header>
 
-  <div class="card">
-    <div class="card-title">OEM Updates</div>
-    <div class="card-body"><table>$oemRows</table></div>
-  </div>
-
-  <div class="card">
-    <div class="card-title">Windows Updates</div>
-    <div class="card-body"><table>$wuRows</table></div>
-  </div>
-
-  <div class="card">
-    <div class="card-title">Winget Packages</div>
-    <div class="card-body">
-      <table>
-        <tr><td class="label">Packages Updated</td><td class="value">$($RunData.WingetUpdates)</td></tr>
-        <tr><td class="label">Status</td><td class="value">$(if ($SkipWinget) { "Skipped" } elseif ($DryRun) { "Scan only (dry run)" } else { "Completed" })</td></tr>
-      </table>
+  <section class="hero hero--$statusKey" aria-labelledby="run-status">
+    <div class="hero-main">
+      <div class="status-symbol" aria-hidden="true">$statusGlyph</div>
+      <div>
+        <p class="eyebrow">$computerName</p>
+        <h1 id="run-status">$overallStatus</h1>
+        <p class="hero-summary"><strong>$totalUpdates updates</strong> $summaryVerb in <strong>$durationDisplay</strong></p>
+      </div>
     </div>
-  </div>
-
-  <div class="card">
-    <div class="card-title">Errors and Warnings</div>
-    <div class="card-body"><table>$errorRows</table></div>
-  </div>
-
-  <div class="card">
-    <div class="card-title">Run Details</div>
-    <div class="card-body">
-      <table>
-        <tr><td class="label">Mode</td><td class="value">$(if ($DryRun) { "Dry Run (no changes made)" } else { "Live" })</td></tr>
-        <tr><td class="label">Exit Code</td><td class="value">$($RunData.ExitCode)</td></tr>
-        <tr><td class="label">Reboot Required</td><td class="value">$($RunData.RebootRequired)</td></tr>
-        <tr><td class="label">Total Duration</td><td class="value">$durationMin minutes ($($RunData.DurationSeconds) seconds)</td></tr>
-        <tr><td class="label">Log File</td><td class="value">$($script:LogFile)</td></tr>
-      </table>
+    <div class="hero-side">
+      <span class="run-pill">$modeLabel</span>
+      <span class="exit-token">EXIT $exitCode</span>
     </div>
+  </section>
+
+  <section class="metrics" aria-label="Run metrics">
+    <article class="metric metric--oem">
+      <span class="metric-icon" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none">
+          <path d="M9 3h6v3h3v3h3v6h-3v3h-3v3H9v-3H6v-3H3V9h3V6h3V3Z" stroke="currentColor" stroke-width="1.6"/>
+          <path d="M9 9h6v6H9z" stroke="currentColor" stroke-width="1.6"/>
+        </svg>
+      </span>
+      <div><span class="metric-value">$oemCount</span><span class="metric-label">OEM updates</span></div>
+    </article>
+    <article class="metric metric--windows">
+      <span class="metric-icon" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="currentColor">
+          <path d="m3 5.2 7.4-1v7.1H3V5.2Zm8.5-1.1L21 2.8v8.5h-9.5V4.1ZM3 12.5h7.4v7.2L3 18.7v-6.2Zm8.5 0H21v8.6l-9.5-1.3v-7.3Z"/>
+        </svg>
+      </span>
+      <div><span class="metric-value">$windowsCount</span><span class="metric-label">Windows updates</span></div>
+    </article>
+    <article class="metric metric--apps">
+      <span class="metric-icon" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none">
+          <path d="m12 3 8 4.5v9L12 21l-8-4.5v-9L12 3Z" stroke="currentColor" stroke-width="1.7"/>
+          <path d="m4.4 7.7 7.6 4.4 7.6-4.4M12 12.1V21" stroke="currentColor" stroke-width="1.5"/>
+        </svg>
+      </span>
+      <div><span class="metric-value">$wingetCount</span><span class="metric-label">App packages</span></div>
+    </article>
+    <article class="metric $rebootClass">
+      <span class="metric-icon" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none">
+          <path d="M18.4 8.1A8 8 0 1 1 12 4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+          <path d="M12 1.8 15.1 5 12 8.2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </span>
+      <div><span class="metric-value metric-value--text">$rebootLabel</span><span class="metric-label">Reboot</span></div>
+    </article>
+  </section>
+
+  <div class="dashboard-grid">
+    <section class="panel channels" aria-labelledby="channels-heading">
+      <div class="panel-heading">
+        <div>
+          <h2 id="channels-heading">Update channels</h2>
+          <p>Work completed across the device update stack</p>
+        </div>
+        <span class="section-count">$totalUpdates total</span>
+      </div>
+      <div class="channel-list">
+        <article class="channel channel--oem">
+          <span class="channel-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none">
+              <path d="M8 3h8v3h3v3h2v6h-2v3h-3v3H8v-3H5v-3H3V9h2V6h3V3Z" stroke="currentColor" stroke-width="1.5"/>
+              <path d="M9 9h6v6H9z" stroke="currentColor" stroke-width="1.5"/>
+            </svg>
+          </span>
+          <div><span class="channel-title">OEM &amp; firmware</span><span class="channel-caption">Vendor drivers and BIOS</span></div>
+          <div class="channel-count">$oemCount<small>Updates</small></div>
+          <span class="channel-state $($oemState.Class)">$($oemState.Label)</span>
+          <div>$oemDetails</div>
+        </article>
+
+        <article class="channel channel--windows">
+          <span class="channel-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="currentColor">
+              <path d="m3 5.2 7.4-1v7.1H3V5.2Zm8.5-1.1L21 2.8v8.5h-9.5V4.1ZM3 12.5h7.4v7.2L3 18.7v-6.2Zm8.5 0H21v8.6l-9.5-1.3v-7.3Z"/>
+            </svg>
+          </span>
+          <div><span class="channel-title">Windows Update</span><span class="channel-caption">OS and Microsoft updates</span></div>
+          <div class="channel-count">$windowsCount<small>Updates</small></div>
+          <span class="channel-state $($windowsState.Class)">$($windowsState.Label)</span>
+          <div>$windowsDetails</div>
+        </article>
+
+        <article class="channel channel--apps">
+          <span class="channel-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none">
+              <path d="m12 3 8 4.5v9L12 21l-8-4.5v-9L12 3Z" stroke="currentColor" stroke-width="1.6"/>
+              <path d="m4.4 7.7 7.6 4.4 7.6-4.4M12 12.1V21" stroke="currentColor" stroke-width="1.4"/>
+            </svg>
+          </span>
+          <div><span class="channel-title">Application packages</span><span class="channel-caption">winget package upgrades</span></div>
+          <div class="channel-count">$wingetCount<small>Updates</small></div>
+          <span class="channel-state $($wingetState.Class)">$($wingetState.Label)</span>
+          <div>$wingetDetails</div>
+        </article>
+      </div>
+    </section>
+
+    <aside class="panel device-profile" aria-labelledby="device-heading">
+      <div class="panel-heading">
+        <div>
+          <h2 id="device-heading">Device profile</h2>
+          <p>Inventory captured at run time</p>
+        </div>
+      </div>
+      <dl class="profile-list">
+        <div class="profile-row"><dt>Device name</dt><dd>$computerName</dd></div>
+        <div class="profile-row"><dt>Manufacturer</dt><dd>$manufacturer</dd></div>
+        <div class="profile-row"><dt>Model</dt><dd>$model</dd></div>
+        <div class="profile-row"><dt>Serial number</dt><dd>$serialNumber</dd></div>
+        <div class="profile-row"><dt>Operating system</dt><dd>$osName</dd></div>
+        <div class="profile-row"><dt>OS build</dt><dd>$osBuild</dd></div>
+        <div class="profile-row"><dt>BIOS version</dt><dd>$biosVersion</dd></div>
+        <div class="profile-row"><dt>BIOS date</dt><dd>$biosDateDisplay</dd></div>
+        <div class="profile-row"><dt>Processor</dt><dd>$processor</dd></div>
+        <div class="profile-row"><dt>Memory</dt><dd>$totalRam</dd></div>
+      </dl>
+    </aside>
+
+    <section class="panel attention" aria-labelledby="attention-heading">
+      <div class="panel-heading">
+        <div>
+          <h2 id="attention-heading">Attention needed</h2>
+          <p>Exceptions and follow-up from this run</p>
+        </div>
+        <span class="section-count">$attentionSummary</span>
+      </div>
+      <ul class="notice-list">$noticeRows</ul>
+    </section>
+
+    <section class="panel run-details" aria-labelledby="details-heading">
+      <div class="panel-heading">
+        <div>
+          <h2 id="details-heading">Run details</h2>
+          <p>Execution metadata for audit and support</p>
+        </div>
+      </div>
+      <dl class="detail-grid">
+        <div class="detail-item"><dt>Mode</dt><dd>$(if ($DryRun) { "Dry run · no changes" } else { "Live update" })</dd></div>
+        <div class="detail-item"><dt>Exit code</dt><dd>$exitCode</dd></div>
+        <div class="detail-item"><dt>Duration</dt><dd>$durationDisplay · $durationSeconds seconds</dd></div>
+        <div class="detail-item"><dt>Reboot</dt><dd>$rebootLabel</dd></div>
+      </dl>
+      <div class="log-path"><span>Log file</span><code>$logFileDisplay</code></div>
+    </section>
   </div>
 
-  <div class="footer">
-    SystemUpdatePro v$($script:Version) | Generated $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | $($env:COMPUTERNAME)
-  </div>
-</div>
+  <footer class="footer">
+    <span><strong>SystemUpdatePro</strong> v$versionDisplay</span>
+    <span>$computerName · Report generated $generatedDisplay</span>
+  </footer>
+</main>
 </body>
 </html>
 "@
@@ -1942,7 +3043,9 @@ function New-HTMLReport {
         if (-not $isHeadless -and -not $isSystem) {
             try {
                 Start-Process $reportFile -ErrorAction SilentlyContinue
-            } catch {}
+            } catch {
+                Write-Log "Could not auto-open HTML report: $($_.Exception.Message)" "DEBUG"
+            }
         }
     } catch {
         Write-Log "Failed to write HTML report: $($_.Exception.Message)" "WARNING"
