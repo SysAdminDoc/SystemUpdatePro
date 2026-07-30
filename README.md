@@ -40,6 +40,7 @@ SystemUpdatePro is a fully automated, self-healing PowerShell script that handle
 - **DryRun Mode**: Preview all available updates without installing anything
 - **Driver Backup**: Export current drivers before installing updates for rollback capability
 - **Verified Dependencies**: Restricts downloads and redirects to approved HTTPS origins, checks hashes and publishers before execution, enforces safe version floors, and never changes PowerShell Gallery trust
+- **Capability Matrix**: Gates each provider by Windows build/edition, Server/Core, architecture, PowerShell runtime, execution context, and verified provider version
 - **Privileged Mutation Recovery**: Atomically journals exact registry, service, cache, and scheduled-task before-images; startup rolls back interrupted runs before allowing new changes
 
 ### Enterprise Integration
@@ -50,16 +51,30 @@ SystemUpdatePro is a fully automated, self-healing PowerShell script that handle
 - **Log Rotation**: Automatic cleanup of old log files
 - **HTML Reports**: Responsive operations-dashboard report with update channels, dependency provenance, device profile, exceptions, and print styles
 - **Webhook Notifications**: Send completion status to Slack, Teams, or any generic webhook
-- **Update History**: Schema-versioned JSON history with stage/item outcomes, provider codes, dependency provenance, and evidence-delivery status
+- **Update History**: Schema-versioned JSON history with stage/item outcomes, provider codes, platform/provider capabilities, dependency provenance, and evidence-delivery status
 
 ---
 
 ## Requirements
 
-- **OS**: Windows 10, Windows 11, or Windows Server 2016+
-- **PowerShell**: 5.1 or higher
-- **Privileges**: Administrator
-- **Network**: Internet access required
+- **OS baseline**: Windows build 14393 or later; provider-specific limits are enforced before each operation
+- **PowerShell**: Windows PowerShell 5.1 or PowerShell 7
+- **Privileges**: Administrator user or `NT AUTHORITY\SYSTEM`
+- **Network**: Access to the enabled providers' approved origins
+
+### Automated capability contract
+
+These combinations are exercised by the PowerShell 5.1 and PowerShell 7 Pester suite. They are capability boundaries, not a claim that every OEM model is supported; the signed OEM tool must still complete an applicability scan for the detected model.
+
+| Platform | Windows Update / servicing | WinGet CLI | OEM adapters |
+|----------|----------------------------|------------|--------------|
+| Windows 10 build 14393-17762 | Enabled | Skipped: requires build 17763+ | Dell/Lenovo on x64 when applicable; HPIA requires build 17763+ |
+| Windows 10 build 17763+ / Windows 11 | Enabled | Administrator-user context only | Dell/Lenovo on x64; HPIA on x64/ARM64; matching manufacturer required |
+| Server 2016/2019/2022, Desktop or Core | Enabled | Skipped | Skipped |
+| Server 2025 Desktop Experience | Enabled | Administrator-user context only | Skipped |
+| Server 2025 Core | Enabled | Skipped | Skipped |
+
+Windows Update and inbox servicing accept x86, x64, and ARM64. The WinGet CLI matrix accepts x86, x64, and ARM64 but intentionally blocks `SYSTEM`, where the CLI cannot reliably enumerate user-scoped packages. Dell may run an already verified 5.7.0+ CLI under `SYSTEM`, but its WinGet bootstrap requires an administrator-user context. Missing or stale Lenovo and HP tooling is replaced from the pinned manifest before use.
 
 ---
 
@@ -194,6 +209,8 @@ cd SystemUpdatePro
 Firmware is excluded by default. With `-IncludeBIOS`, Dell Command Update, LSUClient, or HP Image Assistant must first complete an applicability scan for the detected model. Disk, AC, charge, or BitLocker query failures remain `Unknown` and block firmware even with `-Force`; non-firmware OEM updates may continue. Active BitLocker is accepted only for Dell's documented `-autoSuspendBitLocker=enable` path. Lenovo and HP require protection to be suspended beforehand.
 
 Elevated dependencies are defined in one in-script acquisition manifest. WinGet 1.29.280, PSWindowsUpdate 2.2.1.5, LSUClient 1.8.1, Dell Command Update 5.7.0, and HPIA 5.3.6 are pinned to their approved origins and digests. A valid newer installed WinGet, Dell CLI, or HP Image Assistant is accepted only when it meets the recorded minimum and publisher contract. Dell update execution also requires a signed Inventory Collector 13.8.0 or later. PowerShell modules are loaded by their verified versioned manifest path, so an unverified higher version cannot take precedence.
+
+Preflight records the capability schema, OS build/edition, installation type, architecture, PowerShell runtime, execution context, and each provider's detected/minimum/acquisition version. Unsupported providers are skipped with a machine-readable reason rather than invoked optimistically. The same assessment is preserved across reboot continuation and included in history, generic webhook payloads, and HTML run details.
 
 ---
 

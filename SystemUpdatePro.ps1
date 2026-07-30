@@ -98,7 +98,7 @@
     # Windows + Winget only, cleanup after
 .NOTES
     Version: 4.1.0
-    Requires: Administrator, PowerShell 5.1+, Internet
+    Requires: Administrator, PowerShell 5.1+, and a supported provider capability
 
     EXIT CODES:
         0 = Success, no reboot needed
@@ -149,6 +149,7 @@ $script:ProductName = "SystemUpdatePro"
 $script:EventLogSource = "SystemUpdatePro"
 $script:ResultSchemaVersion = 1
 $script:StateSchemaVersion = 3
+$script:CapabilitySchemaVersion = 1
 $script:MaxContinuationAttempts = 3
 $script:RunId = [guid]::NewGuid().ToString()
 $script:RunStartedAt = Get-Date
@@ -190,6 +191,7 @@ $script:FirmwarePrerequisites = $null
 $script:AcquisitionManifestVersion = 1
 $script:AcquisitionManifest = $null
 $script:AcquisitionProvenance = [System.Collections.ArrayList]::new()
+$script:CapabilityAssessment = $null
 $script:PSModuleInstallRoot = Join-Path ([Environment]::GetFolderPath("ProgramFiles")) "WindowsPowerShell\Modules"
 $script:HPIAInstallRoot = "C:\ProgramData\SystemUpdatePro\HPIA"
 
@@ -604,6 +606,7 @@ function New-RunData {
         Stages           = $stages
         Dependencies     = @($script:AcquisitionProvenance)
         MutationRecovery = @($script:MutationEvidence)
+        Capabilities     = $script:CapabilityAssessment
         EvidenceDelivery = @{}
     }
 }
@@ -953,6 +956,7 @@ function New-ContinuationState {
         StageResults   = @($script:StageResults)
         AcquisitionProvenance = @($script:AcquisitionProvenance)
         MutationEvidence = @($script:MutationEvidence)
+        Capabilities   = $script:CapabilityAssessment
         Errors         = @($script:Errors)
         Warnings       = @($script:Warnings)
     }
@@ -1017,6 +1021,9 @@ function Import-ContinuationState {
     foreach ($mutation in @($State.MutationEvidence)) {
         [void]$script:MutationEvidence.Add([PSCustomObject]$mutation)
     }
+    if ($State.Contains("Capabilities") -and $null -ne $State.Capabilities) {
+        $script:CapabilityAssessment = ConvertTo-Hashtable -InputObject $State.Capabilities
+    }
 
     $script:LogFile = Join-Path $LogPath "$($script:ProductName)_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
     $script:TranscriptFile = Join-Path $LogPath "$($script:ProductName)_Transcript_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
@@ -1043,6 +1050,7 @@ function Set-ContinuationCursor {
     $script:ContinuationState.StageResults = @($script:StageResults)
     $script:ContinuationState.AcquisitionProvenance = @($script:AcquisitionProvenance)
     $script:ContinuationState.MutationEvidence = @($script:MutationEvidence)
+    $script:ContinuationState.Capabilities = $script:CapabilityAssessment
     $script:ContinuationState.Errors = @($script:Errors)
     $script:ContinuationState.Warnings = @($script:Warnings)
     $script:ContinuationState.Parameters = Get-EffectiveRunParameter
@@ -1702,6 +1710,7 @@ function Save-UpdateHistory {
             stages            = @($RunData.Stages)
             dependencies      = @($RunData.Dependencies)
             mutation_recovery = @($RunData.MutationRecovery)
+            capabilities      = $RunData.Capabilities
             evidence_delivery = $RunData.EvidenceDelivery
             parameters        = [ordered]@{
                 SkipOEM           = $SkipOEM.IsPresent
@@ -2285,6 +2294,19 @@ function Get-SystemInfo {
     $bios = Get-CimInstance -ClassName Win32_BIOS -ErrorAction SilentlyContinue
     $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction SilentlyContinue
     $cpu = Get-CimInstance -ClassName Win32_Processor -ErrorAction SilentlyContinue | Select-Object -First 1
+    $currentVersion = Get-ItemProperty -LiteralPath "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" `
+        -ErrorAction SilentlyContinue
+    $productType = if ($null -ne $os.ProductType) { [int]$os.ProductType } else { 0 }
+    $installationType = [string]$currentVersion.InstallationType
+    if ([string]::IsNullOrWhiteSpace($installationType) -and $productType -eq 1) {
+        $installationType = "Client"
+    }
+    $runContext = try {
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        if ($identity.IsSystem) { "System" } else { "AdministratorUser" }
+    } catch {
+        "Unknown"
+    }
 
     return @{
         Manufacturer = $cs.Manufacturer
@@ -2295,9 +2317,545 @@ function Get-SystemInfo {
         OSName = $os.Caption
         OSVersion = $os.Version
         OSBuild = $os.BuildNumber
+        ProductType = $productType
+        OperatingSystemSKU = $os.OperatingSystemSKU
+        InstallationType = $installationType
+        EditionID = $currentVersion.EditionID
+        DisplayVersion = $currentVersion.DisplayVersion
+        Architecture = Get-SystemArchitecture
+        PowerShellVersion = $PSVersionTable.PSVersion.ToString()
+        PowerShellEdition = [string]$PSVersionTable.PSEdition
+        ExecutionContext = $runContext
+        IsServer = ($productType -in @(2, 3))
+        IsServerCore = ($installationType -match "(?i)Core")
         TotalRAM = [math]::Round($cs.TotalPhysicalMemory / 1GB, 1)
         Processor = $cpu.Name
     }
+}
+
+# ============================================================================
+# PLATFORM AND PROVIDER CAPABILITY CONTRACT
+# ============================================================================
+
+function Get-CapabilityMatrix {
+    $manifest = Get-AcquisitionManifest
+    return [ordered]@{
+        SchemaVersion = $script:CapabilitySchemaVersion
+        Platform = [ordered]@{
+            MinimumBuild = 14393
+            MinimumPowerShellVersion = "5.1"
+            Architectures = @("x86", "x64", "arm64")
+            ProductTypes = @(1, 2, 3)
+            InstallationTypes = @("Client", "Server", "Server Core")
+            PowerShellEditions = @("Desktop", "Core")
+            UnsupportedEditionPatterns = @("(?i)Nano")
+        }
+        Providers = [ordered]@{
+            WindowsUpdate = [ordered]@{
+                DisplayName = "Windows Update"
+                ClientMinimumBuild = 14393
+                ServerMinimumBuild = 14393
+                SupportsServer = $true
+                SupportsServerCore = $true
+                Architectures = @("x86", "x64", "arm64")
+                Contexts = @("AdministratorUser", "System")
+                BootstrapContexts = @("AdministratorUser", "System")
+                DependencyName = "PSWindowsUpdate"
+                VersionPolicy = "BuiltInFallback"
+                MinimumVersion = [string]$manifest.PSWindowsUpdate.MinimumVersion
+                AcquisitionVersion = [string]$manifest.PSWindowsUpdate.ExactVersion
+                ManufacturerPattern = ""
+            }
+            WindowsServicing = [ordered]@{
+                DisplayName = "Windows servicing"
+                ClientMinimumBuild = 14393
+                ServerMinimumBuild = 14393
+                SupportsServer = $true
+                SupportsServerCore = $true
+                Architectures = @("x86", "x64", "arm64")
+                Contexts = @("AdministratorUser", "System")
+                BootstrapContexts = @()
+                DependencyName = "DISM/SFC"
+                VersionPolicy = "Inbox"
+                MinimumVersion = "Inbox"
+                AcquisitionVersion = ""
+                ManufacturerPattern = ""
+            }
+            Winget = [ordered]@{
+                DisplayName = "WinGet CLI"
+                ClientMinimumBuild = 17763
+                ServerMinimumBuild = 26100
+                SupportsServer = $true
+                SupportsServerCore = $false
+                Architectures = @("x86", "x64", "arm64")
+                Contexts = @("AdministratorUser")
+                BootstrapContexts = @("AdministratorUser")
+                DependencyName = "WinGet"
+                VersionPolicy = "VerifiedAcquisition"
+                MinimumVersion = [string]$manifest.WinGet.MinimumVersion
+                AcquisitionVersion = [string]$manifest.WinGet.ExactVersion
+                ManufacturerPattern = ""
+            }
+            Dell = [ordered]@{
+                DisplayName = "Dell Command Update"
+                ClientMinimumBuild = 14393
+                ServerMinimumBuild = 0
+                SupportsServer = $false
+                SupportsServerCore = $false
+                Architectures = @($manifest.DellCommandUpdate.Architectures)
+                Contexts = @("AdministratorUser", "System")
+                BootstrapContexts = @("AdministratorUser")
+                DependencyName = "DellCommandUpdate"
+                VersionPolicy = "VerifiedAcquisition"
+                MinimumVersion = [string]$manifest.DellCommandUpdate.MinimumVersion
+                AcquisitionVersion = [string]$manifest.DellCommandUpdate.ExactVersion
+                AdditionalMinimumVersions = [ordered]@{
+                    InventoryCollector = [string]$manifest.DellCommandUpdate.InventoryCollectorMinimum
+                }
+                ManufacturerPattern = "(?i)DELL|ALIENWARE"
+            }
+            Lenovo = [ordered]@{
+                DisplayName = "Lenovo LSUClient"
+                ClientMinimumBuild = 14393
+                ServerMinimumBuild = 0
+                SupportsServer = $false
+                SupportsServerCore = $false
+                Architectures = @("x64")
+                Contexts = @("AdministratorUser", "System")
+                BootstrapContexts = @("AdministratorUser", "System")
+                DependencyName = "LSUClient"
+                VersionPolicy = "VerifiedAcquisition"
+                MinimumVersion = [string]$manifest.LSUClient.MinimumVersion
+                AcquisitionVersion = [string]$manifest.LSUClient.ExactVersion
+                ManufacturerPattern = "(?i)LENOVO"
+            }
+            HP = [ordered]@{
+                DisplayName = "HP Image Assistant"
+                ClientMinimumBuild = 17763
+                ServerMinimumBuild = 0
+                SupportsServer = $false
+                SupportsServerCore = $false
+                Architectures = @($manifest.HPIA.Architectures)
+                Contexts = @("AdministratorUser", "System")
+                BootstrapContexts = @("AdministratorUser", "System")
+                DependencyName = "HPIA"
+                VersionPolicy = "VerifiedAcquisition"
+                MinimumVersion = [string]$manifest.HPIA.InstalledMinimumVersion
+                AcquisitionVersion = [string]$manifest.HPIA.ExactVersion
+                ManufacturerPattern = "(?i)HP|HEWLETT"
+            }
+        }
+    }
+}
+
+function Get-ProviderVersionInventory {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary]$SystemInfo,
+        [AllowNull()][System.Collections.IDictionary]$Matrix = $null
+    )
+
+    if ($null -eq $Matrix) { $Matrix = Get-CapabilityMatrix }
+    $inventory = [ordered]@{}
+
+    $psWindowsUpdate = Test-InstalledPSModule -ModuleName "PSWindowsUpdate"
+    $inventory.WindowsUpdate = if ($psWindowsUpdate.Valid) {
+        [ordered]@{
+            Status = "Ready"; Version = [string]$psWindowsUpdate.Version
+            Source = "PSWindowsUpdate"; Reason = "Verified pinned PSWindowsUpdate payload is installed"
+        }
+    } else {
+        [ordered]@{
+            Status = "BuiltInFallback"; Version = [string]$SystemInfo.OSVersion
+            Source = "Windows Update Agent"
+            Reason = "Verified PSWindowsUpdate is not installed; the inbox WUA fallback remains available"
+        }
+    }
+
+    $windowsRoot = if ([string]::IsNullOrWhiteSpace([string]$script:WindowsRoot)) {
+        [string]$env:SystemRoot
+    } else {
+        [string]$script:WindowsRoot
+    }
+    $dismPath = Join-Path $windowsRoot "System32\dism.exe"
+    $sfcPath = Join-Path $windowsRoot "System32\sfc.exe"
+    $servicingReady = (
+        (Test-Path -LiteralPath $dismPath -PathType Leaf) -and
+        (Test-Path -LiteralPath $sfcPath -PathType Leaf)
+    )
+    $inventory.WindowsServicing = [ordered]@{
+        Status = $(if ($servicingReady) { "Ready" } else { "Unavailable" })
+        Version = [string]$SystemInfo.OSVersion
+        Source = "Windows inbox"
+        Reason = $(if ($servicingReady) {
+            "Inbox DISM and SFC are present"
+        } else {
+            "Inbox DISM or SFC is missing"
+        })
+    }
+
+    $wingetEvidence = Get-WingetTrustEvidence
+    $inventory.Winget = if ($wingetEvidence.Valid) {
+        [ordered]@{
+            Status = "Ready"; Version = [string]$wingetEvidence.Version
+            Source = "Microsoft Desktop App Installer"
+            Reason = "Installed WinGet meets the pinned version and publisher policy"
+        }
+    } else {
+        [ordered]@{
+            Status = "AcquisitionRequired"; Version = ""; Source = "Pinned acquisition manifest"
+            Reason = [string]$wingetEvidence.Reason
+        }
+    }
+
+    $manufacturer = [string]$SystemInfo.Manufacturer
+    $dellSpec = Get-AcquisitionManifestEntry -Name "DellCommandUpdate"
+    if ($manufacturer -match [string]$Matrix.Providers.Dell.ManufacturerPattern) {
+        $dellEvidence = $null
+        foreach ($candidate in @(
+            "${env:ProgramFiles}\Dell\CommandUpdate\dcu-cli.exe",
+            "${env:ProgramFiles(x86)}\Dell\CommandUpdate\dcu-cli.exe"
+        )) {
+            $candidateEvidence = Get-InstalledExecutableEvidence -Path $candidate `
+                -MinimumVersion $dellSpec.MinimumVersion -PublisherPattern $dellSpec.PublisherPattern
+            if ($candidateEvidence.Valid) {
+                $dellEvidence = $candidateEvidence
+                break
+            }
+        }
+        $inventoryEvidence = Get-DellInventoryCollectorEvidence
+        $inventory.Dell = if ($null -ne $dellEvidence -and $inventoryEvidence.Valid) {
+            [ordered]@{
+                Status = "Ready"; Version = [string]$dellEvidence.Version
+                Source = "Dell Command Update"
+                Reason = "Dell Command Update and Inventory Collector meet the minimum version policy"
+            }
+        } else {
+            $dellReasons = @()
+            if ($null -eq $dellEvidence) { $dellReasons += "Dell Command Update is missing or unverified" }
+            if (-not $inventoryEvidence.Valid) {
+                $dellReasons += "Inventory Collector: $($inventoryEvidence.Reason)"
+            }
+            [ordered]@{
+                Status = "AcquisitionRequired"; Version = ""; Source = "Pinned acquisition manifest"
+                Reason = $dellReasons -join "; "
+            }
+        }
+    } else {
+        $inventory.Dell = [ordered]@{
+            Status = "NotApplicable"; Version = ""; Source = ""
+            Reason = "Manufacturer does not use the Dell adapter"
+        }
+    }
+
+    if ($manufacturer -match [string]$Matrix.Providers.Lenovo.ManufacturerPattern) {
+        $lenovoEvidence = Test-InstalledPSModule -ModuleName "LSUClient"
+        $inventory.Lenovo = if ($lenovoEvidence.Valid) {
+            [ordered]@{
+                Status = "Ready"; Version = [string]$lenovoEvidence.Version
+                Source = "LSUClient"; Reason = "Verified pinned LSUClient payload is installed"
+            }
+        } else {
+            [ordered]@{
+                Status = "AcquisitionRequired"; Version = ""; Source = "Pinned acquisition manifest"
+                Reason = [string]$lenovoEvidence.Reason
+            }
+        }
+    } else {
+        $inventory.Lenovo = [ordered]@{
+            Status = "NotApplicable"; Version = ""; Source = ""
+            Reason = "Manufacturer does not use the Lenovo adapter"
+        }
+    }
+
+    if ($manufacturer -match [string]$Matrix.Providers.HP.ManufacturerPattern) {
+        $hpSpec = Get-AcquisitionManifestEntry -Name "HPIA"
+        $hpEvidence = $null
+        foreach ($searchPath in @(
+            $script:HPIAInstallRoot,
+            "C:\SWSetup\SP*",
+            "${env:ProgramFiles}\HP\HPIA"
+        )) {
+            foreach ($candidate in @(Get-ChildItem -Path $searchPath -Filter "HPImageAssistant.exe" `
+                -File -Recurse -ErrorAction SilentlyContinue)) {
+                $candidateEvidence = Get-InstalledExecutableEvidence -Path $candidate.FullName `
+                    -MinimumVersion $hpSpec.InstalledMinimumVersion `
+                    -PublisherPattern $hpSpec.InstalledPublisherPattern
+                if ($candidateEvidence.Valid) {
+                    $hpEvidence = $candidateEvidence
+                    break
+                }
+            }
+            if ($null -ne $hpEvidence) { break }
+        }
+        $inventory.HP = if ($null -ne $hpEvidence) {
+            [ordered]@{
+                Status = "Ready"; Version = [string]$hpEvidence.Version
+                Source = "HP Image Assistant"
+                Reason = "Installed HP Image Assistant meets the minimum version and publisher policy"
+            }
+        } else {
+            [ordered]@{
+                Status = "AcquisitionRequired"; Version = ""; Source = "Pinned acquisition manifest"
+                Reason = "HP Image Assistant is missing or does not meet the verified version policy"
+            }
+        }
+    } else {
+        $inventory.HP = [ordered]@{
+            Status = "NotApplicable"; Version = ""; Source = ""
+            Reason = "Manufacturer does not use the HP adapter"
+        }
+    }
+
+    return $inventory
+}
+
+function Get-PlatformCapability {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary]$SystemInfo,
+        [AllowNull()][System.Collections.IDictionary]$Matrix = $null
+    )
+
+    if ($null -eq $Matrix) { $Matrix = Get-CapabilityMatrix }
+    $unknown = [System.Collections.ArrayList]::new()
+    $unsupported = [System.Collections.ArrayList]::new()
+
+    $build = 0
+    if (-not [int]::TryParse([string]$SystemInfo.OSBuild, [ref]$build)) {
+        [void]$unknown.Add("OS build could not be determined")
+    } elseif ($build -lt [int]$Matrix.Platform.MinimumBuild) {
+        [void]$unsupported.Add(
+            "OS build $build is below the supported floor $($Matrix.Platform.MinimumBuild)"
+        )
+    }
+
+    $productType = 0
+    if (-not [int]::TryParse([string]$SystemInfo.ProductType, [ref]$productType) -or
+        $productType -notin @($Matrix.Platform.ProductTypes)) {
+        [void]$unknown.Add("Windows product type could not be classified")
+    }
+
+    $installationType = [string]$SystemInfo.InstallationType
+    if ([string]::IsNullOrWhiteSpace($installationType)) {
+        [void]$unknown.Add("Windows installation type could not be determined")
+    } elseif ($installationType -notin @($Matrix.Platform.InstallationTypes)) {
+        [void]$unsupported.Add("Windows installation type '$installationType' is unsupported")
+    }
+
+    $editionId = [string]$SystemInfo.EditionID
+    $operatingSystemSKU = 0
+    [void][int]::TryParse([string]$SystemInfo.OperatingSystemSKU, [ref]$operatingSystemSKU)
+    if ([string]::IsNullOrWhiteSpace($editionId) -and $operatingSystemSKU -le 0) {
+        [void]$unknown.Add("Windows edition could not be determined")
+    } elseif (@($Matrix.Platform.UnsupportedEditionPatterns | Where-Object {
+        -not [string]::IsNullOrWhiteSpace($editionId) -and $editionId -match [string]$_
+    }).Count -gt 0) {
+        [void]$unsupported.Add("Windows edition '$editionId' is unsupported")
+    }
+
+    $architecture = ([string]$SystemInfo.Architecture).ToLowerInvariant()
+    if ([string]::IsNullOrWhiteSpace($architecture) -or $architecture -eq "unknown") {
+        [void]$unknown.Add("Processor architecture could not be determined")
+    } elseif ($architecture -notin @($Matrix.Platform.Architectures)) {
+        [void]$unsupported.Add("Architecture '$architecture' is unsupported")
+    }
+
+    $powerShellVersion = ConvertTo-SafeVersion -Value ([string]$SystemInfo.PowerShellVersion)
+    if ($null -eq $powerShellVersion) {
+        [void]$unknown.Add("PowerShell version could not be determined")
+    } elseif (-not (Test-VersionAtLeast -Version $powerShellVersion `
+        -MinimumVersion ([string]$Matrix.Platform.MinimumPowerShellVersion))) {
+        [void]$unsupported.Add(
+            "PowerShell $powerShellVersion is below $($Matrix.Platform.MinimumPowerShellVersion)"
+        )
+    }
+
+    $powerShellEdition = [string]$SystemInfo.PowerShellEdition
+    if ($powerShellEdition -notin @($Matrix.Platform.PowerShellEditions)) {
+        [void]$unsupported.Add("PowerShell edition '$powerShellEdition' is unsupported")
+    }
+
+    $runContext = [string]$SystemInfo.ExecutionContext
+    if ($runContext -notin @("AdministratorUser", "System")) {
+        [void]$unknown.Add("Execution context could not be classified")
+    }
+
+    $status = if ($unknown.Count -gt 0) {
+        "Unknown"
+    } elseif ($unsupported.Count -gt 0) {
+        "Unsupported"
+    } else {
+        "Ready"
+    }
+    $reasons = @($unknown) + @($unsupported)
+    return [ordered]@{
+        Status = $status
+        Supported = ($status -eq "Ready")
+        Reason = $(if ($reasons.Count) { $reasons -join "; " } else { "Platform capability checks passed" })
+        OSBuild = $build
+        ProductType = $productType
+        OperatingSystemSKU = $operatingSystemSKU
+        InstallationType = $installationType
+        EditionID = $editionId
+        IsServer = ($productType -in @(2, 3))
+        IsServerCore = ($installationType -match "(?i)Core")
+        Architecture = $architecture
+        PowerShellVersion = [string]$powerShellVersion
+        PowerShellEdition = $powerShellEdition
+        ExecutionContext = $runContext
+    }
+}
+
+function Get-ProviderCapability {
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("WindowsUpdate", "WindowsServicing", "Winget", "Dell", "Lenovo", "HP")]
+        [string]$Provider,
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary]$SystemInfo,
+        [AllowNull()][System.Collections.IDictionary]$Platform = $null,
+        [AllowNull()][System.Collections.IDictionary]$Matrix = $null,
+        [AllowNull()][System.Collections.IDictionary]$VersionState = $null
+    )
+
+    if ($null -eq $Matrix) { $Matrix = Get-CapabilityMatrix }
+    if ($null -eq $Platform) {
+        $Platform = Get-PlatformCapability -SystemInfo $SystemInfo -Matrix $Matrix
+    }
+    $spec = $Matrix.Providers[$Provider]
+    $reasons = [System.Collections.ArrayList]::new()
+    if ($null -eq $VersionState) {
+        $VersionState = [ordered]@{
+            Status = "Unknown"; Version = ""; Source = ""
+            Reason = "Provider version was not assessed"
+        }
+    }
+
+    if (-not [bool]$Platform.Supported) {
+        [void]$reasons.Add("Platform is $($Platform.Status): $($Platform.Reason)")
+    } else {
+        $buildFloor = if ([bool]$Platform.IsServer) {
+            [int]$spec.ServerMinimumBuild
+        } else {
+            [int]$spec.ClientMinimumBuild
+        }
+        if ([bool]$Platform.IsServer -and -not [bool]$spec.SupportsServer) {
+            [void]$reasons.Add("$($spec.DisplayName) is not supported on Windows Server")
+        } elseif ([int]$Platform.OSBuild -lt $buildFloor) {
+            $platformLabel = if ([bool]$Platform.IsServer) { "Windows Server" } else { "Windows client" }
+            [void]$reasons.Add(
+                "$($spec.DisplayName) requires $platformLabel build $buildFloor or later"
+            )
+        }
+        if ([bool]$Platform.IsServerCore -and -not [bool]$spec.SupportsServerCore) {
+            [void]$reasons.Add("$($spec.DisplayName) is not supported on Server Core")
+        }
+        if ([string]$Platform.Architecture -notin @($spec.Architectures)) {
+            [void]$reasons.Add(
+                "$($spec.DisplayName) is not approved for architecture '$($Platform.Architecture)'"
+            )
+        }
+        if ([string]$Platform.ExecutionContext -notin @($spec.Contexts)) {
+            [void]$reasons.Add(
+                "$($spec.DisplayName) is not supported in the $($Platform.ExecutionContext) context"
+            )
+        }
+        if (-not [string]::IsNullOrWhiteSpace([string]$spec.ManufacturerPattern) -and
+            ([string]$SystemInfo.Manufacturer) -notmatch [string]$spec.ManufacturerPattern) {
+            [void]$reasons.Add(
+                "$($spec.DisplayName) does not match manufacturer '$($SystemInfo.Manufacturer)'"
+            )
+        }
+        if ($reasons.Count -eq 0) {
+            switch ([string]$VersionState.Status) {
+                { $_ -in @("Ready", "BuiltInFallback") } {}
+                "AcquisitionRequired" {
+                    if ([string]$Platform.ExecutionContext -notin @($spec.BootstrapContexts)) {
+                        [void]$reasons.Add(
+                            "$($spec.DisplayName) is not installed at the approved version and cannot be bootstrapped in the $($Platform.ExecutionContext) context"
+                        )
+                    }
+                }
+                default {
+                    [void]$reasons.Add(
+                        "$($spec.DisplayName) version gate is $($VersionState.Status): $($VersionState.Reason)"
+                    )
+                }
+            }
+        }
+    }
+
+    $status = if ($reasons.Count) {
+        "Unsupported"
+    } elseif ([string]$VersionState.Status -eq "AcquisitionRequired") {
+        "RequiresAcquisition"
+    } else {
+        "Ready"
+    }
+    return [ordered]@{
+        Provider = $Provider
+        DisplayName = [string]$spec.DisplayName
+        Status = $status
+        Supported = ($reasons.Count -eq 0)
+        Reason = $(if ($reasons.Count) {
+            @($reasons) -join "; "
+        } elseif ($status -eq "RequiresAcquisition") {
+            "$($spec.DisplayName) requires verified acquisition of version $($spec.AcquisitionVersion): $($VersionState.Reason)"
+        } else {
+            "$($spec.DisplayName) capability and version checks passed"
+        })
+        DependencyName = [string]$spec.DependencyName
+        VersionPolicy = [string]$spec.VersionPolicy
+        MinimumVersion = [string]$spec.MinimumVersion
+        AcquisitionVersion = [string]$spec.AcquisitionVersion
+        VersionStatus = [string]$VersionState.Status
+        DetectedVersion = [string]$VersionState.Version
+        VersionSource = [string]$VersionState.Source
+        VersionReason = [string]$VersionState.Reason
+        Architectures = @($spec.Architectures)
+        Contexts = @($spec.Contexts)
+        BootstrapContexts = @($spec.BootstrapContexts)
+    }
+}
+
+function Get-CapabilityAssessment {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary]$SystemInfo,
+        [AllowNull()][System.Collections.IDictionary]$VersionInventory = $null
+    )
+
+    $matrix = Get-CapabilityMatrix
+    $platform = Get-PlatformCapability -SystemInfo $SystemInfo -Matrix $matrix
+    if ($null -eq $VersionInventory) {
+        $VersionInventory = Get-ProviderVersionInventory -SystemInfo $SystemInfo -Matrix $matrix
+    }
+    $providers = [ordered]@{}
+    foreach ($providerName in @("WindowsUpdate", "WindowsServicing", "Winget", "Dell", "Lenovo", "HP")) {
+        $providers[$providerName] = Get-ProviderCapability -Provider $providerName `
+            -SystemInfo $SystemInfo -Platform $platform -Matrix $matrix `
+            -VersionState $VersionInventory[$providerName]
+    }
+    return [ordered]@{
+        SchemaVersion = $script:CapabilitySchemaVersion
+        EvaluatedAt = (Get-Date).ToUniversalTime().ToString("o")
+        Platform = $platform
+        Providers = $providers
+    }
+}
+
+function Get-AssessedProviderCapability {
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("WindowsUpdate", "WindowsServicing", "Winget", "Dell", "Lenovo", "HP")]
+        [string]$Provider
+    )
+
+    if ($null -eq $script:CapabilityAssessment) {
+        throw "Platform capability assessment has not been initialized"
+    }
+    return $script:CapabilityAssessment.Providers[$Provider]
 }
 
 # ============================================================================
@@ -5428,6 +5986,47 @@ function New-HTMLReport {
     $mutationRecoveryCount = @($mutationEvents | Where-Object {
         [string]$_.Action -in @("Restored", "Committed")
     }).Count
+    $capabilities = Get-ResultValue -Result $RunData -Names @("Capabilities") -Default $null
+    $platformCapabilityDisplay = "Not assessed"
+    $providerCapabilityDisplay = "Not assessed"
+    $runtimeCapabilityDisplay = "Not assessed"
+    if ($null -ne $capabilities) {
+        $platformCapability = Get-ResultValue -Result $capabilities -Names @("Platform") -Default $null
+        if ($null -ne $platformCapability) {
+            $platformCapabilityDisplay = "{0} · {1} build {2} · {3} · {4}" -f @(
+                (& $displayValue (Get-ResultValue -Result $platformCapability -Names @("Status") -Default "Unknown")),
+                (& $displayValue (Get-ResultValue -Result $platformCapability -Names @("InstallationType") -Default "Unknown installation")),
+                (& $displayValue (Get-ResultValue -Result $platformCapability -Names @("OSBuild") -Default "Unknown")),
+                (& $displayValue (Get-ResultValue -Result $platformCapability -Names @("Architecture") -Default "Unknown architecture")),
+                (& $displayValue (Get-ResultValue -Result $platformCapability -Names @("ExecutionContext") -Default "Unknown context"))
+            )
+            $runtimeCapabilityDisplay = "{0} {1}" -f @(
+                (& $displayValue (Get-ResultValue -Result $platformCapability -Names @("PowerShellEdition") -Default "PowerShell")),
+                (& $displayValue (Get-ResultValue -Result $platformCapability -Names @("PowerShellVersion") -Default "Unknown version"))
+            )
+        }
+
+        $providerCapabilities = Get-ResultValue -Result $capabilities -Names @("Providers") -Default $null
+        $providerValues = @()
+        if ($providerCapabilities -is [System.Collections.IDictionary]) {
+            $providerValues = @($providerCapabilities.GetEnumerator() | ForEach-Object { $_.Value })
+        } elseif ($null -ne $providerCapabilities) {
+            $providerValues = @($providerCapabilities.PSObject.Properties | ForEach-Object { $_.Value })
+        }
+        if ($providerValues.Count -gt 0) {
+            $readyProviders = @($providerValues | Where-Object { [string]$_.Status -eq "Ready" }).Count
+            $acquisitionProviders = @($providerValues | Where-Object {
+                [string]$_.Status -eq "RequiresAcquisition"
+            }).Count
+            $unsupportedProviders = @($providerValues | Where-Object {
+                [string]$_.Status -eq "Unsupported"
+            }).Count
+            $providerCapabilityDisplay = (
+                "$readyProviders ready · $acquisitionProviders require acquisition · " +
+                "$unsupportedProviders unsupported"
+            )
+        }
+    }
     $dependencyRows = ""
     foreach ($dependency in $dependencies) {
         $dependencyName = & $displayValue $dependency.Name "Unnamed dependency"
@@ -6595,6 +7194,9 @@ function New-HTMLReport {
         <div class="profile-row"><dt>Serial number</dt><dd>$serialNumber</dd></div>
         <div class="profile-row"><dt>Operating system</dt><dd>$osName</dd></div>
         <div class="profile-row"><dt>OS build</dt><dd>$osBuild</dd></div>
+        <div class="profile-row"><dt>Installation</dt><dd>$(& $displayValue $SysInfo.InstallationType)</dd></div>
+        <div class="profile-row"><dt>Architecture</dt><dd>$(& $displayValue $SysInfo.Architecture)</dd></div>
+        <div class="profile-row"><dt>Run context</dt><dd>$(& $displayValue $SysInfo.ExecutionContext)</dd></div>
         <div class="profile-row"><dt>BIOS version</dt><dd>$biosVersion</dd></div>
         <div class="profile-row"><dt>BIOS date</dt><dd>$biosDateDisplay</dd></div>
         <div class="profile-row"><dt>Processor</dt><dd>$processor</dd></div>
@@ -6636,6 +7238,9 @@ function New-HTMLReport {
         <div class="detail-item"><dt>Exit code</dt><dd>$exitCode</dd></div>
         <div class="detail-item"><dt>Duration</dt><dd>$durationDisplay · $durationSeconds seconds</dd></div>
         <div class="detail-item"><dt>Reboot</dt><dd>$rebootLabel</dd></div>
+        <div class="detail-item"><dt>Platform capability</dt><dd>$platformCapabilityDisplay</dd></div>
+        <div class="detail-item"><dt>Provider capability</dt><dd>$providerCapabilityDisplay</dd></div>
+        <div class="detail-item"><dt>PowerShell runtime</dt><dd>$runtimeCapabilityDisplay</dd></div>
         <div class="detail-item"><dt>Component rollback</dt><dd>$componentRollbackDisplay</dd></div>
         <div class="detail-item"><dt>Mutation recovery</dt><dd>$mutationRecoveryCount verified actions</dd></div>
       </dl>
@@ -6716,6 +7321,7 @@ function Send-WebhookNotification {
         stages          = @($RunData.Stages)
         dependencies    = @($RunData.Dependencies)
         mutation_recovery = @($RunData.MutationRecovery)
+        capabilities    = $RunData.Capabilities
         runtime_seconds = $RunData.DurationSeconds
     }
 
@@ -6891,6 +7497,17 @@ $sysInfo = @{
     BIOSDate = $null
     OSName = ""
     OSBuild = ""
+    ProductType = 0
+    OperatingSystemSKU = 0
+    InstallationType = ""
+    EditionID = ""
+    DisplayVersion = ""
+    Architecture = "unknown"
+    PowerShellVersion = $PSVersionTable.PSVersion.ToString()
+    PowerShellEdition = [string]$PSVersionTable.PSEdition
+    ExecutionContext = "Unknown"
+    IsServer = $false
+    IsServerCore = $false
     Processor = ""
     TotalRAM = 0
 }
@@ -6899,6 +7516,11 @@ $wsusBypassApplied = $false
 $shutdownRequested = $false
 $runData = $null
 $state = @{}
+$oemCapabilityName = ""
+$oemCapability = $null
+$windowsCapability = $null
+$servicingCapability = $null
+$wingetCapability = $null
 
 try {
     :run do {
@@ -7008,6 +7630,72 @@ try {
         $sysInfo = Get-SystemInfo
         Write-Log "System: $($sysInfo.Manufacturer) $($sysInfo.Model)" "INFO"
         Write-Log "OS: $($sysInfo.OSName) (Build $($sysInfo.OSBuild))" "DEBUG"
+        $script:CapabilityAssessment = Get-CapabilityAssessment -SystemInfo $sysInfo
+        $platformCapability = $script:CapabilityAssessment.Platform
+        $windowsCapability = Get-AssessedProviderCapability -Provider "WindowsUpdate"
+        $servicingCapability = Get-AssessedProviderCapability -Provider "WindowsServicing"
+        $wingetCapability = Get-AssessedProviderCapability -Provider "Winget"
+        $oemCapabilityName = if ([string]$sysInfo.Manufacturer -match "DELL|ALIENWARE") {
+            "Dell"
+        } elseif ([string]$sysInfo.Manufacturer -match "LENOVO") {
+            "Lenovo"
+        } elseif ([string]$sysInfo.Manufacturer -match "HP|HEWLETT") {
+            "HP"
+        } else {
+            ""
+        }
+        $oemCapability = if ($oemCapabilityName) {
+            Get-AssessedProviderCapability -Provider $oemCapabilityName
+        } else {
+            $null
+        }
+
+        $platformItemStatus = switch ([string]$platformCapability.Status) {
+            "Ready" { "Succeeded" }
+            "Unknown" { "Unknown" }
+            default { "Blocked" }
+        }
+        [void]$preflightItems.Add((New-UpdateItemResult -Name "Platform capability" `
+            -Status $platformItemStatus -Message ([string]$platformCapability.Reason) `
+            -Evidence @(
+                "capability-schema:$($script:CapabilityAssessment.SchemaVersion)",
+                "build:$($platformCapability.OSBuild)",
+                "installation:$($platformCapability.InstallationType)",
+                "architecture:$($platformCapability.Architecture)",
+                "context:$($platformCapability.ExecutionContext)"
+            )))
+        if (-not [bool]$platformCapability.Supported) {
+            $message = "Platform capability is $($platformCapability.Status): $($platformCapability.Reason)"
+            Write-Log $message "ERROR"
+            [void](Add-StageResult (New-StageResult -Name "Preflight" -Status "Failed" `
+                -Attempted $preflightItems.Count -Failed 1 -ProviderCode 3 -Message $message `
+                -Items @($preflightItems) -StartedAt $preflightStart))
+            $script:ExitCode = 3
+            break run
+        }
+
+        foreach ($capability in @(
+            $(if (-not $SkipWindows) { $windowsCapability }),
+            $(if (-not $SkipWinget) { $wingetCapability }),
+            $(if (-not $SkipOEM -and $null -ne $oemCapability) { $oemCapability })
+        )) {
+            if ($null -eq $capability) { continue }
+            $capabilityItemStatus = switch ([string]$capability.Status) {
+                "Ready" { "Succeeded" }
+                "RequiresAcquisition" { "Warning" }
+                default { "Skipped" }
+            }
+            [void]$preflightItems.Add((New-UpdateItemResult `
+                -Name "$($capability.DisplayName) capability" `
+                -Status $capabilityItemStatus `
+                -Message ([string]$capability.Reason) `
+                -Evidence @(
+                    "version-status:$($capability.VersionStatus)",
+                    "detected-version:$($capability.DetectedVersion)",
+                    "minimum-version:$($capability.MinimumVersion)",
+                    "acquisition-version:$($capability.AcquisitionVersion)"
+                )))
+        }
 
         if (Test-InternetConnection) {
             [void]$preflightItems.Add((New-UpdateItemResult -Name "Internet connectivity" -Status "Succeeded"))
@@ -7135,21 +7823,29 @@ try {
 
         if (-not $script:ContinuationActive) {
             $repairStart = Get-Date
-            if ($RepairWindowsUpdate) {
-            $repairSucceeded = [bool](Repair-WindowsUpdateServices)
-            $repairStage = ConvertTo-StageResult -Name "WindowsUpdateRepair" -Provider "Windows servicing" `
-                -Result @{ Success = $repairSucceeded; Message = $(if ($repairSucceeded) { "Repair completed" } else { "Repair failed" }) } `
-                -StartedAt $repairStart
-            [void](Add-StageResult $repairStage)
-            if ($repairStage.Status -eq "Failed") { $script:ExitCode = 2 }
-            Write-Host ""
+            if ($RepairWindowsUpdate -and -not $servicingCapability.Supported) {
+                [void](Add-StageResult (New-StageResult -Name "WindowsUpdateRepair" `
+                    -Provider "Windows servicing" -Status "Skipped" -Skipped 1 `
+                    -Message $servicingCapability.Reason -StartedAt $repairStart))
+            } elseif ($RepairWindowsUpdate) {
+                $repairSucceeded = [bool](Repair-WindowsUpdateServices)
+                $repairStage = ConvertTo-StageResult -Name "WindowsUpdateRepair" -Provider "Windows servicing" `
+                    -Result @{ Success = $repairSucceeded; Message = $(if ($repairSucceeded) { "Repair completed" } else { "Repair failed" }) } `
+                    -StartedAt $repairStart
+                [void](Add-StageResult $repairStage)
+                if ($repairStage.Status -eq "Failed") { $script:ExitCode = 2 }
+                Write-Host ""
             } else {
                 [void](Add-StageResult (New-StageResult -Name "WindowsUpdateRepair" -Provider "Windows servicing" `
                     -Status "Skipped" -Skipped 1 -Message "Repair not requested" -StartedAt $repairStart))
             }
 
             $wsusStart = Get-Date
-            if ($BypassWSUS) {
+            if ($BypassWSUS -and -not $windowsCapability.Supported) {
+                [void](Add-StageResult (New-StageResult -Name "WSUSBypass" `
+                    -Provider "Windows Update policy" -Status "Skipped" -Skipped 1 `
+                    -Message $windowsCapability.Reason -StartedAt $wsusStart))
+            } elseif ($BypassWSUS) {
                 Set-WSUSBypass -Enable
                 $wsusBypassApplied = $true
                 [void](Add-StageResult (New-StageResult -Name "WSUSBypass" -Provider "Windows Update policy" `
@@ -7160,7 +7856,11 @@ try {
             }
 
             $backupStart = Get-Date
-            if ($BackupDrivers -and -not $SkipOEM) {
+            if ($BackupDrivers -and -not $SkipOEM -and -not $servicingCapability.Supported) {
+                [void](Add-StageResult (New-StageResult -Name "DriverBackup" `
+                    -Provider "Export-WindowsDriver" -Status "Skipped" -Skipped 1 `
+                    -Message $servicingCapability.Reason -StartedAt $backupStart))
+            } elseif ($BackupDrivers -and -not $SkipOEM) {
                 $backupPath = Invoke-DriverBackup
                 $backupSuccess = [bool]$backupPath
                 $backupStage = ConvertTo-StageResult -Name "DriverBackup" -Provider "Export-WindowsDriver" `
@@ -7179,6 +7879,18 @@ try {
                 [void](Add-StageResult (New-StageResult -Name "OEM" -Provider "OEM" -Status "Skipped" `
                     -Skipped 1 -Message "OEM updates skipped by -SkipOEM; remove -SkipOEM to request firmware or OEM drivers" `
                     -StartedAt $oemStart))
+            } elseif ($null -ne $oemCapability -and -not $oemCapability.Supported) {
+                $capabilityItem = New-UpdateItemResult -Name "$($oemCapability.DisplayName) capability" `
+                    -Status $(if ($IncludeBIOS) { "Blocked" } else { "Skipped" }) `
+                    -Message $oemCapability.Reason `
+                    -Evidence @("minimum-version:$($oemCapability.MinimumVersion)")
+                [void](Add-StageResult (New-StageResult -Name "OEM" `
+                    -Provider $oemCapability.DisplayName `
+                    -Status $(if ($IncludeBIOS) { "Partial" } else { "Skipped" }) `
+                    -Skipped 1 -Message $oemCapability.Reason -Items @($capabilityItem) `
+                    -StartedAt $oemStart))
+                Write-Log $oemCapability.Reason "WARNING"
+                if ($IncludeBIOS) { $script:ExitCode = 7 }
             } else {
                 $manufacturer = [string]$sysInfo.Manufacturer
                 $provider = $manufacturer
@@ -7230,6 +7942,11 @@ try {
             if ($SkipWindows) {
                 [void](Add-StageResult (New-StageResult -Name "WindowsUpdate" -Provider "Windows Update" `
                     -Status "Skipped" -Skipped 1 -Message "Windows Update skipped by run configuration" -StartedAt $windowsStart))
+            } elseif (-not $windowsCapability.Supported) {
+                [void](Add-StageResult (New-StageResult -Name "WindowsUpdate" -Provider "Windows Update" `
+                    -Status "Skipped" -Skipped 1 -Message $windowsCapability.Reason `
+                    -Items @((New-UpdateItemResult -Name "Windows Update capability" -Status "Skipped" `
+                        -Message $windowsCapability.Reason)) -StartedAt $windowsStart))
             } else {
                 $wuResult = Invoke-WindowsUpdate -MaxPasses $MaxUpdatePasses
                 $wuStage = ConvertTo-StageResult -Name "WindowsUpdate" -Provider "Windows Update" `
@@ -7250,6 +7967,14 @@ try {
             if ($SkipWinget) {
                 [void](Add-StageResult (New-StageResult -Name "Winget" -Provider "WinGet" -Status "Skipped" `
                     -Skipped 1 -Message "WinGet skipped by run configuration" -StartedAt $wingetStart))
+            } elseif (-not $wingetCapability.Supported) {
+                [void](Add-StageResult (New-StageResult -Name "Winget" -Provider "WinGet" `
+                    -Status "Skipped" -Skipped 1 -Message $wingetCapability.Reason `
+                    -Items @((New-UpdateItemResult -Name "WinGet capability" -Status "Skipped" `
+                        -Message $wingetCapability.Reason `
+                        -Evidence @("minimum-version:$($wingetCapability.MinimumVersion)"))) `
+                    -StartedAt $wingetStart))
+                Write-Log $wingetCapability.Reason "WARNING"
             } else {
                 $wingetResult = Invoke-WingetUpgradeAll
                 $wingetStage = ConvertTo-StageResult -Name "Winget" -Provider "WinGet" `
@@ -7267,7 +7992,11 @@ try {
 
         if (Test-ShouldRunContinuationStage -Stage "Cleanup") {
             $cleanupStart = Get-Date
-            if ($CleanupAfter -or $ResetComponentBase) {
+            if (($CleanupAfter -or $ResetComponentBase) -and -not $servicingCapability.Supported) {
+                [void](Add-StageResult (New-StageResult -Name "Cleanup" `
+                    -Provider "DISM and cleanmgr" -Status "Skipped" -Skipped 1 `
+                    -Message $servicingCapability.Reason -StartedAt $cleanupStart))
+            } elseif ($CleanupAfter -or $ResetComponentBase) {
                 $cleanupResult = Invoke-ComponentCleanup
                 $cleanupStage = ConvertTo-StageResult -Name "Cleanup" -Provider "DISM and cleanmgr" `
                     -Result $cleanupResult `

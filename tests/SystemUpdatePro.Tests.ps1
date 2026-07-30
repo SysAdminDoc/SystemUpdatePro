@@ -23,6 +23,13 @@ BeforeAll {
         "Get-AcquisitionManifest",
         "Get-AcquisitionManifestEntry",
         "Get-SystemArchitecture",
+        "Get-SystemInfo",
+        "Get-CapabilityMatrix",
+        "Get-ProviderVersionInventory",
+        "Get-PlatformCapability",
+        "Get-ProviderCapability",
+        "Get-CapabilityAssessment",
+        "Get-AssessedProviderCapability",
         "Test-AcquisitionUri",
         "ConvertTo-SafeVersion",
         "Test-VersionAtLeast",
@@ -146,6 +153,8 @@ BeforeAll {
         $script:DryRun = [switch]$false
         $script:WebhookUrl = ""
         $script:ResultSchemaVersion = 1
+        $script:CapabilitySchemaVersion = 1
+        $script:CapabilityAssessment = $null
         $script:RunId = "11111111-1111-1111-1111-111111111111"
         $script:StageResults = [System.Collections.ArrayList]::new()
         $script:Errors = [System.Collections.ArrayList]::new()
@@ -206,6 +215,72 @@ BeforeAll {
         $script:LogPath = $stateTestDirectory
         $script:LogRetentionDays = 30
         $script:EntryScriptPath = $script:SourceScriptPath
+    }
+
+    function New-CapabilitySystemInfo {
+        param(
+            [string]$Manufacturer = "Contoso",
+            [string]$OSBuild = "22631",
+            [int]$ProductType = 1,
+            [string]$InstallationType = "Client",
+            [string]$EditionID = "Professional",
+            [int]$OperatingSystemSKU = 48,
+            [string]$Architecture = "x64",
+            [string]$PowerShellVersion = "5.1.22621.2506",
+            [string]$PowerShellEdition = "Desktop",
+            [string]$RunContext = "AdministratorUser"
+        )
+
+        return @{
+            Manufacturer = $Manufacturer
+            OSName = "Microsoft Windows"
+            OSVersion = "10.0.$OSBuild"
+            OSBuild = $OSBuild
+            ProductType = $ProductType
+            InstallationType = $InstallationType
+            EditionID = $EditionID
+            OperatingSystemSKU = $OperatingSystemSKU
+            Architecture = $Architecture
+            PowerShellVersion = $PowerShellVersion
+            PowerShellEdition = $PowerShellEdition
+            ExecutionContext = $RunContext
+        }
+    }
+
+    function New-CapabilityVersionInventory {
+        param(
+            [string]$WingetStatus = "Ready",
+            [string]$DellStatus = "NotApplicable",
+            [string]$LenovoStatus = "NotApplicable",
+            [string]$HPStatus = "NotApplicable"
+        )
+
+        return [ordered]@{
+            WindowsUpdate = [ordered]@{
+                Status = "BuiltInFallback"; Version = "10.0.22631"
+                Source = "Windows Update Agent"; Reason = "Inbox fallback"
+            }
+            WindowsServicing = [ordered]@{
+                Status = "Ready"; Version = "10.0.22631"
+                Source = "Windows inbox"; Reason = "DISM and SFC present"
+            }
+            Winget = [ordered]@{
+                Status = $WingetStatus; Version = $(if ($WingetStatus -eq "Ready") { "1.29.280" } else { "" })
+                Source = "Microsoft Desktop App Installer"; Reason = "WinGet state"
+            }
+            Dell = [ordered]@{
+                Status = $DellStatus; Version = $(if ($DellStatus -eq "Ready") { "5.7.0" } else { "" })
+                Source = "Dell Command Update"; Reason = "Dell state"
+            }
+            Lenovo = [ordered]@{
+                Status = $LenovoStatus; Version = $(if ($LenovoStatus -eq "Ready") { "1.8.1" } else { "" })
+                Source = "LSUClient"; Reason = "Lenovo state"
+            }
+            HP = [ordered]@{
+                Status = $HPStatus; Version = $(if ($HPStatus -eq "Ready") { "5.3.6" } else { "" })
+                Source = "HP Image Assistant"; Reason = "HP state"
+            }
+        }
     }
 }
 
@@ -294,6 +369,163 @@ Describe "Schema-versioned result contract" {
         )
 
         Get-RunExitCode -Stages $stages | Should -Be 1
+    }
+}
+
+Describe "Platform and provider capability matrix" {
+    BeforeEach {
+        Initialize-SystemUpdateProTestState
+    }
+
+    It "derives provider version and architecture gates from the pinned acquisition manifest" {
+        $manifest = Get-AcquisitionManifest
+        $matrix = Get-CapabilityMatrix
+
+        $matrix.SchemaVersion | Should -Be 1
+        $matrix.Providers.Winget.MinimumVersion | Should -Be $manifest.WinGet.MinimumVersion
+        $matrix.Providers.Dell.MinimumVersion | Should -Be $manifest.DellCommandUpdate.MinimumVersion
+        $matrix.Providers.Dell.AdditionalMinimumVersions.InventoryCollector |
+            Should -Be $manifest.DellCommandUpdate.InventoryCollectorMinimum
+        $matrix.Providers.Lenovo.MinimumVersion | Should -Be $manifest.LSUClient.MinimumVersion
+        $matrix.Providers.HP.AcquisitionVersion | Should -Be $manifest.HPIA.ExactVersion
+        @($matrix.Providers.HP.Architectures) | Should -Contain "arm64"
+    }
+
+    It "approves a supported Windows 11 Dell client and records detected provider versions" {
+        $systemInfo = New-CapabilitySystemInfo -Manufacturer "Dell Inc."
+        $versions = New-CapabilityVersionInventory -DellStatus "Ready"
+
+        $assessment = Get-CapabilityAssessment -SystemInfo $systemInfo -VersionInventory $versions
+
+        $assessment.Platform.Status | Should -Be "Ready"
+        $assessment.Providers.WindowsUpdate.Status | Should -Be "Ready"
+        $assessment.Providers.Winget.Status | Should -Be "Ready"
+        $assessment.Providers.Dell.Status | Should -Be "Ready"
+        $assessment.Providers.Dell.DetectedVersion | Should -Be "5.7.0"
+        $assessment.Providers.Dell.VersionPolicy | Should -Be "VerifiedAcquisition"
+        $assessment.Providers.HP.Status | Should -Be "Unsupported"
+        $script:CapabilityAssessment = $assessment
+        (New-RunData -StartedAt (Get-Date).AddSeconds(-1)).Capabilities.Providers.Dell.DetectedVersion |
+            Should -Be "5.7.0"
+    }
+
+    It "keeps inbox updating available but rejects WinGet below the Windows 10 build floor" {
+        $systemInfo = New-CapabilitySystemInfo -OSBuild "17134"
+        $versions = New-CapabilityVersionInventory
+
+        $assessment = Get-CapabilityAssessment -SystemInfo $systemInfo -VersionInventory $versions
+
+        $assessment.Platform.Status | Should -Be "Ready"
+        $assessment.Providers.WindowsUpdate.Status | Should -Be "Ready"
+        $assessment.Providers.WindowsServicing.Status | Should -Be "Ready"
+        $assessment.Providers.Winget.Status | Should -Be "Unsupported"
+        $assessment.Providers.Winget.Reason | Should -Match "17763"
+    }
+
+    It "allows inbox servicing on Server Core while explicitly blocking unsupported providers" {
+        $systemInfo = New-CapabilitySystemInfo -OSBuild "20348" -ProductType 3 `
+            -InstallationType "Server Core" -EditionID "ServerDatacenterCor" `
+            -OperatingSystemSKU 13 -RunContext "System"
+        $versions = New-CapabilityVersionInventory -WingetStatus "AcquisitionRequired"
+
+        $assessment = Get-CapabilityAssessment -SystemInfo $systemInfo -VersionInventory $versions
+
+        $assessment.Platform.Status | Should -Be "Ready"
+        $assessment.Platform.IsServerCore | Should -BeTrue
+        $assessment.Providers.WindowsUpdate.Status | Should -Be "Ready"
+        $assessment.Providers.WindowsServicing.Status | Should -Be "Ready"
+        $assessment.Providers.Winget.Status | Should -Be "Unsupported"
+        $assessment.Providers.Winget.Reason | Should -Match "Windows Server build 26100|Server Core"
+        $assessment.Providers.Dell.Status | Should -Be "Unsupported"
+    }
+
+    It "supports WinGet on Server 2025 Desktop Experience only in an administrator user context" {
+        $versions = New-CapabilityVersionInventory
+        $serverUser = New-CapabilitySystemInfo -OSBuild "26100" -ProductType 3 `
+            -InstallationType "Server" -EditionID "ServerDatacenter" `
+            -OperatingSystemSKU 8 -RunContext "AdministratorUser"
+        $serverSystem = New-CapabilitySystemInfo -OSBuild "26100" -ProductType 3 `
+            -InstallationType "Server" -EditionID "ServerDatacenter" `
+            -OperatingSystemSKU 8 -RunContext "System"
+
+        $userAssessment = Get-CapabilityAssessment -SystemInfo $serverUser -VersionInventory $versions
+        $systemAssessment = Get-CapabilityAssessment -SystemInfo $serverSystem -VersionInventory $versions
+
+        $userAssessment.Providers.Winget.Status | Should -Be "Ready"
+        $systemAssessment.Providers.Winget.Status | Should -Be "Unsupported"
+        $systemAssessment.Providers.Winget.Reason | Should -Match "System context"
+    }
+
+    It "permits verified HPIA acquisition on an ARM64 HP client" {
+        $systemInfo = New-CapabilitySystemInfo -Manufacturer "HP Inc." -OSBuild "26100" `
+            -Architecture "arm64"
+        $versions = New-CapabilityVersionInventory -HPStatus "AcquisitionRequired"
+
+        $assessment = Get-CapabilityAssessment -SystemInfo $systemInfo -VersionInventory $versions
+
+        $assessment.Platform.Status | Should -Be "Ready"
+        $assessment.Providers.HP.Status | Should -Be "RequiresAcquisition"
+        $assessment.Providers.HP.Supported | Should -BeTrue
+        $assessment.Providers.HP.AcquisitionVersion | Should -Be "5.3.6"
+    }
+
+    It "blocks Dell bootstrap under SYSTEM but allows an already verified Dell CLI" {
+        $systemInfo = New-CapabilitySystemInfo -Manufacturer "Dell Inc." -RunContext "System"
+        $missingVersions = New-CapabilityVersionInventory -DellStatus "AcquisitionRequired"
+        $installedVersions = New-CapabilityVersionInventory -DellStatus "Ready"
+
+        $missing = Get-CapabilityAssessment -SystemInfo $systemInfo -VersionInventory $missingVersions
+        $installed = Get-CapabilityAssessment -SystemInfo $systemInfo -VersionInventory $installedVersions
+
+        $missing.Providers.Dell.Status | Should -Be "Unsupported"
+        $missing.Providers.Dell.Reason | Should -Match "cannot be bootstrapped"
+        $installed.Providers.Dell.Status | Should -Be "Ready"
+    }
+
+    It "fails closed when edition, architecture, or execution context cannot be classified" {
+        $systemInfo = New-CapabilitySystemInfo -EditionID "" -OperatingSystemSKU 0 `
+            -Architecture "unknown" -RunContext "Unknown"
+        $versions = New-CapabilityVersionInventory
+
+        $assessment = Get-CapabilityAssessment -SystemInfo $systemInfo -VersionInventory $versions
+
+        $assessment.Platform.Status | Should -Be "Unknown"
+        $assessment.Platform.Supported | Should -BeFalse
+        $assessment.Platform.Reason | Should -Match "edition"
+        $assessment.Platform.Reason | Should -Match "architecture"
+        $assessment.Platform.Reason | Should -Match "Execution context"
+        $assessment.Providers.WindowsUpdate.Status | Should -Be "Unsupported"
+    }
+
+    It "builds a read-only installed-version inventory for the applicable provider" {
+        Mock Test-InstalledPSModule {
+            param($ModuleName)
+            [PSCustomObject]@{
+                Valid = $true
+                Version = $(if ($ModuleName -eq "PSWindowsUpdate") { "2.2.1.5" } else { "1.8.1" })
+                Reason = ""
+            }
+        }
+        Mock Test-Path { $true }
+        Mock Get-WingetTrustEvidence {
+            [PSCustomObject]@{ Valid = $true; Version = "1.29.280"; Reason = "" }
+        }
+        Mock Get-InstalledExecutableEvidence {
+            [PSCustomObject]@{ Valid = $true; Version = "5.7.0"; Reason = "" }
+        }
+        Mock Get-DellInventoryCollectorEvidence {
+            [PSCustomObject]@{ Valid = $true; Version = "13.8.0"; Reason = "" }
+        }
+
+        $systemInfo = New-CapabilitySystemInfo -Manufacturer "Dell Inc."
+        $inventory = Get-ProviderVersionInventory -SystemInfo $systemInfo
+
+        $inventory.WindowsUpdate.Status | Should -Be "Ready"
+        $inventory.WindowsServicing.Status | Should -Be "Ready"
+        $inventory.Winget.Version | Should -Be "1.29.280"
+        $inventory.Dell.Status | Should -Be "Ready"
+        $inventory.Lenovo.Status | Should -Be "NotApplicable"
+        Assert-MockCalled Get-InstalledExecutableEvidence -Times 1 -Exactly
     }
 }
 
@@ -446,11 +678,15 @@ Installer SHA256: $($spec.Sha256)
             -SourceUri "https://hpia.hpcloud.hp.com/downloads/hpia/hp-hpia-5.3.6.exe" `
             -Sha256 ("B" * 64) -Publisher "CN=HP Inc." -Architecture "x64" `
             -InstallPath "C:\ProgramData\SystemUpdatePro\HPIA\HPImageAssistant.exe")
+        $capabilitySystem = New-CapabilitySystemInfo -Manufacturer "HP Inc."
+        $script:CapabilityAssessment = Get-CapabilityAssessment -SystemInfo $capabilitySystem `
+            -VersionInventory (New-CapabilityVersionInventory -HPStatus "Ready")
         $run = New-RunData -StartedAt (Get-Date).AddSeconds(-1)
         $system = @{
             Manufacturer = "HP"; Model = "EliteBook"; SerialNumber = "123"
             OSName = "Windows"; OSBuild = "1"; BIOSVersion = "1"; BIOSDate = Get-Date
-            Processor = "CPU"; TotalRAM = 16
+            Processor = "CPU"; TotalRAM = 16; InstallationType = "Client"
+            Architecture = "x64"; ExecutionContext = "AdministratorUser"
         }
 
         $reportPath = New-HTMLReport -SysInfo $system -RunData $run
@@ -460,6 +696,9 @@ Installer SHA256: $($spec.Sha256)
         $report | Should -Match "HP Image Assistant"
         $report | Should -Match "5\.3\.6\.649"
         $report | Should -Match "C:\\ProgramData\\SystemUpdatePro\\HPIA"
+        $report | Should -Match "Platform capability"
+        $report | Should -Match "Provider capability"
+        $report | Should -Match "AdministratorUser"
     }
 }
 
