@@ -42,14 +42,15 @@ SystemUpdatePro is a fully automated, self-healing PowerShell script that handle
 - **Verified Dependencies**: Restricts downloads and redirects to approved HTTPS origins, checks hashes and publishers before execution, enforces safe version floors, and never changes PowerShell Gallery trust
 - **Capability Matrix**: Gates each provider by Windows build/edition, Server/Core, architecture, PowerShell runtime, execution context, and verified provider version
 - **Privileged Mutation Recovery**: Atomically journals exact registry, service, cache, and scheduled-task before-images; startup rolls back interrupted runs before allowing new changes
+- **Protected Evidence Store**: Uses write-through atomic replacement, last-known-good recovery, corrupt-file quarantine, verified SYSTEM/Administrators ACLs, and configurable secret/serial redaction
 
 ### Enterprise Integration
 - **Event Log**: Writes to Windows Application log for RMM/SIEM visibility
 - **Exit Codes**: Granular exit codes for automation pipelines
 - **WSUS Bypass**: Option to bypass WSUS and connect directly to Microsoft
 - **Post-Reboot Continuation**: Versioned, bounded state machine resumes update stages with the original run settings
-- **Log Rotation**: Automatic cleanup of old log files
-- **HTML Reports**: Responsive operations-dashboard report with update channels, dependency provenance, device profile, exceptions, and print styles
+- **Evidence Retention**: Applies age and total-size limits across logs, transcripts, reports, OEM output, quarantine files, and driver backups
+- **HTML Reports**: Responsive operations-dashboard report with update channels, dependency provenance, retention evidence, device profile, exceptions, and print styles
 - **Webhook Notifications**: Send completion status to Slack, Teams, or any generic webhook
 - **Update History**: Schema-versioned JSON history with stage/item outcomes, provider codes, platform/provider capabilities, dependency provenance, and evidence-delivery status
 
@@ -169,7 +170,7 @@ cd SystemUpdatePro
 .\SystemUpdatePro.ps1 -Force -SkipOEM
 
 # Custom configuration
-.\SystemUpdatePro.ps1 -MaxRetries 5 -MaxUpdatePasses 5 -MinDiskSpaceGB 20 -LogRetentionDays 60
+.\SystemUpdatePro.ps1 -MaxRetries 5 -MaxUpdatePasses 5 -MinDiskSpaceGB 20 -LogRetentionDays 60 -EvidenceMaxSizeMB 1024
 
 # Kitchen sink: backup drivers, dry run with webhook
 .\SystemUpdatePro.ps1 -DryRun -BackupDrivers -WebhookUrl "https://hooks.slack.com/services/..."
@@ -200,7 +201,9 @@ cd SystemUpdatePro
 | `-MinDiskSpaceGB` | Int | 10 | Minimum free disk space required (GB) |
 | `-MinFirmwareChargePercent` | Int | 50 | Minimum battery charge for firmware (10-100) |
 | `-LogPath` | String | C:\ProgramData\SystemUpdatePro\Logs | Log directory |
-| `-LogRetentionDays` | Int | 30 | Days to keep old logs |
+| `-LogRetentionDays` | Int | 30 | Days to retain owned evidence artifacts |
+| `-EvidenceMaxSizeMB` | Int | 512 | Maximum combined size of retained evidence (10-10240 MB) |
+| `-RedactionMode` | Enum | SecretsAndSerials | `Secrets` or `SecretsAndSerials` for persisted evidence |
 | `-Reboot` | Switch | False | Allow automatic reboot if required |
 | `-Force` | Switch | False | Continue non-firmware work despite low disk or pending reboot; never overrides unknown/blocked firmware safety |
 
@@ -255,7 +258,7 @@ Get-EventLog -LogName Application -Source "SystemUpdatePro" -Newest 10
 
 | Path | Purpose |
 |------|---------|
-| `C:\ProgramData\SystemUpdatePro\Logs\` | Log files and HTML reports |
+| `C:\ProgramData\SystemUpdatePro\Logs\` | Logs, transcripts, HTML reports, and OEM command output |
 | `C:\ProgramData\SystemUpdatePro\update.lock` | Lock file (prevents concurrent runs) |
 | `C:\ProgramData\SystemUpdatePro\state.json` | Protected, versioned post-reboot continuation state |
 | `C:\ProgramData\SystemUpdatePro\Journals\` | Protected, run-scoped privileged-mutation recovery journals |
@@ -263,9 +266,13 @@ Get-EventLog -LogName Application -Source "SystemUpdatePro" -Newest 10
 | `C:\ProgramData\SystemUpdatePro\DriverBackups\` | Driver backup snapshots (last 3 kept) |
 | `C:\ProgramData\SystemUpdatePro\HPIA\` | HP Image Assistant installation |
 
-Continuation state is atomically replaced and restricted to SYSTEM, Administrators, and the creating identity. It preserves the run ID, effective parameters, result history, attempt count, and next stage cursor; task command lines contain only the script path. Invalid or broadly writable state is moved to `state.corrupt.<timestamp>.<id>.json` instead of being executed. A continuation can resume at most three times, and terminal success or failure removes its one-shot task and active state.
+Continuation state is atomically replaced and restricted to SYSTEM and Administrators. It preserves the run ID, effective parameters, result history, attempt count, and next stage cursor; task command lines contain only the script path. Schema v3 state migrates to v4 with explicit evidence-policy defaults. Invalid, incompatible, or broadly writable state is quarantined instead of being executed. A continuation can resume at most three times, and terminal success or failure removes its one-shot task and active state.
 
 Privileged mutations use a separate atomic journal with the same protected access model. WSUS policy, service status/startup mode, cleanmgr flags, update-cache directory swaps, and continuation-task replacement are verified and restored in reverse order. An interrupted journal is recovered before a new run can mutate the machine; recovery failure stops the run.
+
+All script-owned local evidence uses write-through temporary files and atomic replacement where the format permits it. Structured files are parsed and schema-validated before promotion; a protected `.previous` copy is restored when the primary is corrupt, and invalid inputs are moved to timestamped quarantine files. Legacy history arrays migrate to the v2 history envelope. Operator-facing evidence always redacts secret-bearing URL/query/header values, and device serials are also redacted by default; use `-RedactionMode Secrets` only when serial retention is operationally required. Active continuation state retains the original webhook endpoint under its private ACL so delivery can resume, then terminal cleanup removes it.
+
+Retention runs at startup and after driver export. It removes only recognized SystemUpdatePro artifacts older than `-LogRetentionDays`, then removes the oldest remaining artifacts until their combined size is at most `-EvidenceMaxSizeMB`; active run files and live state/history recovery copies are excluded. Driver backups remain additionally capped at three. Reports and machine-readable results record exact file/directory counts, bytes freed, remaining bytes, and cleanup errors.
 
 ---
 
@@ -277,6 +284,7 @@ After each run, SystemUpdatePro generates a responsive, self-contained operation
 - A compact device inventory profile
 - Dedicated exceptions and follow-up guidance
 - Audit-friendly run metadata and log location
+- Evidence-retention deletion counts and remaining footprint
 - Responsive layouts for desktop and mobile plus print-optimized styles
 - HTML-encoded machine and update data for safe rendering
 
@@ -329,7 +337,7 @@ When using `-WebhookUrl`, the following JSON payload is sent:
 ```
 
 Slack and Teams webhooks are auto-detected by URL pattern and formatted appropriately.
-The JSON history entry uses the same stage schema and additionally records whether report, Event Log, webhook, and history delivery were attempted and succeeded.
+The JSON history entry uses the same stage schema and additionally records evidence-retention results and whether report, Event Log, webhook, and history delivery were attempted and succeeded.
 
 ---
 

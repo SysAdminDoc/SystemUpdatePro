@@ -20,6 +20,22 @@ BeforeAll {
         "Add-StageResult",
         "Get-RunExitCode",
         "New-RunData",
+        "Test-CurrentIdentityIsAdministrator",
+        "Set-EvidencePathAccess",
+        "Test-EvidencePathAccess",
+        "Test-EvidencePathWriteSafety",
+        "New-ProtectedDirectory",
+        "Add-SensitiveEvidenceValue",
+        "Protect-EvidenceText",
+        "Protect-EvidenceObject",
+        "Write-ProtectedAtomicFile",
+        "Write-ProtectedAtomicJson",
+        "Add-ProtectedEvidenceLine",
+        "Move-EvidenceToQuarantine",
+        "Read-ProtectedJsonFile",
+        "Protect-EvidenceFile",
+        "Protect-EvidenceTree",
+        "Test-LockDocument",
         "Get-AcquisitionManifest",
         "Get-AcquisitionManifestEntry",
         "Get-SystemArchitecture",
@@ -42,6 +58,7 @@ BeforeAll {
         "ConvertTo-Hashtable",
         "Get-EffectiveRunParameter",
         "Get-ContinuationParameterName",
+        "Convert-ContinuationStateSchema",
         "Test-ContinuationState",
         "Set-ContinuationStateAccess",
         "Test-ContinuationStateAccess",
@@ -70,6 +87,14 @@ BeforeAll {
         "Restore-MutationJournalScope",
         "Complete-MutationJournal",
         "Invoke-UnfinishedMutationRecovery",
+        "Get-EvidenceArtifactSize",
+        "Get-EvidenceRetentionCandidate",
+        "Remove-EvidenceRetentionCandidate",
+        "Invoke-EvidenceRetention",
+        "Invoke-LogRotation",
+        "Convert-HistorySchema",
+        "Test-HistoryDocument",
+        "Read-UpdateHistory",
         "Get-ScheduledTaskSnapshot",
         "Restore-ScheduledTaskSnapshot",
         "Register-ContinuationTask",
@@ -155,6 +180,8 @@ BeforeAll {
         $script:ResultSchemaVersion = 1
         $script:CapabilitySchemaVersion = 1
         $script:CapabilityAssessment = $null
+        $script:HistorySchemaVersion = 2
+        $script:LockSchemaVersion = 1
         $script:RunId = "11111111-1111-1111-1111-111111111111"
         $script:StageResults = [System.Collections.ArrayList]::new()
         $script:Errors = [System.Collections.ArrayList]::new()
@@ -165,12 +192,14 @@ BeforeAll {
         $script:OEMUpdates = [System.Collections.ArrayList]::new()
         $script:WindowsUpdates = [System.Collections.ArrayList]::new()
         $script:WingetUpdates = [System.Collections.ArrayList]::new()
-        $script:StateSchemaVersion = 3
+        $script:StateSchemaVersion = 4
         $script:MaxContinuationAttempts = 3
         $script:RunStartedAt = Get-Date
         $stateTestDirectory = Join-Path $TestDrive ([guid]::NewGuid().ToString("N"))
         New-Item -ItemType Directory -Path $stateTestDirectory -Force | Out-Null
         $script:StateFile = Join-Path $stateTestDirectory "state.json"
+        $script:HistoryFile = Join-Path $stateTestDirectory "update_history.json"
+        $script:LockFile = Join-Path $stateTestDirectory "update.lock"
         $script:DataPath = $stateTestDirectory
         $script:TaskName = "SystemUpdatePro_TestContinue"
         $script:ProductName = "SystemUpdatePro"
@@ -189,6 +218,9 @@ BeforeAll {
         New-Item -ItemType Directory -Path $script:MutationJournalDirectory -Force | Out-Null
         $script:MutationJournal = $null
         $script:MutationEvidence = [System.Collections.ArrayList]::new()
+        $script:RetentionResult = $null
+        $script:SensitiveEvidenceValues = [System.Collections.ArrayList]::new()
+        $script:ProtectedEvidenceDirectories = @{}
         $script:WindowsRoot = Join-Path $stateTestDirectory "Windows"
         New-Item -ItemType Directory -Path (Join-Path $script:WindowsRoot "System32") -Force | Out-Null
         $script:PSModuleInstallRoot = Join-Path $stateTestDirectory "Modules"
@@ -214,6 +246,10 @@ BeforeAll {
         $script:MinFirmwareChargePercent = 50
         $script:LogPath = $stateTestDirectory
         $script:LogRetentionDays = 30
+        $script:EvidenceMaxSizeMB = 512
+        $script:RedactionMode = "SecretsAndSerials"
+        $script:LogFile = Join-Path $stateTestDirectory "SystemUpdatePro_test.log"
+        $script:TranscriptFile = Join-Path $stateTestDirectory "SystemUpdatePro_Transcript_test.log"
         $script:EntryScriptPath = $script:SourceScriptPath
     }
 
@@ -702,6 +738,178 @@ Installer SHA256: $($spec.Sha256)
     }
 }
 
+Describe "Protected local evidence store" {
+    BeforeEach {
+        Initialize-SystemUpdateProTestState
+    }
+
+    It "atomically replaces structured evidence and preserves a protected last-known-good copy" {
+        $path = Join-Path $script:DataPath "atomic.json"
+        $validate = {
+            param($data)
+            [PSCustomObject]@{
+                Valid = ($data.value -in @("first", "second"))
+                Reason = "unexpected value"
+            }
+        }
+
+        Write-ProtectedAtomicJson -Path $path -Data ([ordered]@{ value = "first" }) `
+            -DataValidationScript $validate | Should -BeTrue
+        Write-ProtectedAtomicJson -Path $path -Data ([ordered]@{ value = "second" }) `
+            -DataValidationScript $validate | Should -BeTrue
+
+        ((Get-Content -LiteralPath $path -Raw | ConvertFrom-Json).value) | Should -Be "second"
+        ((Get-Content -LiteralPath "$path.previous" -Raw | ConvertFrom-Json).value) |
+            Should -Be "first"
+        (Test-EvidencePathAccess -Path $path).Valid | Should -BeTrue
+        (Test-EvidencePathAccess -Path "$path.previous").Valid | Should -BeTrue
+        $writerSids = @((Get-Acl -LiteralPath $path).Access | Where-Object {
+            $_.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and
+            ($_.FileSystemRights -band [Security.AccessControl.FileSystemRights]::Write)
+        } | ForEach-Object {
+            $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value
+        })
+        $writerSids | Should -Contain "S-1-5-18"
+        $writerSids | Should -Contain "S-1-5-32-544"
+        @(Get-ChildItem -LiteralPath $script:DataPath -Filter "atomic.json.tmp.*").Count |
+            Should -Be 0
+
+        Write-ProtectedAtomicJson -Path $path -Data ([ordered]@{ value = "rejected" }) `
+            -DataValidationScript $validate | Should -BeFalse
+        ((Get-Content -LiteralPath $path -Raw | ConvertFrom-Json).value) | Should -Be "second"
+    }
+
+    It "quarantines a corrupt primary and restores its last-known-good JSON" {
+        $path = Join-Path $script:DataPath "recoverable.json"
+        $validate = {
+            param($data)
+            [PSCustomObject]@{ Valid = ($data.Contains("value")); Reason = "value missing" }
+        }
+        Write-ProtectedAtomicJson -Path $path -Data ([ordered]@{ value = "known-good" }) `
+            -DataValidationScript $validate | Should -BeTrue
+        Write-ProtectedAtomicJson -Path $path -Data ([ordered]@{ value = "current" }) `
+            -DataValidationScript $validate | Should -BeTrue
+        [IO.File]::WriteAllText($path, "{broken")
+
+        $read = Read-ProtectedJsonFile -Path $path -ValidationScript $validate
+
+        $read.Success | Should -BeTrue
+        $read.Recovered | Should -BeTrue
+        $read.Data.value | Should -Be "known-good"
+        ((Get-Content -LiteralPath $path -Raw | ConvertFrom-Json).value) |
+            Should -Be "known-good"
+        @(Get-ChildItem -LiteralPath $script:DataPath -Filter "recoverable.corrupt.*.json").Count |
+            Should -Be 1
+    }
+
+    It "migrates a v3 continuation state to v4 with evidence policy defaults" {
+        $legacy = New-ContinuationState -StageCursor "WindowsUpdate" `
+            -ScriptPath $script:SourceScriptPath
+        $legacy.SchemaVersion = 3
+        [void]$legacy.Parameters.Remove("EvidenceMaxSizeMB")
+        [void]$legacy.Parameters.Remove("RedactionMode")
+        Write-ProtectedAtomicJson -Path $script:StateFile -Data $legacy | Should -BeTrue
+
+        $loaded = Get-State
+
+        $loaded.SchemaVersion | Should -Be 4
+        $loaded.Parameters.EvidenceMaxSizeMB | Should -Be 512
+        $loaded.Parameters.RedactionMode | Should -Be "SecretsAndSerials"
+        $loaded.Contains("_MigrationSourceSchema") | Should -BeFalse
+        ((Get-Content -LiteralPath $script:StateFile -Raw | ConvertFrom-Json).SchemaVersion) |
+            Should -Be 4
+    }
+
+    It "migrates and redacts legacy history without leaving sensitive backup data" {
+        $script:WebhookUrl = "https://hooks.slack.com/services/T00/B00/SECRET"
+        $legacyEntry = [ordered]@{
+            run_id = [guid]::NewGuid().ToString()
+            timestamp = (Get-Date).ToString("o")
+            exit_code = 0
+            serial_number = "SERIAL-123"
+            errors = @("delivery https://hooks.slack.com/services/T00/B00/SECRET failed")
+        }
+        $legacyJson = ConvertTo-Json -InputObject @($legacyEntry) -Depth 8
+        Write-ProtectedAtomicFile -Path $script:HistoryFile -Content $legacyJson |
+            Should -BeTrue
+        Add-SensitiveEvidenceValue -Value "SERIAL-123"
+
+        $history = Read-UpdateHistory
+        $backup = Get-Content -LiteralPath "$($script:HistoryFile).previous" -Raw
+
+        $history.schema_version | Should -Be 2
+        $history.entries.Count | Should -Be 1
+        $history.entries[0].serial_number | Should -Be "[REDACTED]"
+        $history.entries[0].errors[0] | Should -Not -Match "SECRET"
+        $backup | Should -Not -Match "SERIAL-123|SECRET"
+        (Test-HistoryDocument -History (
+            ConvertTo-Hashtable -InputObject ($backup | ConvertFrom-Json)
+        )).Valid | Should -BeTrue
+    }
+
+    It "redacts flushed logs and text artifacts without retaining an unredacted copy" {
+        $script:WebhookUrl = "https://example.test/hook?sig=TOPSECRET"
+        Add-SensitiveEvidenceValue -Value "SERIAL-ABC"
+        $logPath = Join-Path $script:DataPath "SystemUpdatePro_redaction.log"
+
+        Add-ProtectedEvidenceLine -Path $logPath `
+            -Line "Serial SERIAL-ABC endpoint https://example.test/hook?sig=TOPSECRET" |
+            Should -BeTrue
+        $content = Get-Content -LiteralPath $logPath -Raw
+        $content | Should -Not -Match "SERIAL-ABC|TOPSECRET"
+        $content | Should -Match "REDACTED"
+        (Test-EvidencePathAccess -Path $logPath).Valid | Should -BeTrue
+
+        $script:RedactionMode = "Secrets"
+        Protect-EvidenceText -Text "SERIAL-ABC https://example.test/hook?sig=TOPSECRET" |
+            Should -Match "SERIAL-ABC"
+    }
+
+    It "removes only owned expired artifacts and reports exact file, directory, and byte counts" {
+        $oldLog = Join-Path $script:LogPath "SystemUpdatePro_20000101_000000.log"
+        $oldReport = Join-Path $script:LogPath "SystemUpdatePro_Report_20000101_000000.html"
+        $vendorDirectory = Join-Path $script:LogPath "HPIA_20000101_000000"
+        [void](Write-ProtectedAtomicFile -Path $oldLog -Content "12345")
+        [void](Write-ProtectedAtomicFile -Path $oldReport -Content "1234567")
+        [void](New-ProtectedDirectory -Path $vendorDirectory)
+        [void](Write-ProtectedAtomicFile -Path (Join-Path $vendorDirectory "one.log") -Content "123")
+        [void](Write-ProtectedAtomicFile -Path (Join-Path $vendorDirectory "two.xml") -Content "1234")
+        $unowned = Join-Path $script:LogPath "operator-notes.log"
+        [IO.File]::WriteAllText($unowned, "keep")
+
+        foreach ($path in @($oldLog, $oldReport, $vendorDirectory)) {
+            (Get-Item -LiteralPath $path).LastWriteTime = (Get-Date).AddDays(-60)
+        }
+        $result = Invoke-EvidenceRetention -RetentionDays 30 -MaximumSizeMB 512
+
+        $result.DeletedFiles | Should -Be 4
+        $result.DeletedDirectories | Should -Be 1
+        $result.BytesFreed | Should -Be 19
+        $result.Errors.Count | Should -Be 0
+        Test-Path -LiteralPath $unowned | Should -BeTrue
+        Test-Path -LiteralPath $oldLog | Should -BeFalse
+        Test-Path -LiteralPath $vendorDirectory | Should -BeFalse
+    }
+
+    It "enforces the configured evidence size ceiling by deleting oldest owned artifacts first" {
+        $oldLargeLog = Join-Path $script:LogPath "SystemUpdatePro_20000101_000001.log"
+        $newLargeLog = Join-Path $script:LogPath "SystemUpdatePro_20990101_000001.log"
+        [IO.File]::WriteAllBytes($oldLargeLog, (New-Object byte[] (7MB)))
+        [IO.File]::WriteAllBytes($newLargeLog, (New-Object byte[] (5MB)))
+        [void](Set-EvidencePathAccess -Path $oldLargeLog)
+        [void](Set-EvidencePathAccess -Path $newLargeLog)
+        (Get-Item -LiteralPath $oldLargeLog).LastWriteTime = (Get-Date).AddDays(-1)
+
+        $result = Invoke-EvidenceRetention -RetentionDays 30 -MaximumSizeMB 10
+
+        $result.DeletedFiles | Should -Be 1
+        $result.BytesFreed | Should -Be (7MB)
+        $result.RemainingBytes | Should -BeLessOrEqual (10MB)
+        Test-Path -LiteralPath $oldLargeLog | Should -BeFalse
+        Test-Path -LiteralPath $newLargeLog | Should -BeTrue
+    }
+}
+
 Describe "PowerShell 5.1 continuation state machine" {
     BeforeEach {
         Initialize-SystemUpdateProTestState
@@ -729,10 +937,10 @@ Describe "PowerShell 5.1 continuation state machine" {
         if (-not $secondSave) { throw "Second atomic save failed: $script:LastStateError" }
         $loaded = Get-State
 
-        $loaded.SchemaVersion | Should -Be 3
+        $loaded.SchemaVersion | Should -Be 4
         $loaded.Phase | Should -Be "AwaitingReboot"
         $loaded.RunId | Should -Be "11111111-1111-1111-1111-111111111111"
-        $loaded.Parameters.Count | Should -Be 22
+        $loaded.Parameters.Count | Should -Be 24
         $loaded.AcquisitionProvenance.Count | Should -Be 1
         $loaded.AcquisitionProvenance[0].Name | Should -Be "LSUClient"
         $loaded.Parameters.SkipOEM | Should -BeTrue
@@ -743,7 +951,8 @@ Describe "PowerShell 5.1 continuation state machine" {
         (Test-ContinuationStateAccess -Path $script:StateFile).Valid | Should -BeTrue
         (Get-Acl -LiteralPath $script:StateFile).AreAccessRulesProtected | Should -BeTrue
         @(Get-ChildItem -LiteralPath (Split-Path -Parent $script:StateFile) -Filter "state.json.tmp.*").Count | Should -Be 0
-        Test-Path -LiteralPath "$($script:StateFile).previous" | Should -BeFalse
+        Test-Path -LiteralPath "$($script:StateFile).previous" | Should -BeTrue
+        (Test-ContinuationStateAccess -Path "$($script:StateFile).previous").Valid | Should -BeTrue
     }
 
     It "restores every effective parameter, run identity, cursor, and bounded attempt" {
@@ -763,6 +972,8 @@ Describe "PowerShell 5.1 continuation state machine" {
         $script:MinDiskSpaceGB = 20
         $script:MinFirmwareChargePercent = 65
         $script:LogRetentionDays = 60
+        $script:EvidenceMaxSizeMB = 256
+        $script:RedactionMode = "Secrets"
         [void]$script:StageResults.Add((New-StageResult -Name "WindowsUpdate" -Status "Succeeded" `
             -Attempted 1 -Installed 1 -RebootRequired $true))
         $state = New-ContinuationState -StageCursor "Winget" -ScriptPath $script:SourceScriptPath
@@ -793,6 +1004,8 @@ Describe "PowerShell 5.1 continuation state machine" {
         $script:MinDiskSpaceGB | Should -Be 20
         $script:MinFirmwareChargePercent | Should -Be 65
         $script:LogRetentionDays | Should -Be 60
+        $script:EvidenceMaxSizeMB | Should -Be 256
+        $script:RedactionMode | Should -Be "Secrets"
         $script:StageResults[0].RebootRequired | Should -BeFalse
         $script:StageResults[0].RebootSatisfied | Should -BeTrue
         (Get-State).Phase | Should -Be "Running"
@@ -1015,7 +1228,7 @@ Describe "Privileged mutation journal and crash recovery" {
         $journal = New-MutationJournal
         $journalPath = Get-MutationJournalPath
         $journal | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $journalPath
-        Mock Test-ContinuationStateAccess {
+        Mock Test-EvidencePathAccess {
             [PSCustomObject]@{ Valid = $false; Reason = "untrusted ACL" }
         }
 
@@ -1023,7 +1236,9 @@ Describe "Privileged mutation journal and crash recovery" {
 
         $result.Failed | Should -Be 1
         $result.Messages[0] | Should -Match "untrusted ACL"
-        Test-Path -LiteralPath $journalPath | Should -BeTrue
+        Test-Path -LiteralPath $journalPath | Should -BeFalse
+        @(Get-ChildItem -LiteralPath $script:MutationJournalDirectory -Filter "*.corrupt.*").Count |
+            Should -Be 1
     }
 
     It "preserves zero, missing, binary, and multi-string registry before-images exactly" {
@@ -1406,6 +1621,8 @@ Describe "Fail-closed firmware safety" {
         Mock Get-Process { @() }
         Mock New-Item {}
         Mock Remove-Item {}
+        Mock New-ProtectedDirectory { $true }
+        Mock Protect-EvidenceTree { $true }
         Mock Start-Process { [PSCustomObject]@{ ExitCode = 0 } }
 
         $result = Invoke-HPUpdate -IncludeBIOS -SystemInfo $hpInfo `

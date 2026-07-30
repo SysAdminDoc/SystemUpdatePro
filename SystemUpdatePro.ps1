@@ -68,6 +68,10 @@
     Custom log directory (default: C:\ProgramData\SystemUpdatePro\Logs)
 .PARAMETER LogRetentionDays
     Days to keep old logs (default: 30)
+.PARAMETER EvidenceMaxSizeMB
+    Maximum combined size of retained logs, reports, and driver backups (default: 512 MB)
+.PARAMETER RedactionMode
+    Redact secrets only, or secrets and device serial numbers (default: SecretsAndSerials)
 .PARAMETER Reboot
     Allow automatic reboot if required
 .PARAMETER Force
@@ -136,6 +140,10 @@ param(
     [int]$MinFirmwareChargePercent = 50,
     [string]$LogPath = "C:\ProgramData\SystemUpdatePro\Logs",
     [int]$LogRetentionDays = 30,
+    [ValidateRange(10, 10240)]
+    [int]$EvidenceMaxSizeMB = 512,
+    [ValidateSet("Secrets", "SecretsAndSerials")]
+    [string]$RedactionMode = "SecretsAndSerials",
     [switch]$Reboot,
     [switch]$Force
 )
@@ -146,10 +154,14 @@ param(
 
 $script:Version = "4.1.0"
 $script:ProductName = "SystemUpdatePro"
+$script:EvidenceMaxSizeMB = [int]$EvidenceMaxSizeMB
+$script:RedactionMode = [string]$RedactionMode
 $script:EventLogSource = "SystemUpdatePro"
 $script:ResultSchemaVersion = 1
-$script:StateSchemaVersion = 3
+$script:StateSchemaVersion = 4
 $script:CapabilitySchemaVersion = 1
+$script:HistorySchemaVersion = 2
+$script:LockSchemaVersion = 1
 $script:MaxContinuationAttempts = 3
 $script:RunId = [guid]::NewGuid().ToString()
 $script:RunStartedAt = Get-Date
@@ -192,6 +204,9 @@ $script:AcquisitionManifestVersion = 1
 $script:AcquisitionManifest = $null
 $script:AcquisitionProvenance = [System.Collections.ArrayList]::new()
 $script:CapabilityAssessment = $null
+$script:RetentionResult = $null
+$script:SensitiveEvidenceValues = [System.Collections.ArrayList]::new()
+$script:ProtectedEvidenceDirectories = @{}
 $script:PSModuleInstallRoot = Join-Path ([Environment]::GetFolderPath("ProgramFiles")) "WindowsPowerShell\Modules"
 $script:HPIAInstallRoot = "C:\ProgramData\SystemUpdatePro\HPIA"
 
@@ -235,6 +250,623 @@ function Write-EventLogEntry {
 }
 
 # ============================================================================
+# PROTECTED LOCAL EVIDENCE STORE
+# ============================================================================
+
+function Test-CurrentIdentityIsAdministrator {
+    try {
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+        return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch {
+        return $false
+    }
+}
+
+function Set-EvidencePathAccess {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSUseShouldProcessForStateChangingFunctions", "", Justification = "Applies the product's private evidence ACL to an explicitly supplied path.")]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    try {
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent().User
+        $systemIdentity = New-Object Security.Principal.SecurityIdentifier("S-1-5-18")
+        $administratorIdentity = New-Object Security.Principal.SecurityIdentifier("S-1-5-32-544")
+        $identities = @($systemIdentity, $administratorIdentity)
+        # Unit tests and read-only development runs can execute without an
+        # elevated administrator token. Production initialization has already
+        # enforced elevation, so production ACLs contain only SYSTEM/Admins.
+        if (-not (Test-CurrentIdentityIsAdministrator) -and
+            $currentIdentity.Value -notin @($systemIdentity.Value, $administratorIdentity.Value)) {
+            $identities += $currentIdentity
+        }
+        $identities = @($identities | Sort-Object -Property Value -Unique)
+
+        if ($item.PSIsContainer) {
+            $acl = New-Object System.Security.AccessControl.DirectorySecurity
+            $inheritance = [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
+                [Security.AccessControl.InheritanceFlags]::ObjectInherit
+            $propagation = [Security.AccessControl.PropagationFlags]::None
+        } else {
+            $acl = New-Object System.Security.AccessControl.FileSecurity
+            $inheritance = [Security.AccessControl.InheritanceFlags]::None
+            $propagation = [Security.AccessControl.PropagationFlags]::None
+        }
+        $acl.SetOwner($currentIdentity)
+        $acl.SetAccessRuleProtection($true, $false)
+        foreach ($identity in $identities) {
+            $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                $identity,
+                [Security.AccessControl.FileSystemRights]::FullControl,
+                $inheritance,
+                $propagation,
+                [Security.AccessControl.AccessControlType]::Allow
+            )
+            [void]$acl.AddAccessRule($rule)
+        }
+
+        if ($PSVersionTable.PSEdition -eq "Core") {
+            [IO.FileSystemAclExtensions]::SetAccessControl($item, $acl)
+        } else {
+            $item.SetAccessControl($acl)
+        }
+        return $true
+    } catch {
+        $script:LastEvidenceAccessError = $_.Exception.Message
+        return $false
+    }
+}
+
+function Test-EvidencePathAccess {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    try {
+        $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+        if (-not $acl.AreAccessRulesProtected) {
+            return [PSCustomObject]@{ Valid = $false; Reason = "Evidence path inherits access rules" }
+        }
+
+        $writeSafety = Test-EvidencePathWriteSafety -Path $Path
+        if (-not $writeSafety.Valid) { return $writeSafety }
+
+        $requiredWriterSids = @("S-1-5-18", "S-1-5-32-544")
+        if (-not (Test-CurrentIdentityIsAdministrator)) {
+            $requiredWriterSids += [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        }
+        foreach ($requiredSid in $requiredWriterSids) {
+            $hasFullControl = @($acl.Access | Where-Object {
+                $_.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and
+                $_.IdentityReference.Translate(
+                    [Security.Principal.SecurityIdentifier]
+                ).Value -eq $requiredSid -and
+                ($_.FileSystemRights -band [Security.AccessControl.FileSystemRights]::FullControl) -eq
+                    [Security.AccessControl.FileSystemRights]::FullControl
+            }).Count -gt 0
+            if (-not $hasFullControl) {
+                return [PSCustomObject]@{
+                    Valid = $false
+                    Reason = "Evidence path is missing the required full-control SID $requiredSid"
+                }
+            }
+        }
+        return [PSCustomObject]@{ Valid = $true; Reason = "" }
+    } catch {
+        return [PSCustomObject]@{
+            Valid = $false
+            Reason = "Evidence ACL could not be verified: $($_.Exception.Message)"
+        }
+    }
+}
+
+function Test-EvidencePathWriteSafety {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+        [switch]$AllowCurrentIdentity
+    )
+
+    try {
+        $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+        $allowedWriterSids = @("S-1-5-18", "S-1-5-32-544")
+        if ($AllowCurrentIdentity -or -not (Test-CurrentIdentityIsAdministrator)) {
+            $allowedWriterSids += [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        }
+        $writeRights = [Security.AccessControl.FileSystemRights]::Write -bor
+            [Security.AccessControl.FileSystemRights]::Modify -bor
+            [Security.AccessControl.FileSystemRights]::FullControl -bor
+            [Security.AccessControl.FileSystemRights]::WriteData -bor
+            [Security.AccessControl.FileSystemRights]::CreateFiles
+        foreach ($rule in $acl.Access) {
+            if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or
+                -not ($rule.FileSystemRights -band $writeRights)) {
+                continue
+            }
+            $sid = $rule.IdentityReference.Translate(
+                [Security.Principal.SecurityIdentifier]
+            ).Value
+            if ($sid -notin $allowedWriterSids) {
+                return [PSCustomObject]@{
+                    Valid = $false
+                    Reason = "Evidence path grants write access to unapproved SID $sid"
+                }
+            }
+        }
+        return [PSCustomObject]@{ Valid = $true; Reason = "" }
+    } catch {
+        return [PSCustomObject]@{
+            Valid = $false
+            Reason = "Evidence write ACL could not be verified: $($_.Exception.Message)"
+        }
+    }
+}
+
+function New-ProtectedDirectory {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSUseShouldProcessForStateChangingFunctions", "", Justification = "Creates and ACL-hardens an explicitly supplied evidence directory.")]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    try {
+        $resolvedPath = [IO.Path]::GetFullPath($Path).TrimEnd("\", "/")
+        if ($null -eq $script:ProtectedEvidenceDirectories) {
+            $script:ProtectedEvidenceDirectories = @{}
+        }
+        if ($script:ProtectedEvidenceDirectories.ContainsKey($resolvedPath) -and
+            (Test-Path -LiteralPath $resolvedPath -PathType Container)) {
+            return $true
+        }
+        if (Test-Path -LiteralPath $resolvedPath -PathType Container) {
+            $dataRoot = [IO.Path]::GetFullPath([string]$script:DataPath).TrimEnd("\", "/")
+            $isProductDataPath = (
+                $resolvedPath.Equals($dataRoot, [StringComparison]::OrdinalIgnoreCase) -or
+                $resolvedPath.StartsWith(
+                    "$dataRoot$([IO.Path]::DirectorySeparatorChar)",
+                    [StringComparison]::OrdinalIgnoreCase
+                )
+            )
+            if (-not $isProductDataPath) {
+                $unownedEntries = @(Get-ChildItem -LiteralPath $resolvedPath -Force `
+                    -ErrorAction Stop | Where-Object {
+                        $_.Name -notmatch "^(SystemUpdatePro_|DCU_(?:Scan|Apply)_|HPIA_\d{8}_\d{6})"
+                    })
+                if ($unownedEntries.Count -gt 0) {
+                    throw "Custom evidence directory contains unowned content; use a dedicated empty LogPath"
+                }
+            }
+        }
+        if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
+            New-Item -ItemType Directory -Path $Path -Force -ErrorAction Stop | Out-Null
+        }
+        if (-not (Set-EvidencePathAccess -Path $Path)) {
+            throw "Access controls could not be applied: $($script:LastEvidenceAccessError)"
+        }
+        $script:ProtectedEvidenceDirectories[$resolvedPath] = $true
+        return $true
+    } catch {
+        $script:LastEvidenceAccessError = $_.Exception.Message
+        return $false
+    }
+}
+
+function Add-SensitiveEvidenceValue {
+    param(
+        [AllowNull()][string]$Value
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return }
+    if ($null -eq $script:SensitiveEvidenceValues) {
+        $script:SensitiveEvidenceValues = [System.Collections.ArrayList]::new()
+    }
+    if ($Value -notin @($script:SensitiveEvidenceValues)) {
+        [void]$script:SensitiveEvidenceValues.Add($Value)
+    }
+}
+
+function Protect-EvidenceText {
+    param(
+        [AllowNull()][object]$Text,
+        [AllowEmptyCollection()][string[]]$SensitiveValues = @()
+    )
+
+    if ($null -eq $Text) { return "" }
+    $safeText = [string]$Text
+    $safeText = [regex]::Replace(
+        $safeText,
+        "(?i)(https://hooks\.slack\.com/services/)[^\s`"'<]+",
+        '${1}[REDACTED]'
+    )
+    $safeText = [regex]::Replace(
+        $safeText,
+        "(?i)([?&](?:sig|signature|token|access_token|code|key|api[_-]?key|secret|password)=)[^&\s`"'<>]+",
+        '${1}[REDACTED]'
+    )
+    $safeText = [regex]::Replace(
+        $safeText,
+        "(?i)(Authorization\s*[:=]\s*(?:Bearer|Basic)\s+)[A-Za-z0-9._~+/=-]+",
+        '${1}[REDACTED]'
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace([string]$WebhookUrl)) {
+        $safeText = [regex]::Replace(
+            $safeText,
+            [regex]::Escape([string]$WebhookUrl),
+            "[REDACTED WEBHOOK]",
+            [Text.RegularExpressions.RegexOptions]::IgnoreCase
+        )
+    }
+    if ($RedactionMode -eq "SecretsAndSerials") {
+        $allSensitiveValues = @($SensitiveValues) + @($script:SensitiveEvidenceValues)
+        foreach ($value in @($allSensitiveValues | Where-Object {
+            -not [string]::IsNullOrWhiteSpace([string]$_)
+        } | Select-Object -Unique)) {
+            $safeText = [regex]::Replace(
+                $safeText,
+                [regex]::Escape([string]$value),
+                "[REDACTED SERIAL]",
+                [Text.RegularExpressions.RegexOptions]::IgnoreCase
+            )
+        }
+    }
+    return $safeText
+}
+
+function Protect-EvidenceObject {
+    param(
+        [AllowNull()][object]$InputObject,
+        [string]$PropertyName = ""
+    )
+
+    if ($null -eq $InputObject) { return $null }
+    $isSecretProperty = $PropertyName -match "(?i)(webhook|authorization|password|secret|token|api.?key|signature)"
+    $isSerialProperty = $PropertyName -match "(?i)^serial[_-]?(number)?$"
+    if ($isSecretProperty -or ($isSerialProperty -and $RedactionMode -eq "SecretsAndSerials")) {
+        return "[REDACTED]"
+    }
+    if ($InputObject -is [string]) {
+        return Protect-EvidenceText -Text $InputObject
+    }
+    if ($InputObject -is [ValueType] -or $InputObject -is [datetime] -or
+        $InputObject -is [version]) {
+        return $InputObject
+    }
+    if ($InputObject -is [System.Collections.IDictionary]) {
+        $safeDictionary = [ordered]@{}
+        foreach ($key in $InputObject.Keys) {
+            $safeDictionary[[string]$key] = Protect-EvidenceObject `
+                -InputObject $InputObject[$key] -PropertyName ([string]$key)
+        }
+        return ,$safeDictionary
+    }
+    if ($InputObject -is [System.Management.Automation.PSCustomObject]) {
+        $safeDictionary = [ordered]@{}
+        foreach ($property in $InputObject.PSObject.Properties) {
+            $safeDictionary[$property.Name] = Protect-EvidenceObject `
+                -InputObject $property.Value -PropertyName $property.Name
+        }
+        return ,$safeDictionary
+    }
+    if ($InputObject -is [System.Collections.IEnumerable]) {
+        return ,@($InputObject | ForEach-Object {
+            Protect-EvidenceObject -InputObject $_ -PropertyName $PropertyName
+        })
+    }
+    return Protect-EvidenceText -Text $InputObject
+}
+
+function Write-ProtectedAtomicFile {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSUseShouldProcessForStateChangingFunctions", "", Justification = "Writes only to an explicitly supplied evidence path through a validated atomic replace.")]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string]$Content,
+        [AllowNull()][scriptblock]$ValidationScript = $null,
+        [bool]$KeepLastKnownGood = $true
+    )
+
+    $temporaryPath = "$Path.tmp.$PID.$([guid]::NewGuid().ToString('N'))"
+    $backupPath = "$Path.previous"
+    $stream = $null
+    try {
+        $directory = Split-Path -Parent $Path
+        if ([string]::IsNullOrWhiteSpace($directory) -or
+            -not (New-ProtectedDirectory -Path $directory)) {
+            throw "Evidence directory could not be protected: $($script:LastEvidenceAccessError)"
+        }
+
+        $bytes = (New-Object Text.UTF8Encoding($false)).GetBytes($Content)
+        $stream = [IO.FileStream]::new(
+            $temporaryPath,
+            [IO.FileMode]::CreateNew,
+            [IO.FileAccess]::Write,
+            [IO.FileShare]::None,
+            4096,
+            [IO.FileOptions]::WriteThrough
+        )
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+        $stream.Dispose()
+        $stream = $null
+
+        if ($null -ne $ValidationScript) {
+            $validation = & $ValidationScript $temporaryPath
+            if (($validation -is [bool] -and -not $validation) -or
+                ($validation.PSObject.Properties["Valid"] -and -not [bool]$validation.Valid)) {
+                $reason = if ($validation.PSObject.Properties["Reason"]) {
+                    [string]$validation.Reason
+                } else {
+                    "Validation rejected the temporary payload"
+                }
+                throw $reason
+            }
+        }
+        if (-not (Set-EvidencePathAccess -Path $temporaryPath)) {
+            throw "Temporary evidence access controls could not be hardened: $($script:LastEvidenceAccessError)"
+        }
+
+        if (Test-Path -LiteralPath $Path) {
+            Remove-Item -LiteralPath $backupPath -Force -ErrorAction SilentlyContinue
+            [IO.File]::Replace($temporaryPath, $Path, $backupPath, $true)
+            if ($KeepLastKnownGood) {
+                if (-not (Set-EvidencePathAccess -Path $backupPath)) {
+                    throw "Last-known-good evidence backup could not be protected"
+                }
+            } else {
+                Remove-Item -LiteralPath $backupPath -Force -ErrorAction Stop
+            }
+        } else {
+            [IO.File]::Move($temporaryPath, $Path)
+        }
+        if (-not (Set-EvidencePathAccess -Path $Path)) {
+            throw "Evidence access controls could not be hardened: $($script:LastEvidenceAccessError)"
+        }
+        return $true
+    } catch {
+        $script:LastEvidenceWriteError = $_.Exception.Message
+        if ($null -ne $stream) { $stream.Dispose() }
+        Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
+        return $false
+    }
+}
+
+function Write-ProtectedAtomicJson {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSUseShouldProcessForStateChangingFunctions", "", Justification = "Serializes and atomically replaces an explicitly supplied protected JSON evidence file.")]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+        [Parameter(Mandatory = $true)]
+        [AllowNull()][object]$Data,
+        [int]$Depth = 24,
+        [AllowNull()][scriptblock]$DataValidationScript = $null,
+        [bool]$KeepLastKnownGood = $true
+    )
+
+    try {
+        if ($null -ne $DataValidationScript) {
+            $dataValidation = & $DataValidationScript $Data
+            if (($dataValidation -is [bool] -and -not $dataValidation) -or
+                ($dataValidation.PSObject.Properties["Valid"] -and
+                    -not [bool]$dataValidation.Valid)) {
+                $reason = if ($dataValidation.PSObject.Properties["Reason"]) {
+                    [string]$dataValidation.Reason
+                } else {
+                    "JSON data validation failed"
+                }
+                throw $reason
+            }
+        }
+        $json = $Data | ConvertTo-Json -Depth $Depth
+        $validationScript = {
+            param([string]$CandidatePath)
+            try {
+                $candidateObject = [IO.File]::ReadAllText($CandidatePath) |
+                    ConvertFrom-Json -ErrorAction Stop
+                return ($null -ne $candidateObject)
+            } catch {
+                return [PSCustomObject]@{ Valid = $false; Reason = $_.Exception.Message }
+            }
+        }
+        return Write-ProtectedAtomicFile -Path $Path -Content $json `
+            -ValidationScript $validationScript -KeepLastKnownGood:$KeepLastKnownGood
+    } catch {
+        $script:LastEvidenceWriteError = $_.Exception.Message
+        return $false
+    }
+}
+
+function Add-ProtectedEvidenceLine {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string]$Line
+    )
+
+    $stream = $null
+    try {
+        $directory = Split-Path -Parent $Path
+        if (-not (New-ProtectedDirectory -Path $directory)) {
+            throw "Evidence directory could not be protected"
+        }
+        $wasCreated = -not (Test-Path -LiteralPath $Path)
+        $bytes = (New-Object Text.UTF8Encoding($false)).GetBytes(
+            "$(Protect-EvidenceText -Text $Line)$([Environment]::NewLine)"
+        )
+        $stream = [IO.FileStream]::new(
+            $Path,
+            [IO.FileMode]::Append,
+            [IO.FileAccess]::Write,
+            [IO.FileShare]::ReadWrite,
+            4096,
+            [IO.FileOptions]::WriteThrough
+        )
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+        $stream.Dispose()
+        $stream = $null
+        if ($wasCreated -and -not (Set-EvidencePathAccess -Path $Path)) {
+            throw "Appended evidence could not be protected"
+        }
+        return $true
+    } catch {
+        if ($null -ne $stream) { $stream.Dispose() }
+        $script:LastEvidenceWriteError = $_.Exception.Message
+        return $false
+    }
+}
+
+function Move-EvidenceToQuarantine {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSUseShouldProcessForStateChangingFunctions", "", Justification = "Moves an explicitly supplied corrupt evidence file beside its source for recovery inspection.")]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+        [string]$Reason = ""
+    )
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return "" }
+    $directory = Split-Path -Parent $Path
+    $extension = [IO.Path]::GetExtension($Path)
+    $baseName = [IO.Path]::GetFileNameWithoutExtension($Path)
+    $quarantineName = "{0}.corrupt.{1}.{2}{3}" -f @(
+        $baseName,
+        (Get-Date -Format "yyyyMMddTHHmmss"),
+        ([guid]::NewGuid().ToString("N")),
+        $extension
+    )
+    $quarantinePath = Join-Path $directory $quarantineName
+    try {
+        Move-Item -LiteralPath $Path -Destination $quarantinePath -ErrorAction Stop
+        if (-not (Set-EvidencePathAccess -Path $quarantinePath)) {
+            throw "Quarantined evidence could not be protected"
+        }
+        $script:LastEvidenceQuarantineReason = $Reason
+        return $quarantinePath
+    } catch {
+        $script:LastEvidenceWriteError = $_.Exception.Message
+        return ""
+    }
+}
+
+function Read-ProtectedJsonFile {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+        [AllowNull()][scriptblock]$MigrationScript = $null,
+        [AllowNull()][scriptblock]$ValidationScript = $null
+    )
+
+    $failures = [System.Collections.ArrayList]::new()
+    foreach ($candidate in @($Path, "$Path.previous")) {
+        if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) { continue }
+        try {
+            $access = Test-EvidencePathAccess -Path $candidate
+            if (-not $access.Valid -and (Test-CurrentIdentityIsAdministrator)) {
+                $writeSafety = Test-EvidencePathWriteSafety -Path $candidate `
+                    -AllowCurrentIdentity
+                if (-not $writeSafety.Valid) { throw $writeSafety.Reason }
+                [void](Set-EvidencePathAccess -Path $candidate)
+                $access = Test-EvidencePathAccess -Path $candidate
+            }
+            if (-not $access.Valid) { throw $access.Reason }
+            $data = ConvertTo-Hashtable -InputObject (
+                [IO.File]::ReadAllText($candidate) | ConvertFrom-Json -ErrorAction Stop
+            )
+            if ($null -ne $MigrationScript) {
+                $data = & $MigrationScript $data
+            }
+            if ($null -ne $ValidationScript) {
+                $validation = & $ValidationScript $data
+                if (($validation -is [bool] -and -not $validation) -or
+                    ($validation.PSObject.Properties["Valid"] -and -not [bool]$validation.Valid)) {
+                    $reason = if ($validation.PSObject.Properties["Reason"]) {
+                        [string]$validation.Reason
+                    } else {
+                        "Evidence validation failed"
+                    }
+                    throw $reason
+                }
+            }
+
+            $recovered = $candidate -ne $Path
+            if ($recovered -and -not (Write-ProtectedAtomicJson -Path $Path -Data $data `
+                -DataValidationScript $ValidationScript)) {
+                throw "Last-known-good payload was valid but could not be restored: $($script:LastEvidenceWriteError)"
+            }
+            return [PSCustomObject]@{
+                Success = $true; Data = $data; Recovered = $recovered
+                Source = $candidate; Error = ""
+            }
+        } catch {
+            [void]$failures.Add("$candidate`: $($_.Exception.Message)")
+            [void](Move-EvidenceToQuarantine -Path $candidate -Reason $_.Exception.Message)
+        }
+    }
+    return [PSCustomObject]@{
+        Success = $false; Data = $null; Recovered = $false; Source = ""
+        Error = $failures -join "; "
+    }
+}
+
+function Protect-EvidenceFile {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSUseShouldProcessForStateChangingFunctions", "", Justification = "ACL-hardens and redacts an explicitly supplied text evidence file.")]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+        [AllowEmptyCollection()][string[]]$SensitiveValues = @()
+    )
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    if (-not (Set-EvidencePathAccess -Path $Path)) { return $false }
+    $extension = [IO.Path]::GetExtension($Path).ToLowerInvariant()
+    if ($extension -notin @(".log", ".txt", ".xml", ".json", ".csv", ".html", ".htm")) {
+        return $true
+    }
+    try {
+        $file = Get-Item -LiteralPath $Path -ErrorAction Stop
+        if ($file.Length -gt 32MB) { return $true }
+        $content = [IO.File]::ReadAllText($Path)
+        $safeContent = Protect-EvidenceText -Text $content -SensitiveValues $SensitiveValues
+        if ($safeContent -ne $content) {
+            return Write-ProtectedAtomicFile -Path $Path -Content $safeContent `
+                -KeepLastKnownGood:$false
+        }
+        return $true
+    } catch {
+        $script:LastEvidenceWriteError = $_.Exception.Message
+        return $false
+    }
+}
+
+function Protect-EvidenceTree {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSUseShouldProcessForStateChangingFunctions", "", Justification = "Recursively ACL-hardens a product-owned evidence directory and redacts supported text artifacts.")]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+        [AllowEmptyCollection()][string[]]$SensitiveValues = @()
+    )
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) { return $false }
+    $succeeded = Set-EvidencePathAccess -Path $Path
+    foreach ($item in @(Get-ChildItem -LiteralPath $Path -Force -Recurse -ErrorAction SilentlyContinue)) {
+        if ($item.PSIsContainer) {
+            if (-not (Set-EvidencePathAccess -Path $item.FullName)) { $succeeded = $false }
+        } elseif (-not (Protect-EvidenceFile -Path $item.FullName -SensitiveValues $SensitiveValues)) {
+            $succeeded = $false
+        }
+    }
+    return $succeeded
+}
+
+# ============================================================================
 # LOGGING FUNCTIONS
 # ============================================================================
 
@@ -245,14 +877,10 @@ function Write-Log {
         [string]$Level = "INFO"
     )
 
+    $safeMessage = Protect-EvidenceText -Text $Message
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $logEntry = "[$timestamp] [$Level] $Message"
-
-    try {
-        Add-Content -Path $script:LogFile -Value $logEntry -ErrorAction SilentlyContinue
-    } catch {
-        Write-Log "Existing App Installer registration could not be restored: $($_.Exception.Message)" "DEBUG"
-    }
+    $logEntry = "[$timestamp] [$Level] $safeMessage"
+    [void](Add-ProtectedEvidenceLine -Path $script:LogFile -Line $logEntry)
 
     $colors = @{
         "HEADER"  = "Cyan"
@@ -275,7 +903,7 @@ function Write-Log {
     }
 
     # Prefix dry run messages
-    $displayMsg = "$($prefixes[$Level])$Message"
+    $displayMsg = "$($prefixes[$Level])$safeMessage"
     if ($DryRun -and $Level -notin @("HEADER", "DEBUG")) {
         $displayMsg = "[DRY RUN] $displayMsg"
     }
@@ -283,8 +911,8 @@ function Write-Log {
     Write-Host $displayMsg -ForegroundColor $colors[$Level]
 
     # Track warnings and errors
-    if ($Level -eq "WARNING") { [void]$script:Warnings.Add($Message) }
-    if ($Level -eq "ERROR") { [void]$script:Errors.Add($Message) }
+    if ($Level -eq "WARNING") { [void]$script:Warnings.Add($safeMessage) }
+    if ($Level -eq "ERROR") { [void]$script:Errors.Add($safeMessage) }
 }
 
 function Write-Banner {
@@ -316,16 +944,32 @@ function Test-Administrator {
 
 function Initialize-RunEnvironment {
     try {
-        foreach ($path in @($script:DataPath, $script:MutationJournalDirectory, $LogPath)) {
-            if (-not (Test-Path -LiteralPath $path)) {
-                New-Item -ItemType Directory -Path $path -Force -ErrorAction Stop | Out-Null
+        foreach ($path in @(
+            $script:DataPath,
+            $script:MutationJournalDirectory,
+            $LogPath,
+            (Join-Path $script:DataPath "DriverBackups")
+        )) {
+            if (-not (New-ProtectedDirectory -Path $path)) {
+                throw "Could not initialize protected evidence directory '$path': $($script:LastEvidenceAccessError)"
             }
         }
+        Add-SensitiveEvidenceValue -Value $WebhookUrl
 
         try {
             Start-Transcript -Path $script:TranscriptFile -Force -ErrorAction Stop | Out-Null
             $script:TranscriptStarted = $true
+            if (-not (Set-EvidencePathAccess -Path $script:TranscriptFile)) {
+                throw "Transcript access controls could not be hardened"
+            }
         } catch {
+            if ($script:TranscriptStarted) {
+                try {
+                    Stop-Transcript | Out-Null
+                } catch {
+                    [Diagnostics.Debug]::WriteLine($_.Exception.Message)
+                }
+            }
             $script:TranscriptStarted = $false
         }
 
@@ -607,6 +1251,7 @@ function New-RunData {
         Dependencies     = @($script:AcquisitionProvenance)
         MutationRecovery = @($script:MutationEvidence)
         Capabilities     = $script:CapabilityAssessment
+        Retention        = $script:RetentionResult
         EvidenceDelivery = @{}
     }
 }
@@ -615,13 +1260,33 @@ function New-RunData {
 # LOCK FILE MANAGEMENT
 # ============================================================================
 
+function Test-LockDocument {
+    param(
+        [AllowNull()][object]$Lock
+    )
+
+    if ($Lock -isnot [System.Collections.IDictionary] -or
+        [int]$Lock.SchemaVersion -ne $script:LockSchemaVersion) {
+        return [PSCustomObject]@{ Valid = $false; Reason = "Lock schema is invalid" }
+    }
+    $lockPid = 0
+    $lockStarted = [datetime]::MinValue
+    if (-not [int]::TryParse([string]$Lock.PID, [ref]$lockPid) -or $lockPid -lt 1 -or
+        -not [datetime]::TryParse([string]$Lock.StartTime, [ref]$lockStarted)) {
+        return [PSCustomObject]@{ Valid = $false; Reason = "Lock process metadata is invalid" }
+    }
+    return [PSCustomObject]@{ Valid = $true; Reason = "" }
+}
+
 function Test-LockFile {
-    if (Test-Path $script:LockFile) {
-        $lockContent = Get-Content $script:LockFile -ErrorAction SilentlyContinue | ConvertFrom-Json -ErrorAction SilentlyContinue
-        if ($lockContent) {
+    if (Test-Path -LiteralPath $script:LockFile) {
+        $lockRead = Read-ProtectedJsonFile -Path $script:LockFile `
+            -ValidationScript ${function:Test-LockDocument}
+        if ($lockRead.Success) {
+            $lockContent = $lockRead.Data
             # Check if the process is still running
             $process = Get-Process -Id $lockContent.PID -ErrorAction SilentlyContinue
-            if ($process -and $process.ProcessName -eq "powershell") {
+            if ($process -and $process.ProcessName -in @("powershell", "pwsh")) {
                 # Check if lock is stale (older than 4 hours)
                 $lockTime = [DateTime]::Parse($lockContent.StartTime)
                 if ((Get-Date) - $lockTime -lt [TimeSpan]::FromHours(4)) {
@@ -630,23 +1295,29 @@ function Test-LockFile {
             }
         }
         # Stale lock - remove it
-        Remove-Item $script:LockFile -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $script:LockFile -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath "$($script:LockFile).previous" -Force -ErrorAction SilentlyContinue
     }
     return $false
 }
 
 function New-LockFile {
-    $lockData = @{
+    $lockData = [ordered]@{
+        SchemaVersion = $script:LockSchemaVersion
+        RunId = $script:RunId
         PID = $PID
         StartTime = (Get-Date).ToString("o")
         Computer = $env:COMPUTERNAME
-    } | ConvertTo-Json
-
-    Set-Content -Path $script:LockFile -Value $lockData -Force
+    }
+    if (-not (Write-ProtectedAtomicJson -Path $script:LockFile -Data $lockData `
+        -DataValidationScript ${function:Test-LockDocument})) {
+        throw "Lock file could not be committed: $($script:LastEvidenceWriteError)"
+    }
 }
 
 function Remove-LockFile {
-    Remove-Item $script:LockFile -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $script:LockFile -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath "$($script:LockFile).previous" -Force -ErrorAction SilentlyContinue
 }
 
 # ============================================================================
@@ -704,6 +1375,8 @@ function Get-EffectiveRunParameter {
         MinFirmwareChargePercent = [int]$MinFirmwareChargePercent
         LogPath            = [string]$LogPath
         LogRetentionDays   = [int]$LogRetentionDays
+        EvidenceMaxSizeMB  = [int]$EvidenceMaxSizeMB
+        RedactionMode      = [string]$RedactionMode
         Reboot             = $Reboot.IsPresent
         Force              = $Force.IsPresent
     }
@@ -715,8 +1388,31 @@ function Get-ContinuationParameterName {
         "RepairWindowsUpdate", "CleanupAfter", "ResetComponentBase", "ContinueAfterReboot", "DryRun",
         "BackupDrivers", "ShowHistory", "WebhookUrl", "HistoryCount", "MaxRetries",
         "MaxUpdatePasses", "MinDiskSpaceGB", "MinFirmwareChargePercent", "LogPath",
-        "LogRetentionDays", "Reboot", "Force"
+        "LogRetentionDays", "EvidenceMaxSizeMB", "RedactionMode", "Reboot", "Force"
     )
+}
+
+function Convert-ContinuationStateSchema {
+    param(
+        [AllowNull()][object]$State
+    )
+
+    $migrated = ConvertTo-Hashtable -InputObject $State
+    if ($migrated -isnot [System.Collections.IDictionary]) { return $migrated }
+    $schemaVersion = [int]$migrated.SchemaVersion
+    if ($schemaVersion -eq 3) {
+        if ($migrated.Parameters -is [System.Collections.IDictionary]) {
+            if (-not $migrated.Parameters.Contains("EvidenceMaxSizeMB")) {
+                $migrated.Parameters["EvidenceMaxSizeMB"] = 512
+            }
+            if (-not $migrated.Parameters.Contains("RedactionMode")) {
+                $migrated.Parameters["RedactionMode"] = "SecretsAndSerials"
+            }
+        }
+        $migrated["SchemaVersion"] = 4
+        $migrated["_MigrationSourceSchema"] = 3
+    }
+    return $migrated
 }
 
 function Test-ContinuationState {
@@ -775,100 +1471,29 @@ function Set-ContinuationStateAccess {
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSUseShouldProcessForStateChangingFunctions", "", Justification = "Hardens the run-owned state file against non-administrator modification.")]
     param([string]$Path = $script:StateFile)
 
-    try {
-        $currentIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
-        $acl = New-Object System.Security.AccessControl.FileSecurity
-        $acl.SetOwner($currentIdentity)
-        $acl.SetAccessRuleProtection($true, $false)
-
-        $identities = @(
-            (New-Object System.Security.Principal.SecurityIdentifier("S-1-5-18")),
-            (New-Object System.Security.Principal.SecurityIdentifier("S-1-5-32-544")),
-            $currentIdentity
-        ) | Select-Object -Unique
-
-        foreach ($identity in $identities) {
-            $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-                $identity,
-                [System.Security.AccessControl.FileSystemRights]::FullControl,
-                [System.Security.AccessControl.AccessControlType]::Allow
-            )
-            [void]$acl.AddAccessRule($rule)
-        }
-
-        $fileInfo = [System.IO.FileInfo](Get-Item -LiteralPath $Path -ErrorAction Stop)
-        if ($PSVersionTable.PSEdition -eq "Core") {
-            [System.IO.FileSystemAclExtensions]::SetAccessControl($fileInfo, $acl)
-        } else {
-            $fileInfo.SetAccessControl($acl)
-        }
-        return $true
-    } catch {
-        $script:LastStateAccessError = $_.Exception.Message
-        return $false
-    }
+    $result = Set-EvidencePathAccess -Path $Path
+    if (-not $result) { $script:LastStateAccessError = $script:LastEvidenceAccessError }
+    return $result
 }
 
 function Test-ContinuationStateAccess {
     param([string]$Path = $script:StateFile)
 
-    try {
-        $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
-        if (-not $acl.AreAccessRulesProtected) {
-            return [PSCustomObject]@{ Valid = $false; Reason = "State file inherits access rules" }
-        }
-
-        $broadWriterSids = @("S-1-1-0", "S-1-5-11", "S-1-5-32-545")
-        $writeRights = [System.Security.AccessControl.FileSystemRights]::Write -bor
-            [System.Security.AccessControl.FileSystemRights]::Modify -bor
-            [System.Security.AccessControl.FileSystemRights]::FullControl
-        foreach ($rule in $acl.Access) {
-            if ($rule.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
-                $rule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value -in $broadWriterSids -and
-                ($rule.FileSystemRights -band $writeRights)) {
-                return [PSCustomObject]@{ Valid = $false; Reason = "State file is writable by a broad principal" }
-            }
-        }
-        return [PSCustomObject]@{ Valid = $true; Reason = "" }
-    } catch {
-        return [PSCustomObject]@{ Valid = $false; Reason = "State ACL could not be verified: $($_.Exception.Message)" }
-    }
+    return Test-EvidencePathAccess -Path $Path
 }
 
 function Save-State {
     param([System.Collections.IDictionary]$State)
 
-    $temporaryPath = "$($script:StateFile).tmp.$PID.$([guid]::NewGuid().ToString('N'))"
-    $backupPath = "$($script:StateFile).previous"
-
     try {
-        $stateDirectory = Split-Path -Parent $script:StateFile
-        if (-not (Test-Path -LiteralPath $stateDirectory)) {
-            New-Item -ItemType Directory -Path $stateDirectory -Force -ErrorAction Stop | Out-Null
-        }
-
         $State["LastUpdatedAt"] = (Get-Date).ToString("o")
-        $json = $State | ConvertTo-Json -Depth 20
-        $utf8 = New-Object System.Text.UTF8Encoding($false)
-        [System.IO.File]::WriteAllText($temporaryPath, $json, $utf8)
-
-        # Validate the complete temporary payload before replacing durable state.
-        $validated = [System.IO.File]::ReadAllText($temporaryPath) | ConvertFrom-Json -ErrorAction Stop
-        if ($null -eq $validated) { throw "State validation returned no data" }
-
-        if (Test-Path -LiteralPath $script:StateFile) {
-            [System.IO.File]::Replace($temporaryPath, $script:StateFile, $backupPath, $true)
-            Remove-Item -LiteralPath $backupPath -Force -ErrorAction SilentlyContinue
-        } else {
-            [System.IO.File]::Move($temporaryPath, $script:StateFile)
-        }
-        if (-not (Set-ContinuationStateAccess -Path $script:StateFile)) {
-            throw "State file access controls could not be hardened: $($script:LastStateAccessError)"
+        if (-not (Write-ProtectedAtomicJson -Path $script:StateFile -Data $State -Depth 20 `
+            -DataValidationScript ${function:Test-ContinuationState})) {
+            throw $script:LastEvidenceWriteError
         }
         return $true
     } catch {
         $script:LastStateError = $_.Exception.Message
-        Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
         try {
             Write-Log "Failed to save continuation state: $($_.Exception.Message)" "ERROR"
         } catch {
@@ -881,48 +1506,28 @@ function Save-State {
 function Move-StateToQuarantine {
     param([string]$Reason)
 
-    if (-not (Test-Path -LiteralPath $script:StateFile)) { return "" }
-
-    $directory = Split-Path -Parent $script:StateFile
-    $baseName = [System.IO.Path]::GetFileNameWithoutExtension($script:StateFile)
-    $quarantineName = "{0}.corrupt.{1}.{2}.json" -f $baseName, (Get-Date -Format "yyyyMMddTHHmmss"), ([guid]::NewGuid().ToString("N"))
-    $quarantinePath = Join-Path $directory $quarantineName
-
-    try {
-        Move-Item -LiteralPath $script:StateFile -Destination $quarantinePath -ErrorAction Stop
-        [void](Set-ContinuationStateAccess -Path $quarantinePath)
+    $quarantinePath = Move-EvidenceToQuarantine -Path $script:StateFile -Reason $Reason
+    if ($quarantinePath) {
         try {
             Write-Log "Quarantined invalid continuation state: $Reason ($quarantinePath)" "WARNING"
         } catch {
-            [System.Diagnostics.Debug]::WriteLine($_.Exception.Message)
+            [Diagnostics.Debug]::WriteLine($_.Exception.Message)
         }
-        return $quarantinePath
-    } catch {
-        try {
-            Write-Log "Could not quarantine invalid continuation state: $($_.Exception.Message)" "ERROR"
-        } catch {
-            [System.Diagnostics.Debug]::WriteLine($_.Exception.Message)
-        }
-        return ""
     }
+    return $quarantinePath
 }
 
 function Get-State {
-    if (-not (Test-Path -LiteralPath $script:StateFile)) { return @{} }
-
-    try {
-        $accessValidation = Test-ContinuationStateAccess -Path $script:StateFile
-        if (-not $accessValidation.Valid) { throw $accessValidation.Reason }
-        $rawState = Get-Content -LiteralPath $script:StateFile -Raw -ErrorAction Stop
-        $stateObject = $rawState | ConvertFrom-Json -ErrorAction Stop
-        $state = ConvertTo-Hashtable -InputObject $stateObject
-        $validation = Test-ContinuationState -State $state
-        if (-not $validation.Valid) { throw $validation.Reason }
-        return $state
-    } catch {
-        [void](Move-StateToQuarantine -Reason $_.Exception.Message)
-        return @{}
+    $read = Read-ProtectedJsonFile -Path $script:StateFile `
+        -MigrationScript ${function:Convert-ContinuationStateSchema} `
+        -ValidationScript ${function:Test-ContinuationState}
+    if (-not $read.Success) { return @{} }
+    if ($read.Data.Contains("_MigrationSourceSchema")) {
+        [void]$read.Data.Remove("_MigrationSourceSchema")
+        [void](Write-ProtectedAtomicJson -Path $script:StateFile -Data $read.Data -Depth 20 `
+            -DataValidationScript ${function:Test-ContinuationState})
     }
+    return $read.Data
 }
 
 function Clear-State {
@@ -982,7 +1587,7 @@ function Import-ContinuationState {
     )
     $integerNames = @(
         "HistoryCount", "MaxRetries", "MaxUpdatePasses", "MinDiskSpaceGB",
-        "MinFirmwareChargePercent", "LogRetentionDays"
+        "MinFirmwareChargePercent", "LogRetentionDays", "EvidenceMaxSizeMB"
     )
 
     foreach ($name in $switchNames) {
@@ -993,6 +1598,7 @@ function Import-ContinuationState {
     }
     Set-Variable -Name "WebhookUrl" -Scope Script -Value ([string]$State.Parameters.WebhookUrl)
     Set-Variable -Name "LogPath" -Scope Script -Value ([string]$State.Parameters.LogPath)
+    Set-Variable -Name "RedactionMode" -Scope Script -Value ([string]$State.Parameters.RedactionMode)
 
     $script:RunId = [string]$State.RunId
     $script:RunStartedAt = [datetime]::Parse([string]$State.CreatedAt)
@@ -1144,40 +1750,16 @@ function Save-MutationJournal {
     )
 
     $journalPath = Get-MutationJournalPath -RunId ([string]$Journal.RunId)
-    $temporaryPath = "$journalPath.tmp.$PID.$([guid]::NewGuid().ToString('N'))"
-    $backupPath = "$journalPath.previous"
-
     try {
-        if (-not (Test-Path -LiteralPath $script:MutationJournalDirectory)) {
-            New-Item -ItemType Directory -Path $script:MutationJournalDirectory -Force -ErrorAction Stop | Out-Null
-        }
         $Journal["LastUpdatedAt"] = (Get-Date).ToUniversalTime().ToString("o")
         $validation = Test-MutationJournal -Journal $Journal
         if (-not $validation.Valid) { throw $validation.Reason }
-
-        $json = $Journal | ConvertTo-Json -Depth 24
-        $utf8 = New-Object System.Text.UTF8Encoding($false)
-        [IO.File]::WriteAllText($temporaryPath, $json, $utf8)
-        $roundTrip = ConvertTo-Hashtable -InputObject (
-            [IO.File]::ReadAllText($temporaryPath) | ConvertFrom-Json -ErrorAction Stop
-        )
-        $roundTripValidation = Test-MutationJournal -Journal $roundTrip
-        if (-not $roundTripValidation.Valid) {
-            throw "Mutation journal round-trip failed: $($roundTripValidation.Reason)"
-        }
-
-        if (Test-Path -LiteralPath $journalPath) {
-            [IO.File]::Replace($temporaryPath, $journalPath, $backupPath, $true)
-            Remove-Item -LiteralPath $backupPath -Force -ErrorAction SilentlyContinue
-        } else {
-            [IO.File]::Move($temporaryPath, $journalPath)
-        }
-        if (-not (Set-ContinuationStateAccess -Path $journalPath)) {
-            throw "Mutation journal access controls could not be hardened"
+        if (-not (Write-ProtectedAtomicJson -Path $journalPath -Data $Journal -Depth 24 `
+            -DataValidationScript ${function:Test-MutationJournal})) {
+            throw $script:LastEvidenceWriteError
         }
         return $true
     } catch {
-        Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
         $script:LastMutationJournalError = $_.Exception.Message
         return $false
     }
@@ -1187,22 +1769,11 @@ function Get-MutationJournal {
     param([string]$RunId = $script:RunId)
 
     $journalPath = Get-MutationJournalPath -RunId $RunId
-    if (-not (Test-Path -LiteralPath $journalPath -PathType Leaf)) { return $null }
-
-    try {
-        $access = Test-ContinuationStateAccess -Path $journalPath
-        if (-not $access.Valid) { throw $access.Reason }
-        $journal = ConvertTo-Hashtable -InputObject (
-            Get-Content -LiteralPath $journalPath -Raw -ErrorAction Stop |
-                ConvertFrom-Json -ErrorAction Stop
-        )
-        $validation = Test-MutationJournal -Journal $journal
-        if (-not $validation.Valid) { throw $validation.Reason }
-        return $journal
-    } catch {
-        $script:LastMutationJournalError = $_.Exception.Message
-        return $null
-    }
+    $read = Read-ProtectedJsonFile -Path $journalPath `
+        -ValidationScript ${function:Test-MutationJournal}
+    if ($read.Success) { return $read.Data }
+    $script:LastMutationJournalError = $read.Error
+    return $null
 }
 
 function Get-OrCreateMutationJournal {
@@ -1578,14 +2149,10 @@ function Invoke-UnfinishedMutationRecovery {
 
     foreach ($file in @(Get-ChildItem -LiteralPath $script:MutationJournalDirectory -Filter "*.json" -File -ErrorAction SilentlyContinue)) {
         try {
-            $access = Test-ContinuationStateAccess -Path $file.FullName
-            if (-not $access.Valid) { throw $access.Reason }
-            $journalObject = ConvertTo-Hashtable -InputObject (
-                Get-Content -LiteralPath $file.FullName -Raw -ErrorAction Stop |
-                    ConvertFrom-Json -ErrorAction Stop
-            )
-            $validation = Test-MutationJournal -Journal $journalObject
-            if (-not $validation.Valid) { throw $validation.Reason }
+            $journalRead = Read-ProtectedJsonFile -Path $file.FullName `
+                -ValidationScript ${function:Test-MutationJournal}
+            if (-not $journalRead.Success) { throw $journalRead.Error }
+            $journalObject = $journalRead.Data
             if ([string]$journalObject.RunId -ne [IO.Path]::GetFileNameWithoutExtension($file.Name)) {
                 throw "Mutation journal filename does not match its run ID"
             }
@@ -1622,6 +2189,7 @@ function Invoke-UnfinishedMutationRecovery {
 
             if ($journalRecovered) {
                 Remove-Item -LiteralPath $file.FullName -Force -ErrorAction Stop
+                Remove-Item -LiteralPath "$($file.FullName).previous" -Force -ErrorAction SilentlyContinue
                 $result.Recovered++
                 $result.Messages += "Recovered unfinished run $($journalObject.RunId)"
             } else {
@@ -1644,26 +2212,288 @@ function Invoke-UnfinishedMutationRecovery {
 # LOG ROTATION
 # ============================================================================
 
+function Get-EvidenceArtifactSize {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    try {
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        if (-not $item.PSIsContainer) {
+            return [PSCustomObject]@{ Bytes = [long]$item.Length; Files = 1 }
+        }
+        $files = @(Get-ChildItem -LiteralPath $Path -File -Force -Recurse -ErrorAction SilentlyContinue)
+        $bytes = [long](($files | Measure-Object -Property Length -Sum).Sum)
+        return [PSCustomObject]@{ Bytes = $bytes; Files = $files.Count }
+    } catch {
+        return [PSCustomObject]@{ Bytes = 0L; Files = 0 }
+    }
+}
+
+function Get-EvidenceRetentionCandidate {
+    $candidates = [System.Collections.ArrayList]::new()
+    $excludedPaths = @(
+        [IO.Path]::GetFullPath([string]$script:LogFile),
+        [IO.Path]::GetFullPath([string]$script:TranscriptFile),
+        [IO.Path]::GetFullPath([string]$script:StateFile),
+        [IO.Path]::GetFullPath([string]$script:HistoryFile),
+        [IO.Path]::GetFullPath("$($script:StateFile).previous"),
+        [IO.Path]::GetFullPath("$($script:HistoryFile).previous")
+    )
+
+    if (Test-Path -LiteralPath $LogPath -PathType Container) {
+        foreach ($item in @(Get-ChildItem -LiteralPath $LogPath -Force -ErrorAction SilentlyContinue)) {
+            $owned = if ($item.PSIsContainer) {
+                $item.Name -match "^HPIA_\d{8}_\d{6}$"
+            } else {
+                $item.Name -match "^(SystemUpdatePro_(?:Transcript_|Report_)?|DCU_(?:Scan|Apply)_).*\.(?:log|html)$"
+            }
+            if (-not $owned -or [IO.Path]::GetFullPath($item.FullName) -in $excludedPaths) { continue }
+            $size = Get-EvidenceArtifactSize -Path $item.FullName
+            [void]$candidates.Add([PSCustomObject]@{
+                Path = $item.FullName
+                Kind = $(if ($item.PSIsContainer) { "Directory" } else { "File" })
+                LastWriteTime = $item.LastWriteTime
+                Bytes = [long]$size.Bytes
+                Files = [int]$size.Files
+                Category = $(if ($item.PSIsContainer) { "VendorReport" } else { "LogOrReport" })
+            })
+        }
+    }
+
+    $driverBackupRoot = Join-Path $script:DataPath "DriverBackups"
+    if (Test-Path -LiteralPath $driverBackupRoot -PathType Container) {
+        foreach ($directory in @(Get-ChildItem -LiteralPath $driverBackupRoot -Directory -Force `
+            -ErrorAction SilentlyContinue | Where-Object { $_.Name -match "^Backup_\d{8}_\d{6}$" })) {
+            $size = Get-EvidenceArtifactSize -Path $directory.FullName
+            [void]$candidates.Add([PSCustomObject]@{
+                Path = $directory.FullName
+                Kind = "Directory"
+                LastWriteTime = $directory.LastWriteTime
+                Bytes = [long]$size.Bytes
+                Files = [int]$size.Files
+                Category = "DriverBackup"
+            })
+        }
+    }
+
+    foreach ($root in @($script:DataPath, $script:MutationJournalDirectory)) {
+        if (-not (Test-Path -LiteralPath $root -PathType Container)) { continue }
+        foreach ($file in @(Get-ChildItem -LiteralPath $root -File -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match "\.corrupt\.\d{8}T\d{6}\.[a-f0-9]+" })) {
+            [void]$candidates.Add([PSCustomObject]@{
+                Path = $file.FullName
+                Kind = "File"
+                LastWriteTime = $file.LastWriteTime
+                Bytes = [long]$file.Length
+                Files = 1
+                Category = "Quarantine"
+            })
+        }
+    }
+    return @($candidates)
+}
+
+function Remove-EvidenceRetentionCandidate {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSUseShouldProcessForStateChangingFunctions", "", Justification = "Deletes only a candidate constructed from product-owned filename and directory contracts.")]
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Candidate,
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary]$Result,
+        [string]$Reason
+    )
+
+    try {
+        if ($Candidate.Kind -eq "Directory") {
+            Remove-Item -LiteralPath $Candidate.Path -Recurse -Force -ErrorAction Stop
+            $Result["DeletedDirectories"] = [int]$Result.DeletedDirectories + 1
+        } else {
+            Remove-Item -LiteralPath $Candidate.Path -Force -ErrorAction Stop
+        }
+        $Result["DeletedFiles"] = [int]$Result.DeletedFiles + [int]$Candidate.Files
+        $Result["BytesFreed"] = [long]$Result.BytesFreed + [long]$Candidate.Bytes
+        $Result["Items"] = @($Result.Items) + @([ordered]@{
+            Path = [string]$Candidate.Path
+            Category = [string]$Candidate.Category
+            Reason = $Reason
+            Files = [int]$Candidate.Files
+            Bytes = [long]$Candidate.Bytes
+        })
+        return $true
+    } catch {
+        $Result["Errors"] = @($Result.Errors) + @(
+            "$(Protect-EvidenceText -Text $Candidate.Path): $($_.Exception.Message)"
+        )
+        return $false
+    }
+}
+
+function Invoke-EvidenceRetention {
+    param(
+        [int]$RetentionDays = $LogRetentionDays,
+        [int]$MaximumSizeMB = $EvidenceMaxSizeMB
+    )
+
+    $result = [ordered]@{
+        SchemaVersion = 1
+        EvaluatedAt = (Get-Date).ToUniversalTime().ToString("o")
+        RetentionDays = [math]::Max(1, $RetentionDays)
+        MaximumSizeMB = [math]::Max(10, $MaximumSizeMB)
+        DeletedFiles = 0
+        DeletedDirectories = 0
+        BytesFreed = 0L
+        RemainingBytes = 0L
+        Items = @()
+        Errors = @()
+    }
+    $cutoff = (Get-Date).AddDays(-[int]$result.RetentionDays)
+    $candidates = @(Get-EvidenceRetentionCandidate)
+    $removedPaths = [System.Collections.ArrayList]::new()
+
+    foreach ($candidate in @($candidates | Where-Object {
+        $_.LastWriteTime -lt $cutoff
+    } | Sort-Object LastWriteTime)) {
+        if (Remove-EvidenceRetentionCandidate -Candidate $candidate -Result $result -Reason "Age") {
+            [void]$removedPaths.Add([string]$candidate.Path)
+        }
+    }
+
+    $remainingBackups = @($candidates | Where-Object {
+        $_.Category -eq "DriverBackup" -and [string]$_.Path -notin @($removedPaths)
+    } | Sort-Object LastWriteTime -Descending)
+    foreach ($candidate in @($remainingBackups | Select-Object -Skip 3)) {
+        if (Remove-EvidenceRetentionCandidate -Candidate $candidate -Result $result -Reason "BackupCount") {
+            [void]$removedPaths.Add([string]$candidate.Path)
+        }
+    }
+
+    $remaining = @($candidates | Where-Object {
+        [string]$_.Path -notin @($removedPaths) -and (Test-Path -LiteralPath $_.Path)
+    })
+    $maximumBytes = [long]$result.MaximumSizeMB * 1MB
+    $remainingBytes = [long](($remaining | Measure-Object -Property Bytes -Sum).Sum)
+    foreach ($candidate in @($remaining | Sort-Object LastWriteTime)) {
+        if ($remainingBytes -le $maximumBytes) { break }
+        if (Remove-EvidenceRetentionCandidate -Candidate $candidate -Result $result -Reason "Size") {
+            $remainingBytes -= [long]$candidate.Bytes
+            [void]$removedPaths.Add([string]$candidate.Path)
+        }
+    }
+    $result["RemainingBytes"] = [math]::Max(0L, $remainingBytes)
+    $script:RetentionResult = $result
+
+    $deletedArtifacts = [int]$result.DeletedFiles + [int]$result.DeletedDirectories
+    if ($deletedArtifacts -gt 0 -or @($result.Errors).Count -gt 0) {
+        Write-Log (
+            "Evidence retention removed $($result.DeletedFiles) files and " +
+            "$($result.DeletedDirectories) directories, freed $($result.BytesFreed) bytes, " +
+            "and recorded $(@($result.Errors).Count) errors"
+        ) $(if (@($result.Errors).Count -gt 0) { "WARNING" } else { "DEBUG" })
+    }
+    return $result
+}
+
 function Invoke-LogRotation {
     param([int]$RetentionDays = 30)
 
-    $cutoffDate = (Get-Date).AddDays(-$RetentionDays)
-
-    Get-ChildItem -Path $LogPath -Filter "*.log" -ErrorAction SilentlyContinue |
-        Where-Object { $_.LastWriteTime -lt $cutoffDate } |
-        Remove-Item -Force -ErrorAction SilentlyContinue
-
-    $removed = @(Get-ChildItem -Path $LogPath -Filter "*.log" -ErrorAction SilentlyContinue |
-        Where-Object { $_.LastWriteTime -lt $cutoffDate }).Count
-
-    if ($removed -gt 0) {
-        Write-Log "Removed $removed old log files" "DEBUG"
-    }
+    return Invoke-EvidenceRetention -RetentionDays $RetentionDays `
+        -MaximumSizeMB $EvidenceMaxSizeMB
 }
 
 # ============================================================================
 # UPDATE HISTORY TRACKING
 # ============================================================================
+
+function Convert-HistorySchema {
+    param(
+        [AllowNull()][object]$History
+    )
+
+    $converted = ConvertTo-Hashtable -InputObject $History
+    if ($converted -is [System.Collections.IDictionary] -and
+        $converted.Contains("entries") -and [int]$converted.schema_version -eq 2) {
+        return $converted
+    }
+
+    $legacyEntries = if ($null -eq $converted) {
+        @()
+    } elseif ($converted -is [System.Collections.IDictionary] -and $converted.Contains("entries")) {
+        @($converted.entries)
+    } else {
+        @($converted)
+    }
+    $migratedEntries = [System.Collections.ArrayList]::new()
+    foreach ($legacyEntry in $legacyEntries) {
+        $entry = ConvertTo-Hashtable -InputObject $legacyEntry
+        if ($entry -isnot [System.Collections.IDictionary]) { continue }
+        if ([string]::IsNullOrWhiteSpace([string]$entry.run_id)) {
+            $entry["run_id"] = [guid]::NewGuid().ToString()
+        }
+        if (-not $entry.Contains("schema_version")) { $entry["schema_version"] = 1 }
+        if (-not $entry.Contains("stages")) { $entry["stages"] = @() }
+        if (-not $entry.Contains("dependencies")) { $entry["dependencies"] = @() }
+        if (-not $entry.Contains("mutation_recovery")) { $entry["mutation_recovery"] = @() }
+        if (-not $entry.Contains("capabilities")) { $entry["capabilities"] = $null }
+        if (-not $entry.Contains("evidence_delivery")) { $entry["evidence_delivery"] = [ordered]@{} }
+        [void]$migratedEntries.Add($entry)
+    }
+
+    return [ordered]@{
+        schema_version = $script:HistorySchemaVersion
+        _migration_source_schema = $(if ($converted -is [System.Collections.IDictionary] -and
+            $converted.Contains("schema_version")) { [int]$converted.schema_version } else { 0 })
+        last_updated_at = (Get-Date).ToUniversalTime().ToString("o")
+        entries = @($migratedEntries)
+    }
+}
+
+function Test-HistoryDocument {
+    param(
+        [AllowNull()][object]$History
+    )
+
+    if ($History -isnot [System.Collections.IDictionary]) {
+        return [PSCustomObject]@{ Valid = $false; Reason = "History root is not an object" }
+    }
+    if ([int]$History.schema_version -ne $script:HistorySchemaVersion) {
+        return [PSCustomObject]@{ Valid = $false; Reason = "Unsupported history schema version" }
+    }
+    if (-not $History.Contains("entries")) {
+        return [PSCustomObject]@{ Valid = $false; Reason = "History entries are missing" }
+    }
+    foreach ($entry in @($History.entries)) {
+        if ($entry -isnot [System.Collections.IDictionary]) {
+            return [PSCustomObject]@{ Valid = $false; Reason = "History entry is not an object" }
+        }
+        $parsedRunId = [guid]::Empty
+        if (-not [guid]::TryParse([string]$entry.run_id, [ref]$parsedRunId)) {
+            return [PSCustomObject]@{ Valid = $false; Reason = "History entry run ID is invalid" }
+        }
+    }
+    return [PSCustomObject]@{ Valid = $true; Reason = "" }
+}
+
+function Read-UpdateHistory {
+    $read = Read-ProtectedJsonFile -Path $script:HistoryFile `
+        -MigrationScript ${function:Convert-HistorySchema} `
+        -ValidationScript ${function:Test-HistoryDocument}
+    if (-not $read.Success) {
+        $script:LastHistoryError = $read.Error
+        return $null
+    }
+    if ($read.Data.Contains("_migration_source_schema")) {
+        [void]$read.Data.Remove("_migration_source_schema")
+        $read.Data = Protect-EvidenceObject -InputObject $read.Data
+        [void](Write-ProtectedAtomicJson -Path $script:HistoryFile -Data $read.Data -Depth 24 `
+            -DataValidationScript ${function:Test-HistoryDocument})
+        [void](Write-ProtectedAtomicJson -Path "$($script:HistoryFile).previous" `
+            -Data $read.Data -Depth 24 -DataValidationScript ${function:Test-HistoryDocument} `
+            -KeepLastKnownGood:$false)
+    }
+    return $read.Data
+}
 
 function Save-UpdateHistory {
     param(
@@ -1671,24 +2501,17 @@ function Save-UpdateHistory {
     )
 
     try {
-        $history = @()
-        if (Test-Path $script:HistoryFile) {
-            $existing = Get-Content $script:HistoryFile -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json -ErrorAction SilentlyContinue
-            if ($existing) {
-                # ConvertFrom-Json returns array or single object
-                if ($existing -is [array]) {
-                    $history = @($existing)
-                } else {
-                    $history = @($existing)
-                }
-            }
+        $document = Read-UpdateHistory
+        if ($null -eq $document) {
+            $document = Convert-HistorySchema -History @()
         }
+        $history = @($document.entries)
 
         # A reboot continuation retains the logical run ID. Replace the prior
         # segment so history contains one durable record per logical run.
         $history = @($history | Where-Object { [string]$_.run_id -ne [string]$RunData.RunId })
 
-        $entry = [ordered]@{
+        $entry = Protect-EvidenceObject -InputObject ([ordered]@{
             schema_version    = $RunData.SchemaVersion
             run_id            = $RunData.RunId
             timestamp         = $RunData.CompletedAt
@@ -1711,6 +2534,7 @@ function Save-UpdateHistory {
             dependencies      = @($RunData.Dependencies)
             mutation_recovery = @($RunData.MutationRecovery)
             capabilities      = $RunData.Capabilities
+            retention         = $RunData.Retention
             evidence_delivery = $RunData.EvidenceDelivery
             parameters        = [ordered]@{
                 SkipOEM           = $SkipOEM.IsPresent
@@ -1723,7 +2547,7 @@ function Save-UpdateHistory {
                 ResetComponentBase = $ResetComponentBase.IsPresent
                 ContinueAfterReboot = $ContinueAfterReboot.IsPresent
             }
-        }
+        })
 
         # Prepend new entry, keep last 100 runs
         $history = @($entry) + @($history)
@@ -1731,9 +2555,19 @@ function Save-UpdateHistory {
             $history = $history[0..99]
         }
 
-        $history | ConvertTo-Json -Depth 12 | Set-Content -Path $script:HistoryFile -Force -Encoding UTF8 -ErrorAction Stop
+        $document["schema_version"] = $script:HistorySchemaVersion
+        $document["last_updated_at"] = (Get-Date).ToUniversalTime().ToString("o")
+        $document["entries"] = @($history)
+        if ($document.Contains("_migration_source_schema")) {
+            [void]$document.Remove("_migration_source_schema")
+        }
+        if (-not (Write-ProtectedAtomicJson -Path $script:HistoryFile -Data $document -Depth 24 `
+            -DataValidationScript ${function:Test-HistoryDocument})) {
+            throw $script:LastEvidenceWriteError
+        }
         return $true
     } catch {
+        $script:LastHistoryError = $_.Exception.Message
         return $false
     }
 }
@@ -1741,23 +2575,24 @@ function Save-UpdateHistory {
 function Show-UpdateHistory {
     param([int]$Count = 10)
 
-    if (-not (Test-Path $script:HistoryFile)) {
+    if (-not (Test-Path -LiteralPath $script:HistoryFile) -and
+        -not (Test-Path -LiteralPath "$($script:HistoryFile).previous")) {
         Write-Host "No update history found." -ForegroundColor Yellow
         return
     }
 
     try {
-        $history = Get-Content $script:HistoryFile -Raw | ConvertFrom-Json
-        if (-not $history) {
+        $history = Read-UpdateHistory
+        if ($null -eq $history -or @($history.entries).Count -eq 0) {
             Write-Host "No update history found." -ForegroundColor Yellow
             return
         }
 
-        $entries = @($history) | Select-Object -First $Count
+        $entries = @(@($history.entries) | Select-Object -First $Count)
 
         Write-Host ""
         Write-Host "  ================================================================" -ForegroundColor Cyan
-        Write-Host "    SystemUpdatePro - Update History (Last $($entries.Count) Runs)" -ForegroundColor Cyan
+        Write-Host "    SystemUpdatePro - Update History (Last $(@($entries).Count) Runs)" -ForegroundColor Cyan
         Write-Host "  ================================================================" -ForegroundColor Cyan
         Write-Host ""
 
@@ -1805,7 +2640,9 @@ function Invoke-DriverBackup {
     Write-Log "Backing up current drivers to: $backupDir" "STEP"
 
     try {
-        New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
+        if (-not (New-ProtectedDirectory -Path $backupDir)) {
+            throw "Driver backup directory could not be protected"
+        }
 
         if ($DryRun) {
             Write-Log "Would export drivers via Export-WindowsDriver to $backupDir" "INFO"
@@ -1827,14 +2664,8 @@ function Invoke-DriverBackup {
 
         Write-Log "Backed up $driverFolders drivers ($totalSizeMB MB) to $backupDir" "SUCCESS"
 
-        # Clean up old backups (keep last 3)
-        $allBackups = Get-ChildItem -Path $backupRoot -Directory -ErrorAction SilentlyContinue | Sort-Object CreationTime -Descending
-        if ($allBackups.Count -gt 3) {
-            $allBackups | Select-Object -Skip 3 | ForEach-Object {
-                Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
-                Write-Log "Removed old backup: $($_.Name)" "DEBUG"
-            }
-        }
+        [void](Invoke-EvidenceRetention -RetentionDays $LogRetentionDays `
+            -MaximumSizeMB $EvidenceMaxSizeMB)
 
         return $backupDir
     } catch {
@@ -4874,6 +5705,7 @@ function Invoke-DellUpdate {
         Write-Log "========== DELL COMMAND UPDATE ==========" "HEADER"
 
         $sysInfo = if ($null -ne $SystemInfo) { $SystemInfo } else { Get-SystemInfo }
+        Add-SensitiveEvidenceValue -Value ([string]$sysInfo.SerialNumber)
         Write-Log "Service Tag: $($sysInfo.SerialNumber)" "INFO"
 
         $dcuPath = Get-DCUPath
@@ -4936,6 +5768,8 @@ function Invoke-DellUpdate {
         Write-Log "Verifying Dell model/tool applicability..." "INFO"
         $scanProcess = Start-Process -FilePath $dcuPath -ArgumentList ($scanArgs -join " ") `
             -Wait -NoNewWindow -PassThru -ErrorAction Stop
+        [void](Protect-EvidenceFile -Path $scanLog `
+            -SensitiveValues @([string]$sysInfo.SerialNumber))
         $result.Attempted++
         $result.ExitCode = $scanProcess.ExitCode
         $result.Evidence = @($scanLog)
@@ -5017,6 +5851,8 @@ function Invoke-DellUpdate {
             }
             break
         }
+        [void](Protect-EvidenceFile -Path $dcuLog `
+            -SensitiveValues @([string]$sysInfo.SerialNumber))
 
         if ($result.Success) {
             if ($result.Status -ne "Partial") { $result.Status = "Succeeded" }
@@ -5083,6 +5919,7 @@ function Invoke-LenovoUpdate {
     Write-Log "========== LENOVO SYSTEM UPDATE ==========" "HEADER"
 
     $sysInfo = if ($null -ne $SystemInfo) { $SystemInfo } else { Get-SystemInfo }
+    Add-SensitiveEvidenceValue -Value ([string]$sysInfo.SerialNumber)
     Write-Log "Serial: $($sysInfo.SerialNumber)" "INFO"
 
     if (-not (Install-PSModuleWithRetry -ModuleName "LSUClient")) {
@@ -5414,6 +6251,7 @@ function Invoke-HPUpdate {
         Write-Log "========== HP IMAGE ASSISTANT ==========" "HEADER"
 
         $sysInfo = if ($null -ne $SystemInfo) { $SystemInfo } else { Get-SystemInfo }
+        Add-SensitiveEvidenceValue -Value ([string]$sysInfo.SerialNumber)
         Write-Log "Serial: $($sysInfo.SerialNumber)" "INFO"
 
         $hpiaPath = Get-HPIAPath
@@ -5452,7 +6290,9 @@ function Invoke-HPUpdate {
         $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
         $reportDir = Join-Path $LogPath "HPIA_$timestamp"
         $softpaqDir = Join-Path $env:TEMP "HPSoftpaqs"
-        New-Item -ItemType Directory -Path $reportDir -Force | Out-Null
+        if (-not (New-ProtectedDirectory -Path $reportDir)) {
+            throw "HPIA report directory could not be protected"
+        }
         if (-not $DryRun) {
             New-Item -ItemType Directory -Path $softpaqDir -Force | Out-Null
         }
@@ -5466,6 +6306,8 @@ function Invoke-HPUpdate {
         Write-Log "Verifying HP model/tool applicability..." "INFO"
         $scanProcess = Start-Process -FilePath $hpiaPath -ArgumentList ($scanArgs -join " ") `
             -Wait -NoNewWindow -PassThru -ErrorAction Stop
+        [void](Protect-EvidenceTree -Path $reportDir `
+            -SensitiveValues @([string]$sysInfo.SerialNumber))
         $result.Attempted++
         $result.ExitCode = $scanProcess.ExitCode
         $result.Evidence = @($reportDir)
@@ -5522,6 +6364,8 @@ function Invoke-HPUpdate {
         Write-Log "Applying HP update categories: $($policy.HPCategories -join ', ')..." "INFO"
         $process = Start-Process -FilePath $hpiaPath -ArgumentList ($hpiaArgs -join " ") `
             -Wait -NoNewWindow -PassThru -ErrorAction Stop
+        [void](Protect-EvidenceTree -Path $reportDir `
+            -SensitiveValues @([string]$sysInfo.SerialNumber))
         $result.Attempted++
         $result.ExitCode = $process.ExitCode
 
@@ -5986,6 +6830,18 @@ function New-HTMLReport {
     $mutationRecoveryCount = @($mutationEvents | Where-Object {
         [string]$_.Action -in @("Restored", "Committed")
     }).Count
+    $retention = Get-ResultValue -Result $RunData -Names @("Retention") -Default $null
+    $retentionDisplay = if ($null -eq $retention) {
+        "Not evaluated"
+    } else {
+        $retainedDeletedFiles = [int](Get-ResultValue -Result $retention `
+            -Names @("DeletedFiles") -Default 0)
+        $retainedDeletedDirectories = [int](Get-ResultValue -Result $retention `
+            -Names @("DeletedDirectories") -Default 0)
+        $retainedBytes = [long](Get-ResultValue -Result $retention `
+            -Names @("BytesFreed") -Default 0)
+        "$retainedDeletedFiles files · $retainedDeletedDirectories directories · $retainedBytes bytes freed"
+    }
     $capabilities = Get-ResultValue -Result $RunData -Names @("Capabilities") -Default $null
     $platformCapabilityDisplay = "Not assessed"
     $providerCapabilityDisplay = "Not assessed"
@@ -6070,7 +6926,10 @@ function New-HTMLReport {
     $computerName = & $displayValue $env:COMPUTERNAME "Unknown endpoint"
     $manufacturer = & $displayValue $SysInfo.Manufacturer
     $model = & $displayValue $SysInfo.Model
-    $serialNumber = & $displayValue $SysInfo.SerialNumber
+    $serialNumber = & $displayValue (
+        Protect-EvidenceText -Text $SysInfo.SerialNumber `
+            -SensitiveValues @([string]$SysInfo.SerialNumber)
+    )
     $osName = & $displayValue $SysInfo.OSName
     $osBuild = & $displayValue $SysInfo.OSBuild
     $biosVersion = & $displayValue $SysInfo.BIOSVersion
@@ -7243,6 +8102,7 @@ function New-HTMLReport {
         <div class="detail-item"><dt>PowerShell runtime</dt><dd>$runtimeCapabilityDisplay</dd></div>
         <div class="detail-item"><dt>Component rollback</dt><dd>$componentRollbackDisplay</dd></div>
         <div class="detail-item"><dt>Mutation recovery</dt><dd>$mutationRecoveryCount verified actions</dd></div>
+        <div class="detail-item"><dt>Evidence retention</dt><dd>$retentionDisplay</dd></div>
       </dl>
       <div class="log-path"><span>Log file</span><code>$logFileDisplay</code></div>
     </section>
@@ -7258,7 +8118,24 @@ function New-HTMLReport {
 "@
 
     try {
-        $html | Set-Content -Path $reportFile -Encoding UTF8 -Force
+        $safeHtml = Protect-EvidenceText -Text $html `
+            -SensitiveValues @([string]$SysInfo.SerialNumber)
+        $htmlValidation = {
+            param([string]$CandidatePath)
+            try {
+                $candidateHtml = [IO.File]::ReadAllText($CandidatePath)
+                return (
+                    $candidateHtml -match "<!DOCTYPE html>" -and
+                    $candidateHtml -match "</html>\s*$"
+                )
+            } catch {
+                return $false
+            }
+        }
+        if (-not (Write-ProtectedAtomicFile -Path $reportFile -Content $safeHtml `
+            -ValidationScript $htmlValidation)) {
+            throw "HTML report could not be committed: $($script:LastEvidenceWriteError)"
+        }
         Write-Log "HTML report: $reportFile" "SUCCESS"
 
         # Auto-open in browser unless headless/unattended
@@ -7322,8 +8199,10 @@ function Send-WebhookNotification {
         dependencies    = @($RunData.Dependencies)
         mutation_recovery = @($RunData.MutationRecovery)
         capabilities    = $RunData.Capabilities
+        retention       = $RunData.Retention
         runtime_seconds = $RunData.DurationSeconds
     }
+    $payload = Protect-EvidenceObject -InputObject $payload
 
     try {
         # Detect webhook type and format accordingly
@@ -7611,7 +8490,7 @@ try {
         [void](Add-StageResult (New-StageResult -Name "Coordination" -Status "Succeeded" `
             -Attempted 1 -Message "Single-instance lock acquired" -StartedAt $coordinationStart))
 
-        Invoke-LogRotation -RetentionDays $LogRetentionDays
+        [void](Invoke-LogRotation -RetentionDays $LogRetentionDays)
         Write-Log "Run ID: $($script:RunId)" "DEBUG"
         Write-Log "Log: $script:LogFile" "DEBUG"
 
@@ -7628,6 +8507,7 @@ try {
         $preflightItems = [System.Collections.ArrayList]::new()
 
         $sysInfo = Get-SystemInfo
+        Add-SensitiveEvidenceValue -Value ([string]$sysInfo.SerialNumber)
         Write-Log "System: $($sysInfo.Manufacturer) $($sysInfo.Model)" "INFO"
         Write-Log "OS: $($sysInfo.OSName) (Build $($sysInfo.OSBuild))" "DEBUG"
         $script:CapabilityAssessment = Get-CapabilityAssessment -SystemInfo $sysInfo
@@ -8165,6 +9045,8 @@ try {
     if ($script:TranscriptStarted) {
         try { Stop-Transcript | Out-Null } catch {}
         $script:TranscriptStarted = $false
+        [void](Protect-EvidenceFile -Path $script:TranscriptFile `
+            -SensitiveValues @([string]$sysInfo.SerialNumber))
     }
 }
 
