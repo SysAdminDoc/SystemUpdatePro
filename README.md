@@ -44,7 +44,7 @@ SystemUpdatePro is a fully automated, self-healing PowerShell script that handle
 - **Event Log**: Writes to Windows Application log for RMM/SIEM visibility
 - **Exit Codes**: Granular exit codes for automation pipelines
 - **WSUS Bypass**: Option to bypass WSUS and connect directly to Microsoft
-- **Post-Reboot Continuation**: Scheduled task to resume updates after reboot
+- **Post-Reboot Continuation**: Versioned, bounded state machine resumes update stages with the original run settings
 - **Log Rotation**: Automatic cleanup of old log files
 - **HTML Reports**: Responsive operations-dashboard report with update channels, device profile, exceptions, and print styles
 - **Webhook Notifications**: Send completion status to Slack, Teams, or any generic webhook
@@ -168,7 +168,7 @@ cd SystemUpdatePro
 | `-BypassWSUS` | Switch | False | Bypass WSUS, connect directly to Microsoft |
 | `-RepairWindowsUpdate` | Switch | False | Repair Windows Update components before updating |
 | `-CleanupAfter` | Switch | False | Run DISM component cleanup after updates |
-| `-ContinueAfterReboot` | Switch | False | Create scheduled task to continue after reboot |
+| `-ContinueAfterReboot` | Switch | False | Resume update stages after reboot with the original run settings (maximum 3 attempts) |
 | `-DryRun` | Switch | False | Preview updates without installing |
 | `-BackupDrivers` | Switch | False | Export current drivers before updating |
 | `-ShowHistory` | Switch | False | Display previous update run history |
@@ -227,10 +227,12 @@ Get-EventLog -LogName Application -Source "SystemUpdatePro" -Newest 10
 |------|---------|
 | `C:\ProgramData\SystemUpdatePro\Logs\` | Log files and HTML reports |
 | `C:\ProgramData\SystemUpdatePro\update.lock` | Lock file (prevents concurrent runs) |
-| `C:\ProgramData\SystemUpdatePro\state.json` | State file (for post-reboot continuation) |
+| `C:\ProgramData\SystemUpdatePro\state.json` | Protected, versioned post-reboot continuation state |
 | `C:\ProgramData\SystemUpdatePro\update_history.json` | Update history log (last 100 runs) |
 | `C:\ProgramData\SystemUpdatePro\DriverBackups\` | Driver backup snapshots (last 3 kept) |
 | `C:\ProgramData\SystemUpdatePro\HPIA\` | HP Image Assistant installation |
+
+Continuation state is atomically replaced and restricted to SYSTEM, Administrators, and the creating identity. It preserves the run ID, effective parameters, result history, attempt count, and next stage cursor; task command lines contain only the script path. Invalid or broadly writable state is moved to `state.corrupt.<timestamp>.<id>.json` instead of being executed. A continuation can resume at most three times, and terminal success or failure removes its one-shot task and active state.
 
 ---
 

@@ -142,7 +142,11 @@ $script:Version = "4.1.0"
 $script:ProductName = "SystemUpdatePro"
 $script:EventLogSource = "SystemUpdatePro"
 $script:ResultSchemaVersion = 1
+$script:StateSchemaVersion = 1
+$script:MaxContinuationAttempts = 3
 $script:RunId = [guid]::NewGuid().ToString()
+$script:RunStartedAt = Get-Date
+$script:EntryScriptPath = [string]$PSCommandPath
 $script:DataPath = "C:\ProgramData\SystemUpdatePro"
 $script:LockFile = "C:\ProgramData\SystemUpdatePro\update.lock"
 $script:StateFile = "C:\ProgramData\SystemUpdatePro\state.json"
@@ -166,6 +170,11 @@ $script:WingetUpdateCount = 0
 $script:StageResults = [System.Collections.ArrayList]::new()
 $script:RunFinalized = $false
 $script:TranscriptStarted = $false
+$script:ContinuationAttempt = 0
+$script:ContinuationActive = $false
+$script:ContinuationRegistered = $false
+$script:ContinuationState = $null
+$script:ResumeStageCursor = ""
 
 # Paths are declared without touching disk so read-only commands and tests can
 # load the script contract before privileged initialization.
@@ -617,24 +626,400 @@ function Remove-LockFile {
 # STATE MANAGEMENT (for post-reboot continuation)
 # ============================================================================
 
-function Save-State {
-    param([hashtable]$State)
+function ConvertTo-Hashtable {
+    param([AllowNull()][object]$InputObject)
 
-    $State.LastUpdate = (Get-Date).ToString("o")
-    $State | ConvertTo-Json -Depth 5 | Set-Content -Path $script:StateFile -Force
+    if ($null -eq $InputObject) { return $null }
+
+    if ($InputObject -is [System.Collections.IDictionary]) {
+        $dictionary = [ordered]@{}
+        foreach ($key in $InputObject.Keys) {
+            $dictionary[[string]$key] = ConvertTo-Hashtable -InputObject $InputObject[$key]
+        }
+        return ,$dictionary
+    }
+
+    if ($InputObject -is [System.Management.Automation.PSCustomObject]) {
+        $dictionary = [ordered]@{}
+        foreach ($property in $InputObject.PSObject.Properties) {
+            $dictionary[$property.Name] = ConvertTo-Hashtable -InputObject $property.Value
+        }
+        return ,$dictionary
+    }
+
+    if ($InputObject -is [System.Collections.IEnumerable] -and $InputObject -isnot [string]) {
+        $items = @($InputObject | ForEach-Object { ConvertTo-Hashtable -InputObject $_ })
+        return ,$items
+    }
+
+    return $InputObject
+}
+
+function Get-EffectiveRunParameter {
+    return [ordered]@{
+        SkipOEM            = $SkipOEM.IsPresent
+        SkipWindows        = $SkipWindows.IsPresent
+        SkipWinget         = $SkipWinget.IsPresent
+        IncludeBIOS        = $IncludeBIOS.IsPresent
+        BypassWSUS         = $BypassWSUS.IsPresent
+        RepairWindowsUpdate = $RepairWindowsUpdate.IsPresent
+        CleanupAfter       = $CleanupAfter.IsPresent
+        ContinueAfterReboot = $ContinueAfterReboot.IsPresent
+        DryRun             = $DryRun.IsPresent
+        BackupDrivers      = $BackupDrivers.IsPresent
+        ShowHistory        = $false
+        WebhookUrl         = [string]$WebhookUrl
+        HistoryCount       = [int]$HistoryCount
+        MaxRetries         = [int]$MaxRetries
+        MaxUpdatePasses    = [int]$MaxUpdatePasses
+        MinDiskSpaceGB     = [int]$MinDiskSpaceGB
+        LogPath            = [string]$LogPath
+        LogRetentionDays   = [int]$LogRetentionDays
+        Reboot             = $Reboot.IsPresent
+        Force              = $Force.IsPresent
+    }
+}
+
+function Get-ContinuationParameterName {
+    return @(
+        "SkipOEM", "SkipWindows", "SkipWinget", "IncludeBIOS", "BypassWSUS",
+        "RepairWindowsUpdate", "CleanupAfter", "ContinueAfterReboot", "DryRun",
+        "BackupDrivers", "ShowHistory", "WebhookUrl", "HistoryCount", "MaxRetries",
+        "MaxUpdatePasses", "MinDiskSpaceGB", "LogPath", "LogRetentionDays", "Reboot", "Force"
+    )
+}
+
+function Test-ContinuationState {
+    param([AllowNull()][object]$State)
+
+    $failure = {
+        param([string]$Reason)
+        return [PSCustomObject]@{ Valid = $false; Reason = $Reason }
+    }
+
+    if ($State -isnot [System.Collections.IDictionary]) {
+        return & $failure "State root is not an object"
+    }
+    if ([int]$State.SchemaVersion -ne $script:StateSchemaVersion) {
+        return & $failure "Unsupported state schema version"
+    }
+    if ([string]$State.Phase -notin @("Registering", "AwaitingReboot", "Running")) {
+        return & $failure "Invalid continuation phase"
+    }
+    if ([string]$State.StageCursor -notin @("WindowsUpdate", "Winget", "Cleanup", "Complete")) {
+        return & $failure "Invalid continuation stage cursor"
+    }
+
+    $parsedRunId = [guid]::Empty
+    if (-not [guid]::TryParse([string]$State.RunId, [ref]$parsedRunId)) {
+        return & $failure "Invalid continuation run ID"
+    }
+
+    $attemptCount = 0
+    $maximumAttempts = 0
+    if (-not [int]::TryParse([string]$State.AttemptCount, [ref]$attemptCount) -or
+        -not [int]::TryParse([string]$State.MaxAttempts, [ref]$maximumAttempts) -or
+        $attemptCount -lt 0 -or $maximumAttempts -lt 1 -or $maximumAttempts -gt 10 -or
+        $attemptCount -gt $maximumAttempts) {
+        return & $failure "Invalid continuation attempt bounds"
+    }
+
+    $createdAt = [datetime]::MinValue
+    if (-not [datetime]::TryParse([string]$State.CreatedAt, [ref]$createdAt)) {
+        return & $failure "Invalid continuation creation time"
+    }
+
+    if ($State.Parameters -isnot [System.Collections.IDictionary]) {
+        return & $failure "Continuation parameters are missing"
+    }
+    foreach ($parameterName in Get-ContinuationParameterName) {
+        if (-not $State.Parameters.Contains($parameterName)) {
+            return & $failure "Continuation parameter '$parameterName' is missing"
+        }
+    }
+
+    return [PSCustomObject]@{ Valid = $true; Reason = "" }
+}
+
+function Set-ContinuationStateAccess {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSUseShouldProcessForStateChangingFunctions", "", Justification = "Hardens the run-owned state file against non-administrator modification.")]
+    param([string]$Path = $script:StateFile)
+
+    try {
+        $currentIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+        $acl = New-Object System.Security.AccessControl.FileSecurity
+        $acl.SetOwner($currentIdentity)
+        $acl.SetAccessRuleProtection($true, $false)
+
+        $identities = @(
+            (New-Object System.Security.Principal.SecurityIdentifier("S-1-5-18")),
+            (New-Object System.Security.Principal.SecurityIdentifier("S-1-5-32-544")),
+            $currentIdentity
+        ) | Select-Object -Unique
+
+        foreach ($identity in $identities) {
+            $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                $identity,
+                [System.Security.AccessControl.FileSystemRights]::FullControl,
+                [System.Security.AccessControl.AccessControlType]::Allow
+            )
+            [void]$acl.AddAccessRule($rule)
+        }
+
+        $fileInfo = [System.IO.FileInfo](Get-Item -LiteralPath $Path -ErrorAction Stop)
+        if ($PSVersionTable.PSEdition -eq "Core") {
+            [System.IO.FileSystemAclExtensions]::SetAccessControl($fileInfo, $acl)
+        } else {
+            $fileInfo.SetAccessControl($acl)
+        }
+        return $true
+    } catch {
+        $script:LastStateAccessError = $_.Exception.Message
+        return $false
+    }
+}
+
+function Test-ContinuationStateAccess {
+    param([string]$Path = $script:StateFile)
+
+    try {
+        $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+        if (-not $acl.AreAccessRulesProtected) {
+            return [PSCustomObject]@{ Valid = $false; Reason = "State file inherits access rules" }
+        }
+
+        $broadWriterSids = @("S-1-1-0", "S-1-5-11", "S-1-5-32-545")
+        $writeRights = [System.Security.AccessControl.FileSystemRights]::Write -bor
+            [System.Security.AccessControl.FileSystemRights]::Modify -bor
+            [System.Security.AccessControl.FileSystemRights]::FullControl
+        foreach ($rule in $acl.Access) {
+            if ($rule.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
+                $rule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value -in $broadWriterSids -and
+                ($rule.FileSystemRights -band $writeRights)) {
+                return [PSCustomObject]@{ Valid = $false; Reason = "State file is writable by a broad principal" }
+            }
+        }
+        return [PSCustomObject]@{ Valid = $true; Reason = "" }
+    } catch {
+        return [PSCustomObject]@{ Valid = $false; Reason = "State ACL could not be verified: $($_.Exception.Message)" }
+    }
+}
+
+function Save-State {
+    param([System.Collections.IDictionary]$State)
+
+    $temporaryPath = "$($script:StateFile).tmp.$PID.$([guid]::NewGuid().ToString('N'))"
+    $backupPath = "$($script:StateFile).previous"
+
+    try {
+        $stateDirectory = Split-Path -Parent $script:StateFile
+        if (-not (Test-Path -LiteralPath $stateDirectory)) {
+            New-Item -ItemType Directory -Path $stateDirectory -Force -ErrorAction Stop | Out-Null
+        }
+
+        $State["LastUpdatedAt"] = (Get-Date).ToString("o")
+        $json = $State | ConvertTo-Json -Depth 20
+        $utf8 = New-Object System.Text.UTF8Encoding($false)
+        [System.IO.File]::WriteAllText($temporaryPath, $json, $utf8)
+
+        # Validate the complete temporary payload before replacing durable state.
+        $validated = [System.IO.File]::ReadAllText($temporaryPath) | ConvertFrom-Json -ErrorAction Stop
+        if ($null -eq $validated) { throw "State validation returned no data" }
+
+        if (Test-Path -LiteralPath $script:StateFile) {
+            [System.IO.File]::Replace($temporaryPath, $script:StateFile, $backupPath, $true)
+            Remove-Item -LiteralPath $backupPath -Force -ErrorAction SilentlyContinue
+        } else {
+            [System.IO.File]::Move($temporaryPath, $script:StateFile)
+        }
+        if (-not (Set-ContinuationStateAccess -Path $script:StateFile)) {
+            throw "State file access controls could not be hardened: $($script:LastStateAccessError)"
+        }
+        return $true
+    } catch {
+        $script:LastStateError = $_.Exception.Message
+        Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
+        try {
+            Write-Log "Failed to save continuation state: $($_.Exception.Message)" "ERROR"
+        } catch {
+            [System.Diagnostics.Debug]::WriteLine($_.Exception.Message)
+        }
+        return $false
+    }
+}
+
+function Move-StateToQuarantine {
+    param([string]$Reason)
+
+    if (-not (Test-Path -LiteralPath $script:StateFile)) { return "" }
+
+    $directory = Split-Path -Parent $script:StateFile
+    $baseName = [System.IO.Path]::GetFileNameWithoutExtension($script:StateFile)
+    $quarantineName = "{0}.corrupt.{1}.{2}.json" -f $baseName, (Get-Date -Format "yyyyMMddTHHmmss"), ([guid]::NewGuid().ToString("N"))
+    $quarantinePath = Join-Path $directory $quarantineName
+
+    try {
+        Move-Item -LiteralPath $script:StateFile -Destination $quarantinePath -ErrorAction Stop
+        [void](Set-ContinuationStateAccess -Path $quarantinePath)
+        try {
+            Write-Log "Quarantined invalid continuation state: $Reason ($quarantinePath)" "WARNING"
+        } catch {
+            [System.Diagnostics.Debug]::WriteLine($_.Exception.Message)
+        }
+        return $quarantinePath
+    } catch {
+        try {
+            Write-Log "Could not quarantine invalid continuation state: $($_.Exception.Message)" "ERROR"
+        } catch {
+            [System.Diagnostics.Debug]::WriteLine($_.Exception.Message)
+        }
+        return ""
+    }
 }
 
 function Get-State {
-    if (Test-Path $script:StateFile) {
-        try {
-            return Get-Content $script:StateFile | ConvertFrom-Json -AsHashtable
-        } catch {}
+    if (-not (Test-Path -LiteralPath $script:StateFile)) { return @{} }
+
+    try {
+        $accessValidation = Test-ContinuationStateAccess -Path $script:StateFile
+        if (-not $accessValidation.Valid) { throw $accessValidation.Reason }
+        $rawState = Get-Content -LiteralPath $script:StateFile -Raw -ErrorAction Stop
+        $stateObject = $rawState | ConvertFrom-Json -ErrorAction Stop
+        $state = ConvertTo-Hashtable -InputObject $stateObject
+        $validation = Test-ContinuationState -State $state
+        if (-not $validation.Valid) { throw $validation.Reason }
+        return $state
+    } catch {
+        [void](Move-StateToQuarantine -Reason $_.Exception.Message)
+        return @{}
     }
-    return @{}
 }
 
 function Clear-State {
-    Remove-Item $script:StateFile -Force -ErrorAction SilentlyContinue
+    try {
+        Remove-Item -LiteralPath $script:StateFile -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath "$($script:StateFile).previous" -Force -ErrorAction SilentlyContinue
+        return (-not (Test-Path -LiteralPath $script:StateFile))
+    } catch {
+        return $false
+    }
+}
+
+function New-ContinuationState {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSUseShouldProcessForStateChangingFunctions", "", Justification = "Creates an in-memory continuation state object only.")]
+    param(
+        [string]$StageCursor = "WindowsUpdate",
+        [string]$ScriptPath = [string]$PSCommandPath
+    )
+
+    return [ordered]@{
+        SchemaVersion = $script:StateSchemaVersion
+        RunId          = $script:RunId
+        Phase          = "Registering"
+        StageCursor    = $StageCursor
+        AttemptCount   = $script:ContinuationAttempt
+        MaxAttempts    = $script:MaxContinuationAttempts
+        CreatedAt      = $script:RunStartedAt.ToString("o")
+        LastUpdatedAt  = (Get-Date).ToString("o")
+        ScriptPath     = $ScriptPath
+        Parameters     = Get-EffectiveRunParameter
+        StageResults   = @($script:StageResults)
+        Errors         = @($script:Errors)
+        Warnings       = @($script:Warnings)
+    }
+}
+
+function Import-ContinuationState {
+    param([System.Collections.IDictionary]$State)
+
+    $validation = Test-ContinuationState -State $State
+    if (-not $validation.Valid) {
+        return [PSCustomObject]@{ Success = $false; Message = $validation.Reason }
+    }
+
+    $nextAttempt = [int]$State.AttemptCount + 1
+    if ($nextAttempt -gt [int]$State.MaxAttempts) {
+        return [PSCustomObject]@{ Success = $false; Message = "Continuation attempt limit reached" }
+    }
+
+    $switchNames = @(
+        "SkipOEM", "SkipWindows", "SkipWinget", "IncludeBIOS", "BypassWSUS",
+        "RepairWindowsUpdate", "CleanupAfter", "ContinueAfterReboot", "DryRun",
+        "BackupDrivers", "ShowHistory", "Reboot", "Force"
+    )
+    $integerNames = @(
+        "HistoryCount", "MaxRetries", "MaxUpdatePasses", "MinDiskSpaceGB", "LogRetentionDays"
+    )
+
+    foreach ($name in $switchNames) {
+        Set-Variable -Name $name -Scope Script -Value ([switch][bool]$State.Parameters[$name])
+    }
+    foreach ($name in $integerNames) {
+        Set-Variable -Name $name -Scope Script -Value ([int]$State.Parameters[$name])
+    }
+    Set-Variable -Name "WebhookUrl" -Scope Script -Value ([string]$State.Parameters.WebhookUrl)
+    Set-Variable -Name "LogPath" -Scope Script -Value ([string]$State.Parameters.LogPath)
+
+    $script:RunId = [string]$State.RunId
+    $script:RunStartedAt = [datetime]::Parse([string]$State.CreatedAt)
+    $script:ContinuationAttempt = $nextAttempt
+    $script:ContinuationActive = $true
+    $script:ResumeStageCursor = [string]$State.StageCursor
+    $script:ContinuationState = $State
+    $script:StageResults = [System.Collections.ArrayList]::new()
+    foreach ($stageData in @($State.StageResults)) {
+        $stage = [PSCustomObject]$stageData
+        if ($stage.PSObject.Properties["RebootRequired"] -and [bool]$stage.RebootRequired) {
+            $stage | Add-Member -NotePropertyName "RebootSatisfied" -NotePropertyValue $true -Force
+            $stage.RebootRequired = $false
+        }
+        [void]$script:StageResults.Add($stage)
+    }
+    $script:Errors = [System.Collections.ArrayList]::new()
+    foreach ($message in @($State.Errors)) { [void]$script:Errors.Add([string]$message) }
+    $script:Warnings = [System.Collections.ArrayList]::new()
+    foreach ($message in @($State.Warnings)) { [void]$script:Warnings.Add([string]$message) }
+
+    $script:LogFile = Join-Path $LogPath "$($script:ProductName)_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+    $script:TranscriptFile = Join-Path $LogPath "$($script:ProductName)_Transcript_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+
+    $State.Phase = "Running"
+    $State.AttemptCount = $nextAttempt
+    if (-not (Save-State -State $State)) {
+        return [PSCustomObject]@{ Success = $false; Message = "Could not claim continuation state" }
+    }
+
+    return [PSCustomObject]@{ Success = $true; Message = "Continuation state restored" }
+}
+
+function Set-ContinuationCursor {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSUseShouldProcessForStateChangingFunctions", "", Justification = "Updates the run-owned continuation state snapshot.")]
+    param(
+        [ValidateSet("WindowsUpdate", "Winget", "Cleanup", "Complete")]
+        [string]$StageCursor
+    )
+
+    if (-not $script:ContinuationActive -or $null -eq $script:ContinuationState) { return $true }
+
+    $script:ContinuationState.StageCursor = $StageCursor
+    $script:ContinuationState.StageResults = @($script:StageResults)
+    $script:ContinuationState.Errors = @($script:Errors)
+    $script:ContinuationState.Warnings = @($script:Warnings)
+    $script:ContinuationState.Parameters = Get-EffectiveRunParameter
+    return Save-State -State $script:ContinuationState
+}
+
+function Test-ShouldRunContinuationStage {
+    param(
+        [ValidateSet("WindowsUpdate", "Winget", "Cleanup")]
+        [string]$Stage
+    )
+
+    if (-not $script:ContinuationActive) { return $true }
+    $order = @("WindowsUpdate", "Winget", "Cleanup", "Complete")
+    $cursorIndex = [array]::IndexOf($order, $script:ResumeStageCursor)
+    $stageIndex = [array]::IndexOf($order, $Stage)
+    return ($stageIndex -ge $cursorIndex)
 }
 
 # ============================================================================
@@ -680,6 +1065,10 @@ function Save-UpdateHistory {
                 }
             }
         }
+
+        # A reboot continuation retains the logical run ID. Replace the prior
+        # segment so history contains one durable record per logical run.
+        $history = @($history | Where-Object { [string]$_.run_id -ne [string]$RunData.RunId })
 
         $entry = [ordered]@{
             schema_version    = $RunData.SchemaVersion
@@ -1189,48 +1578,95 @@ function Register-ContinuationTask {
         return $true
     }
 
+    if ($script:ContinuationAttempt -ge $script:MaxContinuationAttempts) {
+        Write-Log "Continuation attempt limit reached ($($script:MaxContinuationAttempts))" "ERROR"
+        return $false
+    }
+
+    $scriptPath = [string]$script:EntryScriptPath
+    if ([string]::IsNullOrWhiteSpace($scriptPath) -or -not (Test-Path -LiteralPath $scriptPath)) {
+        Write-Log "Cannot register continuation because the script path is unavailable" "ERROR"
+        return $false
+    }
+
+    $state = New-ContinuationState -StageCursor "WindowsUpdate" -ScriptPath $scriptPath
+    if (-not (Save-State -State $state)) {
+        Write-Log "Continuation state could not be committed; task was not registered" "ERROR"
+        return $false
+    }
+
     try {
-        # Remove existing task if present
+        # Keep the task command line free of saved parameters and webhook URLs;
+        # the validated state file is the sole resume contract.
         Unregister-ScheduledTask -TaskName $script:TaskName -Confirm:$false -ErrorAction SilentlyContinue
 
-        # Build the command to resume
-        $scriptPath = $MyInvocation.PSCommandPath
-        if (-not $scriptPath) { $scriptPath = $PSCommandPath }
-
-        $arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`""
-        if ($SkipOEM) { $arguments += " -SkipOEM" }
-        if ($SkipWinget) { $arguments += " -SkipWinget" }
-        if ($IncludeBIOS) { $arguments += " -IncludeBIOS" }
-        if ($CleanupAfter) { $arguments += " -CleanupAfter" }
-
-        $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $arguments
+        $powershellPath = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+        $arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$scriptPath`""
+        $action = New-ScheduledTaskAction -Execute $powershellPath -Argument $arguments
         $trigger = New-ScheduledTaskTrigger -AtStartup
         $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+            -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 4)
 
         Register-ScheduledTask -TaskName $script:TaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
 
-        # Save state
-        Save-State @{
-            Phase = "PostReboot"
-            SkipOEM = $SkipOEM.IsPresent
-            SkipWindows = $false
-            SkipWinget = $SkipWinget.IsPresent
-            IncludeBIOS = $IncludeBIOS.IsPresent
-            UpdatesInstalled = $script:UpdatesInstalled
+        $state.Phase = "AwaitingReboot"
+        if (-not (Save-State -State $state)) {
+            throw "Scheduled task was created but final state commit failed"
         }
 
+        $script:ContinuationState = $state
+        $script:ContinuationRegistered = $true
         Write-Log "Continuation task registered: $($script:TaskName)" "SUCCESS"
         return $true
     } catch {
+        Unregister-ScheduledTask -TaskName $script:TaskName -Confirm:$false -ErrorAction SilentlyContinue
+        [void](Clear-State)
+        $script:ContinuationRegistered = $false
         Write-Log "Failed to create continuation task: $($_.Exception.Message)" "WARNING"
         return $false
     }
 }
 
+function Test-ContinuationTask {
+    try {
+        return $null -ne (Get-ScheduledTask -TaskName $script:TaskName -ErrorAction SilentlyContinue)
+    } catch {
+        return $false
+    }
+}
+
 function Unregister-ContinuationTask {
-    Unregister-ScheduledTask -TaskName $script:TaskName -Confirm:$false -ErrorAction SilentlyContinue
-    Clear-State
+    param([switch]$PreserveState)
+
+    $success = $true
+    try {
+        if (Test-ContinuationTask) {
+            Unregister-ScheduledTask -TaskName $script:TaskName -Confirm:$false -ErrorAction Stop
+        }
+    } catch {
+        $success = $false
+        try {
+            Write-Log "Failed to remove continuation task: $($_.Exception.Message)" "ERROR"
+        } catch {
+            [System.Diagnostics.Debug]::WriteLine($_.Exception.Message)
+        }
+    }
+
+    if (-not $PreserveState -and -not (Clear-State)) {
+        $success = $false
+        try {
+            Write-Log "Failed to clear continuation state" "ERROR"
+        } catch {
+            [System.Diagnostics.Debug]::WriteLine($_.Exception.Message)
+        }
+    }
+
+    if ($success -and -not $PreserveState) {
+        $script:ContinuationState = $null
+        $script:ContinuationActive = $false
+    }
+    return $success
 }
 
 # ============================================================================
@@ -3728,7 +4164,7 @@ if ($ShowHistory) {
     exit 0
 }
 
-$scriptStart = Get-Date
+$scriptStart = $script:RunStartedAt
 $sysInfo = @{
     Manufacturer = "Unknown"
     Model = "Unknown"
@@ -3744,6 +4180,7 @@ $lockAcquired = $false
 $wsusBypassApplied = $false
 $shutdownRequested = $false
 $runData = $null
+$state = @{}
 
 try {
     :run do {
@@ -3756,6 +4193,21 @@ try {
                 -Attempted 1 -Failed 1 -ProviderCode 3 -Message $message -StartedAt $initializationStart))
             $script:ExitCode = 3
             break run
+        }
+
+        $state = Get-State
+        if ($state.Count -gt 0) {
+            $resumeResult = Import-ContinuationState -State $state
+            if (-not $resumeResult.Success) {
+                $message = "Continuation state could not be resumed: $($resumeResult.Message)"
+                [void]$script:Errors.Add($message)
+                [void](Add-StageResult (New-StageResult -Name "Resume" -Provider "Task Scheduler" `
+                    -Status "Failed" -Attempted 1 -Failed 1 -ProviderCode 3 -Message $message `
+                    -StartedAt $initializationStart))
+                $script:ExitCode = 3
+                break run
+            }
+            $scriptStart = $script:RunStartedAt
         }
 
         if (-not (Initialize-RunEnvironment)) {
@@ -3798,14 +4250,12 @@ try {
         Write-Log "Run ID: $($script:RunId)" "DEBUG"
         Write-Log "Log: $script:LogFile" "DEBUG"
 
-        $state = Get-State
-        if ($state.Phase -eq "PostReboot") {
+        if ($script:ContinuationActive) {
             $continuationStart = Get-Date
-            Write-Log "Resuming after reboot..." "STEP"
-            $script:UpdatesInstalled = [int]$state.UpdatesInstalled
-            Unregister-ContinuationTask
+            Write-Log "Resuming run $($script:RunId) after reboot at stage '$($script:ResumeStageCursor)' (attempt $($script:ContinuationAttempt)/$($script:MaxContinuationAttempts))..." "STEP"
             [void](Add-StageResult (New-StageResult -Name "Resume" -Status "Succeeded" `
-                -Attempted 1 -Message "Post-reboot continuation resumed" -StartedAt $continuationStart))
+                -Attempted 1 -Message "Post-reboot continuation resumed at $($script:ResumeStageCursor)" `
+                -ProviderCode $script:ContinuationAttempt -StartedAt $continuationStart))
         }
 
         Write-Log "Running pre-flight checks..." "STEP"
@@ -3899,8 +4349,9 @@ try {
             -StartedAt $preflightStart -DurationSeconds ([int]((Get-Date) - $preflightStart).TotalSeconds)))
         Write-Host ""
 
-        $repairStart = Get-Date
-        if ($RepairWindowsUpdate) {
+        if (-not $script:ContinuationActive) {
+            $repairStart = Get-Date
+            if ($RepairWindowsUpdate) {
             $repairSucceeded = [bool](Repair-WindowsUpdateServices)
             $repairStage = ConvertTo-StageResult -Name "WindowsUpdateRepair" -Provider "Windows servicing" `
                 -Result @{ Success = $repairSucceeded; Message = $(if ($repairSucceeded) { "Repair completed" } else { "Repair failed" }) } `
@@ -3908,109 +4359,133 @@ try {
             [void](Add-StageResult $repairStage)
             if ($repairStage.Status -eq "Failed") { $script:ExitCode = 2 }
             Write-Host ""
-        } else {
-            [void](Add-StageResult (New-StageResult -Name "WindowsUpdateRepair" -Provider "Windows servicing" `
-                -Status "Skipped" -Skipped 1 -Message "Repair not requested" -StartedAt $repairStart))
-        }
-
-        $wsusStart = Get-Date
-        if ($BypassWSUS) {
-            Set-WSUSBypass -Enable
-            $wsusBypassApplied = $true
-            [void](Add-StageResult (New-StageResult -Name "WSUSBypass" -Provider "Windows Update policy" `
-                -Status "Succeeded" -Attempted 1 -Message "Temporary WSUS bypass applied" -StartedAt $wsusStart))
-        } else {
-            [void](Add-StageResult (New-StageResult -Name "WSUSBypass" -Provider "Windows Update policy" `
-                -Status "Skipped" -Skipped 1 -Message "WSUS bypass not requested" -StartedAt $wsusStart))
-        }
-
-        $backupStart = Get-Date
-        if ($BackupDrivers -and -not $SkipOEM) {
-            $backupPath = Invoke-DriverBackup
-            $backupSuccess = [bool]$backupPath
-            $backupStage = ConvertTo-StageResult -Name "DriverBackup" -Provider "Export-WindowsDriver" `
-                -Result @{ Success = $backupSuccess; Message = $(if ($backupSuccess) { "Driver backup completed" } else { "Driver backup failed" }); Evidence = @($backupPath) } `
-                -StartedAt $backupStart
-            [void](Add-StageResult $backupStage)
-            if ($backupStage.Status -eq "Failed") { $script:ExitCode = 2 }
-            Write-Host ""
-        } else {
-            [void](Add-StageResult (New-StageResult -Name "DriverBackup" -Provider "Export-WindowsDriver" `
-                -Status "Skipped" -Skipped 1 -Message "Driver backup not requested" -StartedAt $backupStart))
-        }
-
-        $oemStart = Get-Date
-        if ($SkipOEM) {
-            [void](Add-StageResult (New-StageResult -Name "OEM" -Provider "OEM" -Status "Skipped" `
-                -Skipped 1 -Message "OEM updates skipped by run configuration" -StartedAt $oemStart))
-        } else {
-            $manufacturer = [string]$sysInfo.Manufacturer
-            $provider = $manufacturer
-            $oemResult = $null
-
-            if ($manufacturer -match "DELL|ALIENWARE") {
-                $provider = "Dell Command Update"
-                $oemResult = Invoke-DellUpdate -IncludeBIOS:$IncludeBIOS
-            } elseif ($manufacturer -match "LENOVO") {
-                $provider = "LSUClient"
-                $oemResult = Invoke-LenovoUpdate -IncludeBIOS:$IncludeBIOS
-            } elseif ($manufacturer -match "HP|HEWLETT") {
-                $provider = "HP Image Assistant"
-                $oemResult = Invoke-HPUpdate -IncludeBIOS:$IncludeBIOS
             } else {
-                Write-Log "========== OEM UPDATES ==========" "HEADER"
-                Write-Log "Manufacturer '$manufacturer' not supported" "INFO"
-                [void](Add-StageResult (New-StageResult -Name "OEM" -Provider $manufacturer -Status "Skipped" `
-                    -Skipped 1 -Message "Manufacturer is not supported" -StartedAt $oemStart))
+                [void](Add-StageResult (New-StageResult -Name "WindowsUpdateRepair" -Provider "Windows servicing" `
+                    -Status "Skipped" -Skipped 1 -Message "Repair not requested" -StartedAt $repairStart))
             }
 
-            if ($oemResult) {
-                $oemStage = ConvertTo-StageResult -Name "OEM" -Provider $provider -Result $oemResult `
-                    -ItemNames @($script:OEMUpdates) -StartedAt $oemStart
-                [void](Add-StageResult $oemStage)
-                if ($oemStage.Status -in @("Failed", "Partial")) { $script:ExitCode = 2 }
+            $wsusStart = Get-Date
+            if ($BypassWSUS) {
+                Set-WSUSBypass -Enable
+                $wsusBypassApplied = $true
+                [void](Add-StageResult (New-StageResult -Name "WSUSBypass" -Provider "Windows Update policy" `
+                    -Status "Succeeded" -Attempted 1 -Message "Temporary WSUS bypass applied" -StartedAt $wsusStart))
+            } else {
+                [void](Add-StageResult (New-StageResult -Name "WSUSBypass" -Provider "Windows Update policy" `
+                    -Status "Skipped" -Skipped 1 -Message "WSUS bypass not requested" -StartedAt $wsusStart))
             }
-            Write-Host ""
+
+            $backupStart = Get-Date
+            if ($BackupDrivers -and -not $SkipOEM) {
+                $backupPath = Invoke-DriverBackup
+                $backupSuccess = [bool]$backupPath
+                $backupStage = ConvertTo-StageResult -Name "DriverBackup" -Provider "Export-WindowsDriver" `
+                    -Result @{ Success = $backupSuccess; Message = $(if ($backupSuccess) { "Driver backup completed" } else { "Driver backup failed" }); Evidence = @($backupPath) } `
+                    -StartedAt $backupStart
+                [void](Add-StageResult $backupStage)
+                if ($backupStage.Status -eq "Failed") { $script:ExitCode = 2 }
+                Write-Host ""
+            } else {
+                [void](Add-StageResult (New-StageResult -Name "DriverBackup" -Provider "Export-WindowsDriver" `
+                    -Status "Skipped" -Skipped 1 -Message "Driver backup not requested" -StartedAt $backupStart))
+            }
+
+            $oemStart = Get-Date
+            if ($SkipOEM) {
+                [void](Add-StageResult (New-StageResult -Name "OEM" -Provider "OEM" -Status "Skipped" `
+                    -Skipped 1 -Message "OEM updates skipped by run configuration" -StartedAt $oemStart))
+            } else {
+                $manufacturer = [string]$sysInfo.Manufacturer
+                $provider = $manufacturer
+                $oemResult = $null
+
+                if ($manufacturer -match "DELL|ALIENWARE") {
+                    $provider = "Dell Command Update"
+                    $oemResult = Invoke-DellUpdate -IncludeBIOS:$IncludeBIOS
+                } elseif ($manufacturer -match "LENOVO") {
+                    $provider = "LSUClient"
+                    $oemResult = Invoke-LenovoUpdate -IncludeBIOS:$IncludeBIOS
+                } elseif ($manufacturer -match "HP|HEWLETT") {
+                    $provider = "HP Image Assistant"
+                    $oemResult = Invoke-HPUpdate -IncludeBIOS:$IncludeBIOS
+                } else {
+                    Write-Log "========== OEM UPDATES ==========" "HEADER"
+                    Write-Log "Manufacturer '$manufacturer' not supported" "INFO"
+                    [void](Add-StageResult (New-StageResult -Name "OEM" -Provider $manufacturer -Status "Skipped" `
+                        -Skipped 1 -Message "Manufacturer is not supported" -StartedAt $oemStart))
+                }
+
+                if ($oemResult) {
+                    $oemStage = ConvertTo-StageResult -Name "OEM" -Provider $provider -Result $oemResult `
+                        -ItemNames @($script:OEMUpdates) -StartedAt $oemStart
+                    [void](Add-StageResult $oemStage)
+                    if ($oemStage.Status -in @("Failed", "Partial")) { $script:ExitCode = 2 }
+                }
+                Write-Host ""
+            }
+        } else {
+            Write-Log "Stages before '$($script:ResumeStageCursor)' were restored from continuation state" "INFO"
         }
 
-        $windowsStart = Get-Date
-        if ($SkipWindows) {
-            [void](Add-StageResult (New-StageResult -Name "WindowsUpdate" -Provider "Windows Update" `
-                -Status "Skipped" -Skipped 1 -Message "Windows Update skipped by run configuration" -StartedAt $windowsStart))
+        if (Test-ShouldRunContinuationStage -Stage "WindowsUpdate") {
+            $windowsStart = Get-Date
+            if ($SkipWindows) {
+                [void](Add-StageResult (New-StageResult -Name "WindowsUpdate" -Provider "Windows Update" `
+                    -Status "Skipped" -Skipped 1 -Message "Windows Update skipped by run configuration" -StartedAt $windowsStart))
+            } else {
+                $wuResult = Invoke-WindowsUpdate -MaxPasses $MaxUpdatePasses
+                $wuStage = ConvertTo-StageResult -Name "WindowsUpdate" -Provider "Windows Update" `
+                    -Result $wuResult -ItemNames @($script:WindowsUpdates) -StartedAt $windowsStart
+                [void](Add-StageResult $wuStage)
+                if ($wuStage.Status -in @("Failed", "Partial")) { $script:ExitCode = 2 }
+                Write-Host ""
+            }
+            if (-not (Set-ContinuationCursor -StageCursor "Winget")) {
+                throw "Failed to persist continuation cursor after Windows Update"
+            }
         } else {
-            $wuResult = Invoke-WindowsUpdate -MaxPasses $MaxUpdatePasses
-            $wuStage = ConvertTo-StageResult -Name "WindowsUpdate" -Provider "Windows Update" `
-                -Result $wuResult -ItemNames @($script:WindowsUpdates) -StartedAt $windowsStart
-            [void](Add-StageResult $wuStage)
-            if ($wuStage.Status -in @("Failed", "Partial")) { $script:ExitCode = 2 }
-            Write-Host ""
+            Write-Log "Windows Update stage already completed before continuation resumed" "INFO"
         }
 
-        $wingetStart = Get-Date
-        if ($SkipWinget) {
-            [void](Add-StageResult (New-StageResult -Name "Winget" -Provider "WinGet" -Status "Skipped" `
-                -Skipped 1 -Message "WinGet skipped by run configuration" -StartedAt $wingetStart))
+        if (Test-ShouldRunContinuationStage -Stage "Winget") {
+            $wingetStart = Get-Date
+            if ($SkipWinget) {
+                [void](Add-StageResult (New-StageResult -Name "Winget" -Provider "WinGet" -Status "Skipped" `
+                    -Skipped 1 -Message "WinGet skipped by run configuration" -StartedAt $wingetStart))
+            } else {
+                $wingetResult = Invoke-WingetUpgradeAll
+                $wingetStage = ConvertTo-StageResult -Name "Winget" -Provider "WinGet" `
+                    -Result $wingetResult -ItemNames @($script:WingetUpdates) -StartedAt $wingetStart
+                [void](Add-StageResult $wingetStage)
+                if ($wingetStage.Status -in @("Failed", "Partial")) { $script:ExitCode = 2 }
+                Write-Host ""
+            }
+            if (-not (Set-ContinuationCursor -StageCursor "Cleanup")) {
+                throw "Failed to persist continuation cursor after WinGet"
+            }
         } else {
-            $wingetResult = Invoke-WingetUpgradeAll
-            $wingetStage = ConvertTo-StageResult -Name "Winget" -Provider "WinGet" `
-                -Result $wingetResult -ItemNames @($script:WingetUpdates) -StartedAt $wingetStart
-            [void](Add-StageResult $wingetStage)
-            if ($wingetStage.Status -in @("Failed", "Partial")) { $script:ExitCode = 2 }
-            Write-Host ""
+            Write-Log "WinGet stage already completed before continuation resumed" "INFO"
         }
 
-        $cleanupStart = Get-Date
-        if ($CleanupAfter) {
-            $cleanupSucceeded = [bool](Invoke-ComponentCleanup)
-            $cleanupStage = ConvertTo-StageResult -Name "Cleanup" -Provider "DISM and cleanmgr" `
-                -Result @{ Success = $cleanupSucceeded; Message = $(if ($cleanupSucceeded) { "Component cleanup completed" } else { "Component cleanup failed" }) } `
-                -StartedAt $cleanupStart
-            [void](Add-StageResult $cleanupStage)
-            if ($cleanupStage.Status -eq "Failed") { $script:ExitCode = 2 }
-            Write-Host ""
+        if (Test-ShouldRunContinuationStage -Stage "Cleanup") {
+            $cleanupStart = Get-Date
+            if ($CleanupAfter) {
+                $cleanupSucceeded = [bool](Invoke-ComponentCleanup)
+                $cleanupStage = ConvertTo-StageResult -Name "Cleanup" -Provider "DISM and cleanmgr" `
+                    -Result @{ Success = $cleanupSucceeded; Message = $(if ($cleanupSucceeded) { "Component cleanup completed" } else { "Component cleanup failed" }) } `
+                    -StartedAt $cleanupStart
+                [void](Add-StageResult $cleanupStage)
+                if ($cleanupStage.Status -eq "Failed") { $script:ExitCode = 2 }
+                Write-Host ""
+            } else {
+                [void](Add-StageResult (New-StageResult -Name "Cleanup" -Provider "DISM and cleanmgr" `
+                    -Status "Skipped" -Skipped 1 -Message "Cleanup not requested" -StartedAt $cleanupStart))
+            }
+            if (-not (Set-ContinuationCursor -StageCursor "Complete")) {
+                throw "Failed to persist completed continuation cursor"
+            }
         } else {
-            [void](Add-StageResult (New-StageResult -Name "Cleanup" -Provider "DISM and cleanmgr" `
-                -Status "Skipped" -Skipped 1 -Message "Cleanup not requested" -StartedAt $cleanupStart))
+            Write-Log "Cleanup stage already completed before continuation resumed" "INFO"
         }
 
         $script:UpdatesInstalled = [int](($script:StageResults | Measure-Object -Property Installed -Sum).Sum)
@@ -4027,7 +4502,11 @@ try {
         }
 
         if ($script:RebootRequired -and -not $DryRun -and $Reboot) {
-            $shutdownRequested = $true
+            if (-not $ContinueAfterReboot -or $script:ContinuationRegistered) {
+                $shutdownRequested = $true
+            } else {
+                Write-Log "Automatic reboot cancelled because continuation was not registered" "ERROR"
+            }
         }
     } while ($false)
 } catch {
@@ -4046,6 +4525,26 @@ try {
             try { Write-Log $message "ERROR" } catch {}
             if (-not ($script:Errors -contains $message)) { [void]$script:Errors.Add($message) }
             $script:ExitCode = 3
+        }
+    }
+
+    if (-not $DryRun -and -not $script:ContinuationRegistered) {
+        $continuationArtifactsPresent = $script:ContinuationActive -or
+            (Test-Path -LiteralPath $script:StateFile) -or (Test-ContinuationTask)
+        $continuationCleanupStart = Get-Date
+        $continuationCleanupSucceeded = [bool](Unregister-ContinuationTask)
+        if ($continuationArtifactsPresent) {
+            $continuationCleanupStage = ConvertTo-StageResult -Name "ContinuationCleanup" -Provider "Task Scheduler" `
+                -Result @{
+                    Success = $continuationCleanupSucceeded
+                    Message = $(if ($continuationCleanupSucceeded) {
+                        "One-shot continuation task and state removed"
+                    } else {
+                        "Continuation task or state cleanup failed"
+                    })
+                } -StartedAt $continuationCleanupStart
+            [void](Add-StageResult $continuationCleanupStage)
+            if (-not $continuationCleanupSucceeded) { $script:ExitCode = 3 }
         }
     }
 
