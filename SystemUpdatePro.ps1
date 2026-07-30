@@ -141,6 +141,9 @@ param(
 $script:Version = "4.1.0"
 $script:ProductName = "SystemUpdatePro"
 $script:EventLogSource = "SystemUpdatePro"
+$script:ResultSchemaVersion = 1
+$script:RunId = [guid]::NewGuid().ToString()
+$script:DataPath = "C:\ProgramData\SystemUpdatePro"
 $script:LockFile = "C:\ProgramData\SystemUpdatePro\update.lock"
 $script:StateFile = "C:\ProgramData\SystemUpdatePro\state.json"
 $script:HistoryFile = "C:\ProgramData\SystemUpdatePro\update_history.json"
@@ -160,37 +163,17 @@ $script:WingetUpdates = [System.Collections.ArrayList]::new()
 $script:OEMUpdateCount = 0
 $script:WindowsUpdateCount = 0
 $script:WingetUpdateCount = 0
+$script:StageResults = [System.Collections.ArrayList]::new()
+$script:RunFinalized = $false
+$script:TranscriptStarted = $false
 
-$ErrorActionPreference = "Stop"
-$ProgressPreference = "SilentlyContinue"
-
-# ============================================================================
-# INITIALIZATION
-# ============================================================================
-
-# Verify admin privileges
-$currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
-if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    Write-Host "[X] This script requires administrator privileges." -ForegroundColor Red
-    exit 3
-}
-
-# Create directories
-$script:DataPath = "C:\ProgramData\SystemUpdatePro"
-@($script:DataPath, $LogPath) | ForEach-Object {
-    if (-not (Test-Path $_)) {
-        New-Item -ItemType Directory -Path $_ -Force | Out-Null
-    }
-}
-
-# Setup logging
+# Paths are declared without touching disk so read-only commands and tests can
+# load the script contract before privileged initialization.
 $script:LogFile = Join-Path $LogPath "$($script:ProductName)_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
 $script:TranscriptFile = Join-Path $LogPath "$($script:ProductName)_Transcript_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
 
-# Start transcript for deep debugging
-try {
-    Start-Transcript -Path $script:TranscriptFile -Force | Out-Null
-} catch {}
+$ErrorActionPreference = "Stop"
+$ProgressPreference = "SilentlyContinue"
 
 # ============================================================================
 # EVENT LOG SETUP
@@ -216,8 +199,11 @@ function Write-EventLogEntry {
     )
 
     try {
-        Write-EventLog -LogName "Application" -Source $script:EventLogSource -EntryType $EntryType -EventId $EventId -Message $Message -ErrorAction SilentlyContinue
-    } catch {}
+        Write-EventLog -LogName "Application" -Source $script:EventLogSource -EntryType $EntryType -EventId $EventId -Message $Message -ErrorAction Stop
+        return $true
+    } catch {
+        return $false
+    }
 }
 
 # ============================================================================
@@ -282,6 +268,311 @@ function Write-Banner {
 
 "@
     Write-Host $banner -ForegroundColor Cyan
+}
+
+# ============================================================================
+# RESULT CONTRACT AND RUN INITIALIZATION
+# ============================================================================
+
+function Test-Administrator {
+    try {
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+        return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch {
+        return $false
+    }
+}
+
+function Initialize-RunEnvironment {
+    try {
+        foreach ($path in @($script:DataPath, $LogPath)) {
+            if (-not (Test-Path -LiteralPath $path)) {
+                New-Item -ItemType Directory -Path $path -Force -ErrorAction Stop | Out-Null
+            }
+        }
+
+        try {
+            Start-Transcript -Path $script:TranscriptFile -Force -ErrorAction Stop | Out-Null
+            $script:TranscriptStarted = $true
+        } catch {
+            $script:TranscriptStarted = $false
+        }
+
+        return $true
+    } catch {
+        [Console]::Error.WriteLine("[X] Failed to initialize run storage: $($_.Exception.Message)")
+        return $false
+    }
+}
+
+function New-UpdateItemResult {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSUseShouldProcessForStateChangingFunctions", "", Justification = "Creates an in-memory result object only.")]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+        [string]$Id = "",
+        [ValidateSet("Available", "Attempted", "Installed", "Succeeded", "Failed", "Skipped", "Blocked", "Warning", "Unknown")]
+        [string]$Status = "Unknown",
+        [AllowNull()][object]$ProviderCode = $null,
+        [AllowNull()][object]$HResult = $null,
+        [bool]$RebootRequired = $false,
+        [string]$Message = "",
+        [AllowEmptyCollection()][string[]]$Evidence = @(),
+        [datetime]$StartedAt = (Get-Date),
+        [int]$DurationSeconds = 0
+    )
+
+    $attempted = $Status -in @("Attempted", "Installed", "Succeeded", "Failed")
+    return [PSCustomObject][ordered]@{
+        Id               = $Id
+        Name             = $Name
+        Status           = $Status
+        Attempted        = $attempted
+        Available        = ($Status -eq "Available")
+        Installed        = ($Status -eq "Installed")
+        Failed           = ($Status -eq "Failed")
+        Skipped          = ($Status -in @("Skipped", "Blocked"))
+        ProviderExitCode = $ProviderCode
+        ProviderCode     = $ProviderCode
+        HResult          = $HResult
+        RebootRequired   = $RebootRequired
+        Message          = $Message
+        Evidence         = @($Evidence)
+        StartedAt        = $StartedAt.ToString("o")
+        DurationSeconds  = [math]::Max(0, $DurationSeconds)
+    }
+}
+
+function New-StageResult {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSUseShouldProcessForStateChangingFunctions", "", Justification = "Creates an in-memory result object only.")]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+        [string]$Provider = "SystemUpdatePro",
+        [ValidateSet("Succeeded", "Partial", "Failed", "Skipped")]
+        [string]$Status = "Succeeded",
+        [int]$Attempted = 0,
+        [int]$Available = 0,
+        [int]$Installed = 0,
+        [int]$Failed = 0,
+        [int]$Skipped = 0,
+        [bool]$RebootRequired = $false,
+        [AllowNull()][object]$ProviderCode = $null,
+        [AllowNull()][object]$HResult = $null,
+        [string]$Message = "",
+        [AllowEmptyCollection()][object[]]$Items = @(),
+        [AllowEmptyCollection()][string[]]$Evidence = @(),
+        [datetime]$StartedAt = (Get-Date),
+        [int]$DurationSeconds = 0
+    )
+
+    return [PSCustomObject][ordered]@{
+        Name             = $Name
+        Provider         = $Provider
+        Status           = $Status
+        Attempted        = [math]::Max(0, $Attempted)
+        Available        = [math]::Max(0, $Available)
+        Installed        = [math]::Max(0, $Installed)
+        Failed           = [math]::Max(0, $Failed)
+        Skipped          = [math]::Max(0, $Skipped)
+        RebootRequired   = $RebootRequired
+        ProviderExitCode = $ProviderCode
+        ProviderCode     = $ProviderCode
+        HResult          = $HResult
+        Message          = $Message
+        Items            = @($Items)
+        Evidence         = @($Evidence)
+        StartedAt        = $StartedAt.ToString("o")
+        DurationSeconds  = [math]::Max(0, $DurationSeconds)
+    }
+}
+
+function Get-ResultValue {
+    param(
+        [AllowNull()][object]$Result,
+        [Parameter(Mandatory = $true)]
+        [string[]]$Names,
+        [AllowNull()][object]$Default = $null
+    )
+
+    if ($null -eq $Result) { return $Default }
+
+    foreach ($name in $Names) {
+        if ($Result -is [System.Collections.IDictionary] -and $Result.Contains($name) -and $null -ne $Result[$name]) {
+            return $Result[$name]
+        }
+
+        $property = $Result.PSObject.Properties[$name]
+        if ($property -and $null -ne $property.Value) {
+            return $property.Value
+        }
+    }
+
+    return $Default
+}
+
+function ConvertTo-StageResult {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+        [Parameter(Mandatory = $true)]
+        [string]$Provider,
+        [AllowNull()][object]$Result,
+        [AllowEmptyCollection()][string[]]$ItemNames = @(),
+        [AllowEmptyCollection()][string[]]$Evidence = @(),
+        [datetime]$StartedAt = (Get-Date)
+    )
+
+    if ($null -eq $Result) {
+        return New-StageResult -Name $Name -Provider $Provider -Status "Skipped" -Skipped 1 `
+            -Message "Stage skipped by run configuration" -StartedAt $StartedAt
+    }
+
+    $success = [bool](Get-ResultValue -Result $Result -Names @("Success") -Default $false)
+    $installed = [int](Get-ResultValue -Result $Result -Names @("TotalInstalled", "Installed", "UpdateCount") -Default 0)
+    $failed = [int](Get-ResultValue -Result $Result -Names @("TotalFailed", "Failed") -Default 0)
+    $skipped = [int](Get-ResultValue -Result $Result -Names @("Skipped") -Default 0)
+    $attempted = [int](Get-ResultValue -Result $Result -Names @("Attempted", "TotalAttempted") -Default 0)
+    $available = [int](Get-ResultValue -Result $Result -Names @("Available") -Default 0)
+    $message = [string](Get-ResultValue -Result $Result -Names @("Message") -Default "")
+    $rebootRequired = [bool](Get-ResultValue -Result $Result -Names @("RebootRequired") -Default $false)
+    $providerCode = Get-ResultValue -Result $Result -Names @("ProviderCode", "ExitCode") -Default $null
+    $hresult = Get-ResultValue -Result $Result -Names @("HResult") -Default $null
+    $resultEvidence = @(Get-ResultValue -Result $Result -Names @("Evidence") -Default @())
+    $items = @(Get-ResultValue -Result $Result -Names @("Items") -Default @())
+
+    if ($DryRun) {
+        if ($available -eq 0) { $available = $installed }
+        $installed = 0
+    }
+
+    if ($attempted -eq 0 -and -not $DryRun) {
+        $attempted = $available + $installed + $failed + $skipped
+    }
+
+    if ($items.Count -eq 0 -and $ItemNames.Count -gt 0) {
+        $itemStatus = if ($DryRun) {
+            "Available"
+        } elseif ($success) {
+            "Installed"
+        } else {
+            "Failed"
+        }
+
+        $items = @($ItemNames | ForEach-Object {
+            New-UpdateItemResult -Name $_ -Status $itemStatus -ProviderCode $providerCode -HResult $hresult `
+                -RebootRequired $rebootRequired -Message $message -Evidence $resultEvidence
+        })
+    }
+
+    if ($items.Count -eq 0 -and -not [string]::IsNullOrWhiteSpace($message) -and $message -notmatch "^No (updates|applicable updates)") {
+        if (-not $DryRun) { $attempted = [math]::Max(1, $attempted) }
+        if ($items.Count -eq 0) {
+            $operationStatus = if ($success) { "Succeeded" } else { "Failed" }
+            $items = @(New-UpdateItemResult -Name "$Provider operation" -Status $operationStatus `
+                -ProviderCode $providerCode -HResult $hresult -RebootRequired $rebootRequired `
+                -Message $message -Evidence $resultEvidence)
+        }
+    }
+
+    if (-not $success -and $failed -eq 0) {
+        $failed = 1
+    }
+
+    $status = if (-not $success) {
+        if ($installed -gt 0) { "Partial" } else { "Failed" }
+    } elseif ($failed -gt 0) {
+        if ($installed -gt 0) { "Partial" } else { "Failed" }
+    } else {
+        "Succeeded"
+    }
+
+    $duration = [math]::Max(0, [int]((Get-Date) - $StartedAt).TotalSeconds)
+    return New-StageResult -Name $Name -Provider $Provider -Status $status -Attempted $attempted `
+        -Available $available -Installed $installed -Failed $failed -Skipped $skipped `
+        -RebootRequired $rebootRequired -ProviderCode $providerCode -HResult $hresult `
+        -Message $message -Items $items -Evidence (@($Evidence) + $resultEvidence) `
+        -StartedAt $StartedAt -DurationSeconds $duration
+}
+
+function Add-StageResult {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Stage
+    )
+
+    [void]$script:StageResults.Add($Stage)
+    if ($Stage.RebootRequired) { $script:RebootRequired = $true }
+    return $Stage
+}
+
+function Get-RunExitCode {
+    param(
+        [AllowEmptyCollection()][object[]]$Stages = @(),
+        [int]$RequestedExitCode = 0
+    )
+
+    if ($RequestedExitCode -ge 3) { return $RequestedExitCode }
+
+    $failedStages = @($Stages | Where-Object { $_.Status -eq "Failed" })
+    $partialStages = @($Stages | Where-Object { $_.Status -eq "Partial" })
+    if ($failedStages.Count -gt 0 -or $partialStages.Count -gt 0) {
+        $successfulWork = @($Stages | Where-Object {
+            $_.Name -in @("OEM", "WindowsUpdate", "Winget", "DriverBackup", "WindowsUpdateRepair", "Cleanup", "Continuation") -and
+            ($_.Status -eq "Succeeded" -or $_.Installed -gt 0)
+        }).Count
+        if ($successfulWork -gt 0) { return 2 }
+        return 3
+    }
+
+    if ($RequestedExitCode -eq 2) { return 2 }
+    if (@($Stages | Where-Object { $_.RebootRequired }).Count -gt 0) { return 1 }
+    return 0
+}
+
+function New-RunData {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSUseShouldProcessForStateChangingFunctions", "", Justification = "Creates an in-memory result object only.")]
+    param(
+        [datetime]$StartedAt,
+        [datetime]$CompletedAt = (Get-Date),
+        [int]$RequestedExitCode = 0
+    )
+
+    $stages = @($script:StageResults)
+    $exitCode = Get-RunExitCode -Stages $stages -RequestedExitCode $RequestedExitCode
+    $countProperty = if ($DryRun) { "Available" } else { "Installed" }
+    $oemStage = @($stages | Where-Object { $_.Name -eq "OEM" } | Select-Object -Last 1)
+    $windowsStage = @($stages | Where-Object { $_.Name -eq "WindowsUpdate" } | Select-Object -Last 1)
+    $wingetStage = @($stages | Where-Object { $_.Name -eq "Winget" } | Select-Object -Last 1)
+
+    $oemCount = if ($oemStage.Count) { [int]$oemStage[0].$countProperty } else { 0 }
+    $windowsCount = if ($windowsStage.Count) { [int]$windowsStage[0].$countProperty } else { 0 }
+    $wingetCount = if ($wingetStage.Count) { [int]$wingetStage[0].$countProperty } else { 0 }
+    $totalInstalled = [int](($stages | Measure-Object -Property Installed -Sum).Sum)
+    $totalAvailable = [int](($stages | Measure-Object -Property Available -Sum).Sum)
+    $totalFailed = [int](($stages | Measure-Object -Property Failed -Sum).Sum)
+
+    return @{
+        SchemaVersion    = $script:ResultSchemaVersion
+        RunId            = $script:RunId
+        StartedAt        = $StartedAt.ToString("o")
+        CompletedAt      = $CompletedAt.ToString("o")
+        Status           = switch ($exitCode) { 0 { "Succeeded" }; 1 { "SucceededRebootRequired" }; 2 { "Partial" }; default { "Failed" } }
+        OEMUpdates       = $oemCount
+        WindowsUpdates   = $windowsCount
+        WingetUpdates    = $wingetCount
+        TotalInstalled   = $totalInstalled
+        TotalAvailable   = $totalAvailable
+        TotalFailed      = $totalFailed
+        RebootRequired   = (@($stages | Where-Object { $_.RebootRequired }).Count -gt 0)
+        ExitCode         = $exitCode
+        Errors           = @($script:Errors)
+        Warnings         = @($script:Warnings)
+        DurationSeconds  = [math]::Max(0, [int]($CompletedAt - $StartedAt).TotalSeconds)
+        Stages           = $stages
+        EvidenceDelivery = @{}
+    }
 }
 
 # ============================================================================
@@ -376,9 +667,9 @@ function Save-UpdateHistory {
         [hashtable]$RunData
     )
 
-    $history = @()
-    if (Test-Path $script:HistoryFile) {
-        try {
+    try {
+        $history = @()
+        if (Test-Path $script:HistoryFile) {
             $existing = Get-Content $script:HistoryFile -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json -ErrorAction SilentlyContinue
             if ($existing) {
                 # ConvertFrom-Json returns array or single object
@@ -388,39 +679,51 @@ function Save-UpdateHistory {
                     $history = @($existing)
                 }
             }
-        } catch {}
-    }
-
-    $entry = [ordered]@{
-        timestamp       = (Get-Date).ToString("o")
-        hostname        = $env:COMPUTERNAME
-        dry_run         = $DryRun.IsPresent
-        oem_updates     = $RunData.OEMUpdates
-        windows_updates = $RunData.WindowsUpdates
-        winget_updates  = $RunData.WingetUpdates
-        total_installed = $RunData.TotalInstalled
-        total_failed    = $RunData.TotalFailed
-        reboot_required = $RunData.RebootRequired
-        exit_code       = $RunData.ExitCode
-        errors          = @($RunData.Errors)
-        warnings        = @($RunData.Warnings)
-        duration_seconds = $RunData.DurationSeconds
-        parameters      = [ordered]@{
-            SkipOEM     = $SkipOEM.IsPresent
-            SkipWindows = $SkipWindows.IsPresent
-            SkipWinget  = $SkipWinget.IsPresent
-            IncludeBIOS = $IncludeBIOS.IsPresent
-            BackupDrivers = $BackupDrivers.IsPresent
         }
-    }
 
-    # Prepend new entry, keep last 100 runs
-    $history = @($entry) + @($history)
-    if ($history.Count -gt 100) {
-        $history = $history[0..99]
-    }
+        $entry = [ordered]@{
+            schema_version    = $RunData.SchemaVersion
+            run_id            = $RunData.RunId
+            timestamp         = $RunData.CompletedAt
+            started_at        = $RunData.StartedAt
+            hostname          = $env:COMPUTERNAME
+            status            = $RunData.Status
+            dry_run           = $DryRun.IsPresent
+            oem_updates       = $RunData.OEMUpdates
+            windows_updates   = $RunData.WindowsUpdates
+            winget_updates    = $RunData.WingetUpdates
+            total_installed   = $RunData.TotalInstalled
+            total_available   = $RunData.TotalAvailable
+            total_failed      = $RunData.TotalFailed
+            reboot_required   = $RunData.RebootRequired
+            exit_code         = $RunData.ExitCode
+            errors            = @($RunData.Errors)
+            warnings          = @($RunData.Warnings)
+            duration_seconds  = $RunData.DurationSeconds
+            stages            = @($RunData.Stages)
+            evidence_delivery = $RunData.EvidenceDelivery
+            parameters        = [ordered]@{
+                SkipOEM           = $SkipOEM.IsPresent
+                SkipWindows       = $SkipWindows.IsPresent
+                SkipWinget        = $SkipWinget.IsPresent
+                IncludeBIOS       = $IncludeBIOS.IsPresent
+                BackupDrivers     = $BackupDrivers.IsPresent
+                CleanupAfter      = $CleanupAfter.IsPresent
+                ContinueAfterReboot = $ContinueAfterReboot.IsPresent
+            }
+        }
 
-    $history | ConvertTo-Json -Depth 5 | Set-Content -Path $script:HistoryFile -Force -Encoding UTF8
+        # Prepend new entry, keep last 100 runs
+        $history = @($entry) + @($history)
+        if ($history.Count -gt 100) {
+            $history = $history[0..99]
+        }
+
+        $history | ConvertTo-Json -Depth 12 | Set-Content -Path $script:HistoryFile -Force -Encoding UTF8 -ErrorAction Stop
+        return $true
+    } catch {
+        return $false
+    }
 }
 
 function Show-UpdateHistory {
@@ -1082,13 +1385,18 @@ function Install-Winget {
 }
 
 function Invoke-WingetUpgradeAll {
-    $result = @{ Success = $false; UpdateCount = 0; Message = "" }
+    $result = @{
+        Success = $false; RebootRequired = $false
+        UpdateCount = 0; Available = 0; Attempted = 0; Installed = 0; Failed = 0; Skipped = 0
+        ExitCode = $null; HResult = $null; Items = @(); Evidence = @(); Message = ""
+    }
 
     Write-Log "========== WINGET UPGRADE ALL ==========" "HEADER"
 
     if (-not (Test-WingetInstalled)) {
         if (-not (Install-Winget)) {
             $result.Message = "Winget not available"
+            $result.Failed = 1
             Write-Log $result.Message "WARNING"
             return $result
         }
@@ -1101,6 +1409,7 @@ function Invoke-WingetUpgradeAll {
         if ($DryRun) {
             Write-Log "Checking for available winget upgrades..." "INFO"
             $listOutput = & winget upgrade --include-unknown 2>&1
+            $result.ExitCode = $LASTEXITCODE
             $upgradeLines = @($listOutput | Where-Object { $_ -match '\S' -and $_ -notmatch '^(-|Name |\\|The following)' -and $_ -notmatch 'upgrades available' })
 
             # Count available upgrades (rough parse)
@@ -1116,8 +1425,13 @@ function Invoke-WingetUpgradeAll {
             }
 
             $result.UpdateCount = [math]::Max(0, $availCount)
-            $result.Success = $true
+            $result.Available = $result.UpdateCount
+            $result.Success = ($result.ExitCode -in @(0, -1978335189))
+            if (-not $result.Success) { $result.Failed = 1 }
             $result.Message = "$($result.UpdateCount) winget upgrades available (dry run - not installed)"
+            foreach ($line in @($upgradeLines | Select-Object -First $result.UpdateCount)) {
+                [void]$script:WingetUpdates.Add(([string]$line).Trim())
+            }
             Write-Log $result.Message "INFO"
             $script:WingetUpdateCount = $result.UpdateCount
             return $result
@@ -1133,13 +1447,18 @@ function Invoke-WingetUpgradeAll {
 
         $process = Start-Process -FilePath "winget" -ArgumentList $wingetArgs -Wait -NoNewWindow -PassThru
 
+        $result.Attempted = 1
+        $result.ExitCode = $process.ExitCode
         $result.Success = ($process.ExitCode -in @(0, -1978335189))  # 0 or "no updates"
+        if (-not $result.Success) { $result.Failed = 1 }
         $result.Message = "Winget upgrade completed (exit: $($process.ExitCode))"
 
         Write-Log $result.Message $(if ($result.Success) { "SUCCESS" } else { "WARNING" })
 
     } catch {
         $result.Message = "Winget error: $($_.Exception.Message)"
+        $result.Failed = 1
+        $result.HResult = $_.Exception.HResult
         Write-Log $result.Message "ERROR"
     }
 
@@ -1264,7 +1583,13 @@ function Repair-DellServices {
 function Invoke-DellUpdate {
     param([switch]$IncludeBIOS)
 
-    $result = @{ Success = $false; RebootRequired = $false; UpdateCount = 0; Message = "" }
+    $result = @{
+        Success = $false; RebootRequired = $false
+        UpdateCount = 0; Available = 0; Attempted = 0; Installed = 0; Failed = 0; Skipped = 0
+        ExitCode = $null; HResult = $null; Items = @(); Evidence = @(); Message = ""
+    }
+
+    try {
 
     Write-Log "========== DELL COMMAND UPDATE ==========" "HEADER"
 
@@ -1275,6 +1600,7 @@ function Invoke-DellUpdate {
     if (-not $dcuPath) {
         if (-not (Install-DellCommandUpdate)) {
             $result.Message = "Failed to install DCU"
+            $result.Failed = 1
             Write-Log $result.Message "ERROR"
             return $result
         }
@@ -1313,14 +1639,18 @@ function Invoke-DellUpdate {
 
         if ($dcuPath) {
             $process = Start-Process -FilePath $dcuPath -ArgumentList ($dcuArgs -join " ") -Wait -NoNewWindow -PassThru
-            $result.Success = $true
+            $result.Attempted = 1
+            $result.ExitCode = $process.ExitCode
+            $result.Success = ($process.ExitCode -in @(0, 500))
+            if (-not $result.Success) { $result.Failed = 1 }
             $result.Message = "DCU scan completed (exit: $($process.ExitCode)) - no updates installed (dry run)"
         } else {
             $result.Success = $true
             $result.Message = "DCU not installed - would install and scan (dry run)"
         }
 
-        Write-Log $result.Message "INFO"
+        Write-Log $result.Message $(if ($result.Success) { "INFO" } else { "WARNING" })
+        $result.Evidence = @($dcuLog)
         $script:OEMUpdateCount = $result.UpdateCount
         return $result
     }
@@ -1343,6 +1673,8 @@ function Invoke-DellUpdate {
         $attempts++
 
         $process = Start-Process -FilePath $dcuPath -ArgumentList ($dcuArgs -join " ") -Wait -NoNewWindow -PassThru
+        $result.Attempted++
+        $result.ExitCode = $process.ExitCode
 
         switch ($process.ExitCode) {
             0   { $result.Success = $true; $result.Message = "Updates applied"; break }
@@ -1363,9 +1695,19 @@ function Invoke-DellUpdate {
         break
     }
 
+    if (-not $result.Success) { $result.Failed = 1 }
+    $result.Evidence = @($dcuLog)
     Write-Log $result.Message $(if ($result.Success) { "SUCCESS" } else { "WARNING" })
     $script:OEMUpdateCount = $result.UpdateCount
     return $result
+    } catch {
+        $result.Success = $false
+        $result.Failed = [math]::Max(1, $result.Failed)
+        $result.HResult = $_.Exception.HResult
+        $result.Message = "Dell update error: $($_.Exception.Message)"
+        Write-Log $result.Message "ERROR"
+        return $result
+    }
 }
 
 # ============================================================================
@@ -1375,7 +1717,11 @@ function Invoke-DellUpdate {
 function Invoke-LenovoUpdate {
     param([switch]$IncludeBIOS)
 
-    $result = @{ Success = $false; RebootRequired = $false; UpdateCount = 0; Message = "" }
+    $result = @{
+        Success = $false; RebootRequired = $false
+        UpdateCount = 0; Available = 0; Attempted = 0; Installed = 0; Failed = 0; Skipped = 0
+        ExitCode = $null; HResult = $null; Items = @(); Evidence = @(); Message = ""
+    }
 
     Write-Log "========== LENOVO SYSTEM UPDATE ==========" "HEADER"
 
@@ -1384,6 +1730,7 @@ function Invoke-LenovoUpdate {
 
     if (-not (Install-PSModuleWithRetry -ModuleName "LSUClient")) {
         $result.Message = "Failed to install LSUClient"
+        $result.Failed = 1
         Write-Log $result.Message "ERROR"
         return $result
     }
@@ -1409,6 +1756,7 @@ function Invoke-LenovoUpdate {
 
         if ($DryRun) {
             $result.UpdateCount = $updates.Count
+            $result.Available = $updates.Count
             $result.Success = $true
             $result.Message = "$($updates.Count) updates available (dry run - not installed)"
             Write-Log "Available Lenovo updates:" "INFO"
@@ -1422,14 +1770,36 @@ function Invoke-LenovoUpdate {
         }
 
         Write-Log "Installing $($updates.Count) updates..." "INFO"
+        $result.Attempted = $updates.Count
         $installResults = $updates | Install-LSUpdate -ErrorAction SilentlyContinue
 
-        foreach ($r in $installResults) {
-            if ($r.Success -or $r.Result -eq "Installed") {
-                $result.UpdateCount++
-                Write-Log "  [+] $($r.Title)" "SUCCESS"
-            } else {
-                Write-Log "  [!] $($r.Title): $($r.FailureReason)" "WARNING"
+        if (-not $installResults) {
+            $result.Failed = $updates.Count
+            foreach ($update in $updates) {
+                $result.Items += New-UpdateItemResult -Name $update.Title -Id $update.ID -Status "Failed" `
+                    -Message "LSUClient returned no installation result"
+            }
+        } else {
+            foreach ($r in $installResults) {
+                $itemName = if ($r.Title) { $r.Title } else { "Lenovo update" }
+                if ($r.Success -or $r.Result -eq "Installed") {
+                    $result.UpdateCount++
+                    $result.Installed++
+                    $result.Items += New-UpdateItemResult -Name $itemName -Id $r.ID -Status "Installed" `
+                        -ProviderCode $r.Result -RebootRequired ([bool]$r.RebootRequired)
+                    Write-Log "  [+] $itemName" "SUCCESS"
+                } else {
+                    $result.Failed++
+                    $result.Items += New-UpdateItemResult -Name $itemName -Id $r.ID -Status "Failed" `
+                        -ProviderCode $r.Result -Message ([string]$r.FailureReason)
+                    Write-Log "  [!] $itemName`: $($r.FailureReason)" "WARNING"
+                }
+            }
+            if ($result.Items.Count -lt $result.Attempted) {
+                $missingResults = $result.Attempted - $result.Items.Count
+                $result.Failed += $missingResults
+                $result.Items += New-UpdateItemResult -Name "$missingResults update result(s) missing" -Status "Failed" `
+                    -Message "LSUClient returned fewer results than requested"
             }
         }
 
@@ -1438,12 +1808,14 @@ function Invoke-LenovoUpdate {
             if ($action -in @("REBOOT", "SHUTDOWN")) { $result.RebootRequired = $true }
         }
 
-        $result.Success = $true
-        $result.Message = "Installed $($result.UpdateCount) updates"
-        Write-Log $result.Message "SUCCESS"
+        $result.Success = ($result.Failed -eq 0 -and $result.Items.Count -eq $result.Attempted)
+        $result.Message = "Installed: $($result.Installed), Failed: $($result.Failed)"
+        Write-Log $result.Message $(if ($result.Success) { "SUCCESS" } else { "WARNING" })
 
     } catch {
         $result.Message = "Lenovo error: $($_.Exception.Message)"
+        $result.Failed = [math]::Max(1, $result.Failed)
+        $result.HResult = $_.Exception.HResult
         Write-Log $result.Message "ERROR"
     }
 
@@ -1501,7 +1873,13 @@ function Install-HPIA {
 function Invoke-HPUpdate {
     param([switch]$IncludeBIOS)
 
-    $result = @{ Success = $false; RebootRequired = $false; UpdateCount = 0; Message = "" }
+    $result = @{
+        Success = $false; RebootRequired = $false
+        UpdateCount = 0; Available = 0; Attempted = 0; Installed = 0; Failed = 0; Skipped = 0
+        ExitCode = $null; HResult = $null; Items = @(); Evidence = @(); Message = ""
+    }
+
+    try {
 
     Write-Log "========== HP IMAGE ASSISTANT ==========" "HEADER"
 
@@ -1512,6 +1890,7 @@ function Invoke-HPUpdate {
     if (-not $hpiaPath) {
         if (-not (Install-HPIA)) {
             $result.Message = "Failed to install HPIA"
+            $result.Failed = 1
             Write-Log $result.Message "ERROR"
             return $result
         }
@@ -1543,14 +1922,18 @@ function Invoke-HPUpdate {
 
         if ($hpiaPath) {
             $process = Start-Process -FilePath $hpiaPath -ArgumentList ($hpiaArgs -join " ") -Wait -NoNewWindow -PassThru
-            $result.Success = $true
+            $result.Attempted = 1
+            $result.ExitCode = $process.ExitCode
+            $result.Success = ($process.ExitCode -in @(0, 256, 257, 3010))
+            if (-not $result.Success) { $result.Failed = 1 }
             $result.Message = "HPIA scan completed (exit: $($process.ExitCode)) - no updates installed (dry run)"
         } else {
             $result.Success = $true
             $result.Message = "HPIA not installed - would install and scan (dry run)"
         }
 
-        Write-Log $result.Message "INFO"
+        Write-Log $result.Message $(if ($result.Success) { "INFO" } else { "WARNING" })
+        $result.Evidence = @($reportDir)
         $script:OEMUpdateCount = $result.UpdateCount
         return $result
     }
@@ -1564,6 +1947,8 @@ function Invoke-HPUpdate {
     Write-Log "Applying HP updates..." "INFO"
 
     $process = Start-Process -FilePath $hpiaPath -ArgumentList ($hpiaArgs -join " ") -Wait -NoNewWindow -PassThru
+    $result.Attempted = 1
+    $result.ExitCode = $process.ExitCode
 
     Get-Process -Name "HPImageAssistant*" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 
@@ -1572,14 +1957,24 @@ function Invoke-HPUpdate {
         256  { $result.Success = $true; $result.Message = "No updates needed" }
         257  { $result.Success = $true; $result.RebootRequired = $true; $result.Message = "Updates applied - reboot required" }
         3010 { $result.Success = $true; $result.RebootRequired = $true; $result.Message = "Updates applied - reboot required" }
-        default { $result.Success = ($process.ExitCode -lt 256); $result.Message = "HPIA exit: $($process.ExitCode)" }
+        default { $result.Success = $false; $result.Message = "HPIA exit: $($process.ExitCode)" }
     }
+    if (-not $result.Success) { $result.Failed = 1 }
 
     Write-Log $result.Message $(if ($result.Success) { "SUCCESS" } else { "WARNING" })
 
     Remove-Item $softpaqDir -Recurse -Force -ErrorAction SilentlyContinue
+    $result.Evidence = @($reportDir)
     $script:OEMUpdateCount = $result.UpdateCount
     return $result
+    } catch {
+        $result.Success = $false
+        $result.Failed = [math]::Max(1, $result.Failed)
+        $result.HResult = $_.Exception.HResult
+        $result.Message = "HP update error: $($_.Exception.Message)"
+        Write-Log $result.Message "ERROR"
+        return $result
+    }
 }
 
 # ============================================================================
@@ -1587,7 +1982,11 @@ function Invoke-HPUpdate {
 # ============================================================================
 
 function Invoke-WindowsUpdateWUA {
-    $result = @{ Success = $false; RebootRequired = $false; Installed = 0; Failed = 0; Message = "" }
+    $result = @{
+        Success = $false; RebootRequired = $false
+        Available = 0; Attempted = 0; Installed = 0; Failed = 0; Skipped = 0
+        ExitCode = $null; HResult = $null; Items = @(); Evidence = @(); Message = ""
+    }
 
     try {
         $session = New-Object -ComObject Microsoft.Update.Session
@@ -1619,49 +2018,74 @@ function Invoke-WindowsUpdateWUA {
             return $result
         }
 
+        $result.Available = $updatesToInstall.Count
+
         if ($DryRun) {
-            $result.Installed = $updatesToInstall.Count
             $result.Success = $true
             $result.Message = "$($updatesToInstall.Count) updates available (dry run - not installed)"
             for ($i = 0; $i -lt $updatesToInstall.Count; $i++) {
-                $uTitle = $updatesToInstall.Item($i).Title
+                $update = $updatesToInstall.Item($i)
+                $uTitle = $update.Title
                 Write-Log "  -- $uTitle" "INFO"
                 [void]$script:WindowsUpdates.Add($uTitle)
+                $result.Items += New-UpdateItemResult -Name $uTitle -Id $update.Identity.UpdateID -Status "Available"
             }
             return $result
         }
 
         $downloader = $session.CreateUpdateDownloader()
         $downloader.Updates = $updatesToInstall
-        $downloader.Download() | Out-Null
+        $downloadResult = $downloader.Download()
+        if ($downloadResult.ResultCode -notin @(2, 3)) {
+            $result.ExitCode = $downloadResult.ResultCode
+            $result.HResult = $downloadResult.HResult
+            $result.Failed = $updatesToInstall.Count
+            $result.Message = "WUA download failed (result: $($downloadResult.ResultCode), HRESULT: $($downloadResult.HResult))"
+            return $result
+        }
 
         $installer = New-Object -ComObject Microsoft.Update.Installer
         $installer.Updates = $updatesToInstall
         $installResult = $installer.Install()
+        $result.Attempted = $updatesToInstall.Count
+        $result.ExitCode = $installResult.ResultCode
+        $result.HResult = $installResult.HResult
 
         for ($i = 0; $i -lt $updatesToInstall.Count; $i++) {
-            if ($installResult.GetUpdateResult($i).ResultCode -eq 2) { $result.Installed++ }
-            else { $result.Failed++ }
+            $update = $updatesToInstall.Item($i)
+            $itemResult = $installResult.GetUpdateResult($i)
+            $itemStatus = if ($itemResult.ResultCode -eq 2) { "Installed" } else { "Failed" }
+            if ($itemStatus -eq "Installed") { $result.Installed++ } else { $result.Failed++ }
+            [void]$script:WindowsUpdates.Add($update.Title)
+            $result.Items += New-UpdateItemResult -Name $update.Title -Id $update.Identity.UpdateID `
+                -Status $itemStatus -ProviderCode $itemResult.ResultCode -HResult $itemResult.HResult `
+                -RebootRequired ([bool]$itemResult.RebootRequired)
         }
 
-        $result.Success = ($result.Installed -gt 0 -or $result.Failed -eq 0)
+        $result.Success = ($result.Failed -eq 0 -and $installResult.ResultCode -in @(2, 3))
         $result.RebootRequired = $installResult.RebootRequired
         $result.Message = "Installed: $($result.Installed), Failed: $($result.Failed)"
 
     } catch {
         $result.Message = "WUA error: $($_.Exception.Message)"
+        $result.HResult = $_.Exception.HResult
+        $result.Failed = [math]::Max(1, $result.Failed)
     }
 
     return $result
 }
 
 function Invoke-WindowsUpdatePSWU {
-    $result = @{ Success = $false; RebootRequired = $false; Installed = 0; Failed = 0; Message = "" }
+    $result = @{
+        Success = $false; RebootRequired = $false
+        Available = 0; Attempted = 0; Installed = 0; Failed = 0; Skipped = 0
+        ExitCode = $null; HResult = $null; Items = @(); Evidence = @(); Message = ""
+    }
 
     try {
         Import-Module PSWindowsUpdate -Force -ErrorAction Stop
 
-        $updates = Get-WindowsUpdate -MicrosoftUpdate -NotCategory "Drivers","Feature Packs" -NotTitle "Preview" -ErrorAction SilentlyContinue
+        $updates = @(Get-WindowsUpdate -MicrosoftUpdate -NotCategory "Drivers","Feature Packs" -NotTitle "Preview" -ErrorAction Stop)
 
         if (-not $updates -or $updates.Count -eq 0) {
             $result.Success = $true
@@ -1669,35 +2093,56 @@ function Invoke-WindowsUpdatePSWU {
             return $result
         }
 
+        $result.Available = $updates.Count
+
         if ($DryRun) {
-            $result.Installed = $updates.Count
             $result.Success = $true
             $result.Message = "$($updates.Count) updates available (dry run - not installed)"
             foreach ($u in $updates) {
                 $uTitle = if ($u.Title) { $u.Title } else { $u.KB }
                 Write-Log "  -- $uTitle" "INFO"
                 [void]$script:WindowsUpdates.Add($uTitle)
+                $result.Items += New-UpdateItemResult -Name $uTitle -Id ([string]($u.KB -join ",")) -Status "Available"
             }
             return $result
         }
 
-        $installResults = Install-WindowsUpdate -MicrosoftUpdate -AcceptAll -IgnoreReboot -NotCategory "Drivers","Feature Packs" -NotTitle "Preview" -Confirm:$false -ErrorAction SilentlyContinue
+        $result.Attempted = $updates.Count
+        $installResults = @(Install-WindowsUpdate -MicrosoftUpdate -AcceptAll -IgnoreReboot -NotCategory "Drivers","Feature Packs" -NotTitle "Preview" -Confirm:$false -ErrorAction Stop)
 
-        if ($installResults) {
+        if ($installResults.Count -gt 0) {
             foreach ($r in $installResults) {
-                if ($r.Result -eq "Installed") { $result.Installed++ }
-                else { $result.Failed++ }
+                $itemName = if ($r.Title) { $r.Title } else { [string]($r.KB -join ",") }
+                $itemStatus = if ($r.Result -eq "Installed") { "Installed" } else { "Failed" }
+                if ($itemStatus -eq "Installed") { $result.Installed++ } else { $result.Failed++ }
+                [void]$script:WindowsUpdates.Add($itemName)
+                $result.Items += New-UpdateItemResult -Name $itemName -Id ([string]($r.KB -join ",")) `
+                    -Status $itemStatus -ProviderCode $r.Result -HResult $r.HResult `
+                    -RebootRequired ([bool]$r.RebootRequired)
+            }
+            if ($installResults.Count -lt $result.Attempted) {
+                $missingResults = $result.Attempted - $installResults.Count
+                $result.Failed += $missingResults
+                $result.Items += New-UpdateItemResult -Name "$missingResults update result(s) missing" -Status "Failed" `
+                    -Message "PSWindowsUpdate returned fewer results than requested"
             }
         } else {
-            $result.Installed = $updates.Count
+            $result.Failed = $result.Attempted
+            foreach ($u in $updates) {
+                $itemName = if ($u.Title) { $u.Title } else { [string]($u.KB -join ",") }
+                $result.Items += New-UpdateItemResult -Name $itemName -Id ([string]($u.KB -join ",")) `
+                    -Status "Failed" -Message "PSWindowsUpdate returned no installation result"
+            }
         }
 
-        $result.Success = ($result.Installed -gt 0 -or $result.Failed -eq 0)
+        $result.Success = ($result.Failed -eq 0 -and $result.Items.Count -eq $result.Attempted)
         $result.RebootRequired = (Get-WURebootStatus -Silent -ErrorAction SilentlyContinue)
         $result.Message = "Installed: $($result.Installed), Failed: $($result.Failed)"
 
     } catch {
         $result.Message = "PSWU error: $($_.Exception.Message)"
+        $result.HResult = $_.Exception.HResult
+        $result.Failed = [math]::Max(1, $result.Failed)
     }
 
     return $result
@@ -1706,11 +2151,16 @@ function Invoke-WindowsUpdatePSWU {
 function Invoke-WindowsUpdate {
     param([int]$MaxPasses = 3)
 
-    $result = @{ Success = $false; RebootRequired = $false; TotalInstalled = 0; TotalFailed = 0; Passes = 0; Message = "" }
+    $result = @{
+        Success = $false; RebootRequired = $false
+        Available = 0; Attempted = 0; TotalInstalled = 0; TotalFailed = 0; Skipped = 0
+        ExitCode = $null; HResult = $null; Items = @(); Evidence = @(); Passes = 0; Message = ""
+    }
 
     Write-Log "========== WINDOWS UPDATE ==========" "HEADER"
 
     $usePSWU = Install-PSModuleWithRetry -ModuleName "PSWindowsUpdate"
+    $providerSucceeded = $true
 
     for ($pass = 1; $pass -le $MaxPasses; $pass++) {
         Write-Log "Pass $pass of $MaxPasses" "INFO"
@@ -1718,9 +2168,21 @@ function Invoke-WindowsUpdate {
 
         $passResult = if ($usePSWU) { Invoke-WindowsUpdatePSWU } else { Invoke-WindowsUpdateWUA }
 
+        $result.Available += [int]$passResult.Available
+        $result.Attempted += [int]$passResult.Attempted
         $result.TotalInstalled += $passResult.Installed
         $result.TotalFailed += $passResult.Failed
+        $result.Items += @($passResult.Items)
+        $result.Evidence += @($passResult.Evidence)
+        $result.ExitCode = $passResult.ExitCode
+        $result.HResult = $passResult.HResult
         if ($passResult.RebootRequired) { $result.RebootRequired = $true }
+
+        if (-not $passResult.Success) {
+            $providerSucceeded = $false
+            $result.Message = "Pass $pass failed: $($passResult.Message)"
+            break
+        }
 
         if ($passResult.Installed -eq 0) { break }
 
@@ -1730,12 +2192,18 @@ function Invoke-WindowsUpdate {
         if ($pass -lt $MaxPasses) { Start-Sleep -Seconds 5 }
     }
 
-    $result.Success = ($result.TotalInstalled -gt 0 -or $result.TotalFailed -eq 0)
-    $result.Message = "Installed: $($result.TotalInstalled), Failed: $($result.TotalFailed)"
+    $result.Success = ($providerSucceeded -and $result.TotalFailed -eq 0)
+    if ([string]::IsNullOrWhiteSpace($result.Message)) {
+        $result.Message = if ($DryRun) {
+            "Available: $($result.Available)"
+        } else {
+            "Installed: $($result.TotalInstalled), Failed: $($result.TotalFailed)"
+        }
+    }
 
     $label = if ($DryRun) { "Windows Update (available)" } else { "Windows Update" }
     Write-Log "$label`: $($result.Message)" $(if ($result.Success) { "SUCCESS" } else { "WARNING" })
-    $script:WindowsUpdateCount = $result.TotalInstalled
+    $script:WindowsUpdateCount = if ($DryRun) { $result.Available } else { $result.TotalInstalled }
     return $result
 }
 
@@ -3064,7 +3532,7 @@ function Send-WebhookNotification {
         [hashtable]$RunData
     )
 
-    if (-not $Url) { return }
+    if (-not $Url) { return $false }
 
     Write-Log "Sending webhook notification..." "DEBUG"
 
@@ -3077,12 +3545,23 @@ function Send-WebhookNotification {
 
     # Generic payload
     $payload = @{
+        schema_version  = $RunData.SchemaVersion
+        run_id          = $RunData.RunId
+        started_at      = $RunData.StartedAt
+        completed_at    = $RunData.CompletedAt
         hostname        = $env:COMPUTERNAME
         status          = $overallStatus
         oem_updates     = $RunData.OEMUpdates
         windows_updates = $RunData.WindowsUpdates
         winget_updates  = $RunData.WingetUpdates
+        total_installed = $RunData.TotalInstalled
+        total_available = $RunData.TotalAvailable
+        total_failed    = $RunData.TotalFailed
+        reboot_required = $RunData.RebootRequired
+        exit_code       = $RunData.ExitCode
         errors          = @($RunData.Errors)
+        warnings        = @($RunData.Warnings)
+        stages          = @($RunData.Stages)
         runtime_seconds = $RunData.DurationSeconds
     }
 
@@ -3127,15 +3606,116 @@ function Send-WebhookNotification {
         }
         else {
             # Generic webhook
-            $body = $payload | ConvertTo-Json -Depth 3
+            $body = $payload | ConvertTo-Json -Depth 12
         }
 
         Invoke-RestMethod -Uri $Url -Method Post -Body $body -ContentType "application/json" -TimeoutSec 30 -ErrorAction Stop | Out-Null
         Write-Log "Webhook notification sent" "SUCCESS"
+        return $true
     }
     catch {
         Write-Log "Webhook notification failed: $($_.Exception.Message)" "WARNING"
+        return $false
     }
+}
+
+function Invoke-TerminalEvidence {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$SysInfo,
+        [Parameter(Mandatory = $true)]
+        [hashtable]$RunData,
+        [string]$WebhookEndpoint = ""
+    )
+
+    if ($script:RunFinalized) {
+        if ($script:LastEvidenceDelivery) {
+            $RunData.EvidenceDelivery = $script:LastEvidenceDelivery
+        }
+        return $RunData
+    }
+
+    # Mark first so a writer failure or nested error can never duplicate terminal
+    # history, webhook, report, or Event Log evidence.
+    $script:RunFinalized = $true
+    $delivery = [ordered]@{
+        Report  = [ordered]@{ Attempted = $true; Status = "Attempted"; Detail = "" }
+        Event   = [ordered]@{ Attempted = $true; Status = "Attempted"; Detail = "" }
+        Webhook = [ordered]@{ Attempted = [bool]$WebhookEndpoint; Status = $(if ($WebhookEndpoint) { "Attempted" } else { "Skipped" }); Detail = "" }
+        History = [ordered]@{ Attempted = $true; Status = "Attempted"; Detail = "" }
+    }
+    $RunData.EvidenceDelivery = $delivery
+
+    try {
+        $reportPath = New-HTMLReport -SysInfo $SysInfo -RunData $RunData
+        if ($reportPath -and (Test-Path -LiteralPath $reportPath)) {
+            $delivery.Report.Status = "Succeeded"
+            $delivery.Report.Detail = $reportPath
+        } else {
+            $delivery.Report.Status = "Failed"
+            $delivery.Report.Detail = "Report file was not created"
+        }
+    } catch {
+        $delivery.Report.Status = "Failed"
+        $delivery.Report.Detail = $_.Exception.Message
+    }
+
+    try {
+        [void](Initialize-EventLog)
+        $eventMessage = @"
+SystemUpdatePro completed$(if ($DryRun) { ' (DRY RUN)' })
+Run ID: $($RunData.RunId)
+Status: $($RunData.Status)
+System: $($SysInfo.Manufacturer) $($SysInfo.Model)
+Updates $(if ($DryRun) { 'Available' } else { 'Applied' }): $(if ($DryRun) { $RunData.TotalAvailable } else { $RunData.TotalInstalled })
+Updates Failed: $($RunData.TotalFailed)
+Reboot Required: $($RunData.RebootRequired)
+Duration: $($RunData.DurationSeconds) seconds
+"@
+        $eventType = if ($RunData.ExitCode -eq 0) { "Information" } elseif ($RunData.ExitCode -le 2) { "Warning" } else { "Error" }
+        if (Write-EventLogEntry -Message $eventMessage -EntryType $eventType -EventId (1000 + $RunData.ExitCode)) {
+            $delivery.Event.Status = "Succeeded"
+        } else {
+            $delivery.Event.Status = "Failed"
+            $delivery.Event.Detail = "Windows Event Log write failed"
+        }
+    } catch {
+        $delivery.Event.Status = "Failed"
+        $delivery.Event.Detail = $_.Exception.Message
+    }
+
+    if ($WebhookEndpoint) {
+        try {
+            if (Send-WebhookNotification -Url $WebhookEndpoint -RunData $RunData) {
+                $delivery.Webhook.Status = "Succeeded"
+            } else {
+                $delivery.Webhook.Status = "Failed"
+                $delivery.Webhook.Detail = "Webhook delivery failed"
+            }
+        } catch {
+            $delivery.Webhook.Status = "Failed"
+            $delivery.Webhook.Detail = $_.Exception.Message
+        }
+    }
+
+    try {
+        # A persisted record can truthfully claim success for its own write; if
+        # the write fails there is no record, and the in-memory status is reset.
+        $delivery.History.Status = "Succeeded"
+        if (Save-UpdateHistory -RunData $RunData) {
+            $delivery.History.Status = "Succeeded"
+        } else {
+            $delivery.History.Status = "Failed"
+            $delivery.History.Detail = "History write failed"
+        }
+    } catch {
+        $delivery.History.Status = "Failed"
+        $delivery.History.Detail = $_.Exception.Message
+    }
+
+    $RunData.EvidenceDelivery = $delivery
+    $script:LastEvidenceDelivery = $delivery
+    return $RunData
 }
 
 # ============================================================================
@@ -3149,254 +3729,374 @@ if ($ShowHistory) {
 }
 
 $scriptStart = Get-Date
-
-Write-Banner
-Initialize-EventLog | Out-Null
-
-if ($DryRun) {
-    Write-Log "DRY RUN MODE - No changes will be made to this system" "STEP"
-    Write-Host ""
+$sysInfo = @{
+    Manufacturer = "Unknown"
+    Model = "Unknown"
+    SerialNumber = ""
+    BIOSVersion = ""
+    BIOSDate = $null
+    OSName = ""
+    OSBuild = ""
+    Processor = ""
+    TotalRAM = 0
 }
-
-# Check lock file
-if (Test-LockFile) {
-    Write-Log "Another instance is already running" "ERROR"
-    Write-EventLogEntry -Message "Update blocked - another instance running" -EntryType Warning -EventId 1001
-    exit 6
-}
-
-New-LockFile
-
-# Cleanup old logs
-Invoke-LogRotation -RetentionDays $LogRetentionDays
-
-Write-Log "Log: $script:LogFile" "DEBUG"
-
-# Check for post-reboot continuation
-$state = Get-State
-if ($state.Phase -eq "PostReboot") {
-    Write-Log "Resuming after reboot..." "STEP"
-    $script:UpdatesInstalled = $state.UpdatesInstalled
-    Unregister-ContinuationTask
-}
-
-# Pre-flight checks
-Write-Log "Running pre-flight checks..." "STEP"
-
-$sysInfo = Get-SystemInfo
-Write-Log "System: $($sysInfo.Manufacturer) $($sysInfo.Model)" "INFO"
-Write-Log "OS: $($sysInfo.OSName) (Build $($sysInfo.OSBuild))" "DEBUG"
-
-# Internet check
-if (-not (Test-InternetConnection)) {
-    Write-Log "No internet connection" "WARNING"
-    [void]$script:Warnings.Add("No internet")
-}
-
-# Disk space check
-$disk = Test-DiskSpace -MinGB $MinDiskSpaceGB
-Write-Log "Free disk space: $($disk.FreeGB) GB (required: $($disk.RequiredGB) GB)" "DEBUG"
-if (-not $disk.Sufficient) {
-    Write-Log "Insufficient disk space" "ERROR"
-    if (-not $Force) {
-        Remove-LockFile
-        exit 4
-    }
-}
-
-# Pending reboot check
-$reboot = Test-PendingReboot
-if ($reboot.Pending) {
-    Write-Log "Pending reboot: $($reboot.Reasons -join ', ')" "WARNING"
-    if (-not $Force) {
-        Write-Log "Use -Force to override or reboot first" "ERROR"
-        Remove-LockFile
-        exit 5
-    }
-}
-
-# Battery check for BIOS updates
-if ($IncludeBIOS) {
-    $battery = Test-BatteryPower
-    if ($battery.OnBattery) {
-        Write-Log "Cannot update BIOS on battery power" "ERROR"
-        if (-not $Force) {
-            Remove-LockFile
-            exit 7
-        }
-    }
-}
-
-# Metered connection warning
-if (Test-MeteredConnection) {
-    Write-Log "Metered connection detected - large downloads may incur charges" "WARNING"
-}
-
-# BitLocker status
-$bitlocker = Test-BitLockerEnabled
-if ($bitlocker.Enabled) {
-    Write-Log "BitLocker: Active" "INFO"
-}
-
-Write-Host ""
-
-# Repair Windows Update if requested
-if ($RepairWindowsUpdate) {
-    Repair-WindowsUpdateServices
-    Write-Host ""
-}
-
-# WSUS bypass if requested
-if ($BypassWSUS) {
-    Set-WSUSBypass -Enable
-}
-
-# Driver backup if requested
-if ($BackupDrivers -and -not $SkipOEM) {
-    Invoke-DriverBackup
-    Write-Host ""
-}
+$lockAcquired = $false
+$wsusBypassApplied = $false
+$shutdownRequested = $false
+$runData = $null
 
 try {
-    # OEM Updates
-    $oemResult = $null
-    if (-not $SkipOEM) {
-        $manufacturer = $sysInfo.Manufacturer.ToUpper()
+    :run do {
+        $initializationStart = Get-Date
+        if (-not (Test-Administrator)) {
+            $message = "This script requires administrator privileges"
+            Write-Host "[X] $message." -ForegroundColor Red
+            [void]$script:Errors.Add($message)
+            [void](Add-StageResult (New-StageResult -Name "Initialization" -Status "Failed" `
+                -Attempted 1 -Failed 1 -ProviderCode 3 -Message $message -StartedAt $initializationStart))
+            $script:ExitCode = 3
+            break run
+        }
 
-        if ($manufacturer -match "DELL|ALIENWARE") {
-            $oemResult = Invoke-DellUpdate -IncludeBIOS:$IncludeBIOS
-        } elseif ($manufacturer -match "LENOVO") {
-            $oemResult = Invoke-LenovoUpdate -IncludeBIOS:$IncludeBIOS
-        } elseif ($manufacturer -match "HP|HEWLETT") {
-            $oemResult = Invoke-HPUpdate -IncludeBIOS:$IncludeBIOS
+        if (-not (Initialize-RunEnvironment)) {
+            $message = "Run storage initialization failed"
+            [void]$script:Errors.Add($message)
+            [void](Add-StageResult (New-StageResult -Name "Initialization" -Status "Failed" `
+                -Attempted 1 -Failed 1 -ProviderCode 3 -Message $message -StartedAt $initializationStart))
+            $script:ExitCode = 3
+            break run
+        }
+
+        [void](Add-StageResult (New-StageResult -Name "Initialization" -Status "Succeeded" `
+            -Attempted 1 -Message "Run environment initialized" -StartedAt $initializationStart `
+            -DurationSeconds ([int]((Get-Date) - $initializationStart).TotalSeconds)))
+
+        Write-Banner
+        [void](Initialize-EventLog)
+
+        if ($DryRun) {
+            Write-Log "DRY RUN MODE - No updates will be installed" "STEP"
+            Write-Host ""
+        }
+
+        $coordinationStart = Get-Date
+        if (Test-LockFile) {
+            $message = "Another instance is already running"
+            Write-Log $message "ERROR"
+            [void](Add-StageResult (New-StageResult -Name "Coordination" -Status "Failed" `
+                -Attempted 1 -Failed 1 -ProviderCode 6 -Message $message -StartedAt $coordinationStart))
+            $script:ExitCode = 6
+            break run
+        }
+
+        New-LockFile
+        $lockAcquired = $true
+        [void](Add-StageResult (New-StageResult -Name "Coordination" -Status "Succeeded" `
+            -Attempted 1 -Message "Single-instance lock acquired" -StartedAt $coordinationStart))
+
+        Invoke-LogRotation -RetentionDays $LogRetentionDays
+        Write-Log "Run ID: $($script:RunId)" "DEBUG"
+        Write-Log "Log: $script:LogFile" "DEBUG"
+
+        $state = Get-State
+        if ($state.Phase -eq "PostReboot") {
+            $continuationStart = Get-Date
+            Write-Log "Resuming after reboot..." "STEP"
+            $script:UpdatesInstalled = [int]$state.UpdatesInstalled
+            Unregister-ContinuationTask
+            [void](Add-StageResult (New-StageResult -Name "Resume" -Status "Succeeded" `
+                -Attempted 1 -Message "Post-reboot continuation resumed" -StartedAt $continuationStart))
+        }
+
+        Write-Log "Running pre-flight checks..." "STEP"
+        $preflightStart = Get-Date
+        $preflightItems = [System.Collections.ArrayList]::new()
+
+        $sysInfo = Get-SystemInfo
+        Write-Log "System: $($sysInfo.Manufacturer) $($sysInfo.Model)" "INFO"
+        Write-Log "OS: $($sysInfo.OSName) (Build $($sysInfo.OSBuild))" "DEBUG"
+
+        if (Test-InternetConnection) {
+            [void]$preflightItems.Add((New-UpdateItemResult -Name "Internet connectivity" -Status "Succeeded"))
         } else {
-            Write-Log "========== OEM UPDATES ==========" "HEADER"
-            Write-Log "Manufacturer '$($sysInfo.Manufacturer)' not supported" "INFO"
+            Write-Log "No internet connection" "WARNING"
+            [void]$preflightItems.Add((New-UpdateItemResult -Name "Internet connectivity" -Status "Warning" -Message "No internet connection detected"))
         }
 
-        if ($oemResult) {
-            if ($oemResult.RebootRequired) { $script:RebootRequired = $true }
-            if (-not $oemResult.Success) { $script:ExitCode = 2 }
-            $script:UpdatesInstalled += $oemResult.UpdateCount
-            $script:OEMUpdateCount = $oemResult.UpdateCount
+        $disk = Test-DiskSpace -MinGB $MinDiskSpaceGB
+        Write-Log "Free disk space: $($disk.FreeGB) GB (required: $($disk.RequiredGB) GB)" "DEBUG"
+        if (-not $disk.Sufficient) {
+            $message = "Insufficient disk space"
+            if (-not $Force) {
+                Write-Log $message "ERROR"
+                [void]$preflightItems.Add((New-UpdateItemResult -Name "Disk space" -Status "Blocked" -ProviderCode 4 -Message $message))
+                [void](Add-StageResult (New-StageResult -Name "Preflight" -Status "Failed" `
+                    -Attempted $preflightItems.Count -Failed 1 -ProviderCode 4 -Message $message `
+                    -Items @($preflightItems) -StartedAt $preflightStart))
+                $script:ExitCode = 4
+                break run
+            }
+            Write-Log "$message overridden by -Force" "WARNING"
+            [void]$preflightItems.Add((New-UpdateItemResult -Name "Disk space" -Status "Warning" -Message "$message overridden"))
+        } else {
+            [void]$preflightItems.Add((New-UpdateItemResult -Name "Disk space" -Status "Succeeded" -Message "$($disk.FreeGB) GB free"))
         }
-        Write-Host ""
-    }
 
-    # Windows Updates
-    if (-not $SkipWindows) {
-        $wuResult = Invoke-WindowsUpdate -MaxPasses $MaxUpdatePasses
-
-        if ($wuResult.RebootRequired) { $script:RebootRequired = $true }
-        if ($wuResult.TotalFailed -gt 0) { $script:ExitCode = 2 }
-        $script:UpdatesInstalled += $wuResult.TotalInstalled
-        $script:UpdatesFailed += $wuResult.TotalFailed
-        $script:WindowsUpdateCount = $wuResult.TotalInstalled
-        Write-Host ""
-    }
-
-    # Winget Updates
-    if (-not $SkipWinget) {
-        $wingetResult = Invoke-WingetUpgradeAll
-        if ($wingetResult.UpdateCount -gt 0) {
-            $script:UpdatesInstalled += $wingetResult.UpdateCount
+        $reboot = Test-PendingReboot
+        if ($reboot.Pending) {
+            $message = "Pending reboot: $($reboot.Reasons -join ', ')"
+            Write-Log $message "WARNING"
+            if (-not $Force) {
+                Write-Log "Use -Force to override or reboot first" "ERROR"
+                [void]$preflightItems.Add((New-UpdateItemResult -Name "Pending reboot" -Status "Blocked" -ProviderCode 5 -Message $message))
+                [void](Add-StageResult (New-StageResult -Name "Preflight" -Status "Failed" `
+                    -Attempted $preflightItems.Count -Failed 1 -ProviderCode 5 -Message $message `
+                    -Items @($preflightItems) -StartedAt $preflightStart))
+                $script:ExitCode = 5
+                break run
+            }
+            [void]$preflightItems.Add((New-UpdateItemResult -Name "Pending reboot" -Status "Warning" -Message "$message; overridden"))
+        } else {
+            [void]$preflightItems.Add((New-UpdateItemResult -Name "Pending reboot" -Status "Succeeded"))
         }
-        $script:WingetUpdateCount = $wingetResult.UpdateCount
-        Write-Host ""
-    }
 
-    # Component cleanup
-    if ($CleanupAfter) {
-        Invoke-ComponentCleanup
-        Write-Host ""
-    }
+        if ($IncludeBIOS) {
+            $battery = Test-BatteryPower
+            if ($battery.OnBattery) {
+                $message = "Cannot update BIOS on battery power"
+                if (-not $Force) {
+                    Write-Log $message "ERROR"
+                    [void]$preflightItems.Add((New-UpdateItemResult -Name "Firmware power" -Status "Blocked" -ProviderCode 7 -Message $message))
+                    [void](Add-StageResult (New-StageResult -Name "Preflight" -Status "Failed" `
+                        -Attempted $preflightItems.Count -Failed 1 -ProviderCode 7 -Message $message `
+                        -Items @($preflightItems) -StartedAt $preflightStart))
+                    $script:ExitCode = 7
+                    break run
+                }
+                Write-Log "$message overridden by -Force" "WARNING"
+                [void]$preflightItems.Add((New-UpdateItemResult -Name "Firmware power" -Status "Warning" -Message "$message overridden"))
+            } else {
+                [void]$preflightItems.Add((New-UpdateItemResult -Name "Firmware power" -Status "Succeeded" -Message "AC power detected"))
+            }
+        } else {
+            [void]$preflightItems.Add((New-UpdateItemResult -Name "Firmware power" -Status "Skipped" -Message "BIOS updates not requested"))
+        }
 
+        if (Test-MeteredConnection) {
+            Write-Log "Metered connection detected - large downloads may incur charges" "WARNING"
+            [void]$preflightItems.Add((New-UpdateItemResult -Name "Network cost" -Status "Warning" -Message "Metered connection detected"))
+        } else {
+            [void]$preflightItems.Add((New-UpdateItemResult -Name "Network cost" -Status "Succeeded"))
+        }
+
+        $bitlocker = Test-BitLockerEnabled
+        $bitlockerStatus = if ($bitlocker.Status -eq "Unknown") { "Warning" } else { "Succeeded" }
+        [void]$preflightItems.Add((New-UpdateItemResult -Name "BitLocker state" -Status $bitlockerStatus -Message $bitlocker.Status))
+        if ($bitlocker.Enabled) { Write-Log "BitLocker: Active" "INFO" }
+
+        [void](Add-StageResult (New-StageResult -Name "Preflight" -Status "Succeeded" `
+            -Attempted $preflightItems.Count -Message "Preflight checks completed" -Items @($preflightItems) `
+            -StartedAt $preflightStart -DurationSeconds ([int]((Get-Date) - $preflightStart).TotalSeconds)))
+        Write-Host ""
+
+        $repairStart = Get-Date
+        if ($RepairWindowsUpdate) {
+            $repairSucceeded = [bool](Repair-WindowsUpdateServices)
+            $repairStage = ConvertTo-StageResult -Name "WindowsUpdateRepair" -Provider "Windows servicing" `
+                -Result @{ Success = $repairSucceeded; Message = $(if ($repairSucceeded) { "Repair completed" } else { "Repair failed" }) } `
+                -StartedAt $repairStart
+            [void](Add-StageResult $repairStage)
+            if ($repairStage.Status -eq "Failed") { $script:ExitCode = 2 }
+            Write-Host ""
+        } else {
+            [void](Add-StageResult (New-StageResult -Name "WindowsUpdateRepair" -Provider "Windows servicing" `
+                -Status "Skipped" -Skipped 1 -Message "Repair not requested" -StartedAt $repairStart))
+        }
+
+        $wsusStart = Get-Date
+        if ($BypassWSUS) {
+            Set-WSUSBypass -Enable
+            $wsusBypassApplied = $true
+            [void](Add-StageResult (New-StageResult -Name "WSUSBypass" -Provider "Windows Update policy" `
+                -Status "Succeeded" -Attempted 1 -Message "Temporary WSUS bypass applied" -StartedAt $wsusStart))
+        } else {
+            [void](Add-StageResult (New-StageResult -Name "WSUSBypass" -Provider "Windows Update policy" `
+                -Status "Skipped" -Skipped 1 -Message "WSUS bypass not requested" -StartedAt $wsusStart))
+        }
+
+        $backupStart = Get-Date
+        if ($BackupDrivers -and -not $SkipOEM) {
+            $backupPath = Invoke-DriverBackup
+            $backupSuccess = [bool]$backupPath
+            $backupStage = ConvertTo-StageResult -Name "DriverBackup" -Provider "Export-WindowsDriver" `
+                -Result @{ Success = $backupSuccess; Message = $(if ($backupSuccess) { "Driver backup completed" } else { "Driver backup failed" }); Evidence = @($backupPath) } `
+                -StartedAt $backupStart
+            [void](Add-StageResult $backupStage)
+            if ($backupStage.Status -eq "Failed") { $script:ExitCode = 2 }
+            Write-Host ""
+        } else {
+            [void](Add-StageResult (New-StageResult -Name "DriverBackup" -Provider "Export-WindowsDriver" `
+                -Status "Skipped" -Skipped 1 -Message "Driver backup not requested" -StartedAt $backupStart))
+        }
+
+        $oemStart = Get-Date
+        if ($SkipOEM) {
+            [void](Add-StageResult (New-StageResult -Name "OEM" -Provider "OEM" -Status "Skipped" `
+                -Skipped 1 -Message "OEM updates skipped by run configuration" -StartedAt $oemStart))
+        } else {
+            $manufacturer = [string]$sysInfo.Manufacturer
+            $provider = $manufacturer
+            $oemResult = $null
+
+            if ($manufacturer -match "DELL|ALIENWARE") {
+                $provider = "Dell Command Update"
+                $oemResult = Invoke-DellUpdate -IncludeBIOS:$IncludeBIOS
+            } elseif ($manufacturer -match "LENOVO") {
+                $provider = "LSUClient"
+                $oemResult = Invoke-LenovoUpdate -IncludeBIOS:$IncludeBIOS
+            } elseif ($manufacturer -match "HP|HEWLETT") {
+                $provider = "HP Image Assistant"
+                $oemResult = Invoke-HPUpdate -IncludeBIOS:$IncludeBIOS
+            } else {
+                Write-Log "========== OEM UPDATES ==========" "HEADER"
+                Write-Log "Manufacturer '$manufacturer' not supported" "INFO"
+                [void](Add-StageResult (New-StageResult -Name "OEM" -Provider $manufacturer -Status "Skipped" `
+                    -Skipped 1 -Message "Manufacturer is not supported" -StartedAt $oemStart))
+            }
+
+            if ($oemResult) {
+                $oemStage = ConvertTo-StageResult -Name "OEM" -Provider $provider -Result $oemResult `
+                    -ItemNames @($script:OEMUpdates) -StartedAt $oemStart
+                [void](Add-StageResult $oemStage)
+                if ($oemStage.Status -in @("Failed", "Partial")) { $script:ExitCode = 2 }
+            }
+            Write-Host ""
+        }
+
+        $windowsStart = Get-Date
+        if ($SkipWindows) {
+            [void](Add-StageResult (New-StageResult -Name "WindowsUpdate" -Provider "Windows Update" `
+                -Status "Skipped" -Skipped 1 -Message "Windows Update skipped by run configuration" -StartedAt $windowsStart))
+        } else {
+            $wuResult = Invoke-WindowsUpdate -MaxPasses $MaxUpdatePasses
+            $wuStage = ConvertTo-StageResult -Name "WindowsUpdate" -Provider "Windows Update" `
+                -Result $wuResult -ItemNames @($script:WindowsUpdates) -StartedAt $windowsStart
+            [void](Add-StageResult $wuStage)
+            if ($wuStage.Status -in @("Failed", "Partial")) { $script:ExitCode = 2 }
+            Write-Host ""
+        }
+
+        $wingetStart = Get-Date
+        if ($SkipWinget) {
+            [void](Add-StageResult (New-StageResult -Name "Winget" -Provider "WinGet" -Status "Skipped" `
+                -Skipped 1 -Message "WinGet skipped by run configuration" -StartedAt $wingetStart))
+        } else {
+            $wingetResult = Invoke-WingetUpgradeAll
+            $wingetStage = ConvertTo-StageResult -Name "Winget" -Provider "WinGet" `
+                -Result $wingetResult -ItemNames @($script:WingetUpdates) -StartedAt $wingetStart
+            [void](Add-StageResult $wingetStage)
+            if ($wingetStage.Status -in @("Failed", "Partial")) { $script:ExitCode = 2 }
+            Write-Host ""
+        }
+
+        $cleanupStart = Get-Date
+        if ($CleanupAfter) {
+            $cleanupSucceeded = [bool](Invoke-ComponentCleanup)
+            $cleanupStage = ConvertTo-StageResult -Name "Cleanup" -Provider "DISM and cleanmgr" `
+                -Result @{ Success = $cleanupSucceeded; Message = $(if ($cleanupSucceeded) { "Component cleanup completed" } else { "Component cleanup failed" }) } `
+                -StartedAt $cleanupStart
+            [void](Add-StageResult $cleanupStage)
+            if ($cleanupStage.Status -eq "Failed") { $script:ExitCode = 2 }
+            Write-Host ""
+        } else {
+            [void](Add-StageResult (New-StageResult -Name "Cleanup" -Provider "DISM and cleanmgr" `
+                -Status "Skipped" -Skipped 1 -Message "Cleanup not requested" -StartedAt $cleanupStart))
+        }
+
+        $script:UpdatesInstalled = [int](($script:StageResults | Measure-Object -Property Installed -Sum).Sum)
+        $script:UpdatesFailed = [int](($script:StageResults | Measure-Object -Property Failed -Sum).Sum)
+
+        if ($script:RebootRequired -and -not $DryRun -and $ContinueAfterReboot) {
+            $continuationStart = Get-Date
+            $continuationSucceeded = [bool](Register-ContinuationTask)
+            $continuationStage = ConvertTo-StageResult -Name "Continuation" -Provider "Task Scheduler" `
+                -Result @{ Success = $continuationSucceeded; Message = $(if ($continuationSucceeded) { "Continuation task registered" } else { "Continuation task registration failed" }) } `
+                -StartedAt $continuationStart
+            [void](Add-StageResult $continuationStage)
+            if ($continuationStage.Status -eq "Failed") { $script:ExitCode = 2 }
+        }
+
+        if ($script:RebootRequired -and -not $DryRun -and $Reboot) {
+            $shutdownRequested = $true
+        }
+    } while ($false)
+} catch {
+    $message = "Unhandled runtime error: $($_.Exception.Message)"
+    try { Write-Log $message "ERROR" } catch { Write-Host "[X] $message" -ForegroundColor Red }
+    if (-not ($script:Errors -contains $message)) { [void]$script:Errors.Add($message) }
+    [void](Add-StageResult (New-StageResult -Name "Runtime" -Status "Failed" -Attempted 1 `
+        -Failed 1 -ProviderCode 3 -HResult $_.Exception.HResult -Message $message -StartedAt (Get-Date)))
+    $script:ExitCode = 3
 } finally {
-    # Restore WSUS if bypassed
-    if ($BypassWSUS) {
-        Set-WSUSBypass
+    if ($wsusBypassApplied) {
+        try {
+            Set-WSUSBypass
+        } catch {
+            $message = "WSUS settings restoration failed: $($_.Exception.Message)"
+            try { Write-Log $message "ERROR" } catch {}
+            if (-not ($script:Errors -contains $message)) { [void]$script:Errors.Add($message) }
+            $script:ExitCode = 3
+        }
     }
 
-    # Remove lock file
-    Remove-LockFile
-}
-
-# Summary
-$duration = (Get-Date) - $scriptStart
-
-Write-Log "================================================================" "HEADER"
-$summaryLabel = if ($DryRun) { "  DRY RUN COMPLETE" } else { "  UPDATE COMPLETE" }
-Write-Log $summaryLabel "HEADER"
-Write-Log "================================================================" "HEADER"
-Write-Host ""
-Write-Log "System:          $($sysInfo.Manufacturer) $($sysInfo.Model)" "INFO"
-Write-Log "Duration:        $([math]::Round($duration.TotalMinutes, 1)) minutes" "INFO"
-$updLabel = if ($DryRun) { "Updates Available" } else { "Updates Applied" }
-Write-Log "$updLabel`:  $script:UpdatesInstalled" "INFO"
-if ($script:UpdatesFailed -gt 0) {
-    Write-Log "Updates Failed:  $script:UpdatesFailed" "WARNING"
-}
-Write-Log "Reboot Required: $script:RebootRequired" $(if ($script:RebootRequired) { "WARNING" } else { "INFO" })
-Write-Log "Log File:        $script:LogFile" "DEBUG"
-
-# Final exit code
-if ($script:ExitCode -eq 0 -and $script:RebootRequired) { $script:ExitCode = 1 }
-
-Write-Log "Exit Code:       $script:ExitCode" "DEBUG"
-
-# Prepare run data for history, report, and webhook
-$runData = @{
-    OEMUpdates     = $script:OEMUpdateCount
-    WindowsUpdates = $script:WindowsUpdateCount
-    WingetUpdates  = $script:WingetUpdateCount
-    TotalInstalled = $script:UpdatesInstalled
-    TotalFailed    = $script:UpdatesFailed
-    RebootRequired = $script:RebootRequired
-    ExitCode       = $script:ExitCode
-    Errors         = @($script:Errors)
-    Warnings       = @($script:Warnings)
-    DurationSeconds = [int]$duration.TotalSeconds
-}
-
-# Save update history
-Save-UpdateHistory -RunData $runData
-
-# Generate HTML report
-New-HTMLReport -SysInfo $sysInfo -RunData $runData
-
-# Send webhook notification
-if ($WebhookUrl) {
-    Send-WebhookNotification -Url $WebhookUrl -RunData $runData
-}
-
-# Event log entry
-$eventMessage = @"
-SystemUpdatePro completed$(if ($DryRun) { ' (DRY RUN)' })
-System: $($sysInfo.Manufacturer) $($sysInfo.Model)
-Updates $(if ($DryRun) { 'Available' } else { 'Applied' }): $script:UpdatesInstalled
-Updates Failed: $script:UpdatesFailed
-Reboot Required: $script:RebootRequired
-Duration: $([math]::Round($duration.TotalMinutes, 1)) minutes
-"@
-
-$eventType = if ($script:ExitCode -eq 0) { "Information" } elseif ($script:ExitCode -le 2) { "Warning" } else { "Error" }
-Write-EventLogEntry -Message $eventMessage -EntryType $eventType -EventId (1000 + $script:ExitCode)
-
-Write-Host ""
-
-# Handle reboot (skip in dry run)
-if ($script:RebootRequired -and -not $DryRun) {
-    if ($ContinueAfterReboot) {
-        Register-ContinuationTask
+    if ($lockAcquired) {
+        Remove-LockFile
     }
 
-    if ($Reboot) {
-        Write-Log "Rebooting in 30 seconds..." "WARNING"
-        shutdown.exe /r /t 30 /c "SystemUpdatePro - Reboot Required"
+    $completedAt = Get-Date
+    $runData = New-RunData -StartedAt $scriptStart -CompletedAt $completedAt -RequestedExitCode $script:ExitCode
+    $script:ExitCode = $runData.ExitCode
+    $script:RebootRequired = $runData.RebootRequired
+    $script:UpdatesInstalled = $runData.TotalInstalled
+    $script:UpdatesFailed = $runData.TotalFailed
+    $script:OEMUpdateCount = $runData.OEMUpdates
+    $script:WindowsUpdateCount = $runData.WindowsUpdates
+    $script:WingetUpdateCount = $runData.WingetUpdates
+
+    try {
+        Write-Log "================================================================" "HEADER"
+        $summaryLabel = if ($DryRun) { "  DRY RUN COMPLETE" } else { "  UPDATE COMPLETE" }
+        Write-Log $summaryLabel "HEADER"
+        Write-Log "================================================================" "HEADER"
+        Write-Host ""
+        Write-Log "Run ID:          $($runData.RunId)" "INFO"
+        Write-Log "System:          $($sysInfo.Manufacturer) $($sysInfo.Model)" "INFO"
+        Write-Log "Duration:        $([math]::Round($runData.DurationSeconds / 60, 1)) minutes" "INFO"
+        $updateCount = if ($DryRun) { $runData.TotalAvailable } else { $runData.TotalInstalled }
+        $updateLabel = if ($DryRun) { "Updates Available" } else { "Updates Applied" }
+        Write-Log "$updateLabel`:  $updateCount" "INFO"
+        if ($runData.TotalFailed -gt 0) { Write-Log "Updates Failed:  $($runData.TotalFailed)" "WARNING" }
+        Write-Log "Reboot Required: $($runData.RebootRequired)" $(if ($runData.RebootRequired) { "WARNING" } else { "INFO" })
+        Write-Log "Exit Code:       $($runData.ExitCode)" "DEBUG"
+        Write-Log "Log File:        $script:LogFile" "DEBUG"
+    } catch {}
+
+    try {
+        $runData = Invoke-TerminalEvidence -SysInfo $sysInfo -RunData $runData -WebhookEndpoint $WebhookUrl
+    } catch {
+        [Console]::Error.WriteLine("[X] Terminal evidence finalization failed: $($_.Exception.Message)")
+        if ($script:ExitCode -lt 3) { $script:ExitCode = 3 }
+    }
+
+    if ($script:TranscriptStarted) {
+        try { Stop-Transcript | Out-Null } catch {}
+        $script:TranscriptStarted = $false
     }
 }
 
-# Stop transcript
-try { Stop-Transcript | Out-Null } catch {}
+if ($shutdownRequested) {
+    Write-Log "Rebooting in 30 seconds..." "WARNING"
+    shutdown.exe /r /t 30 /c "SystemUpdatePro - Reboot Required"
+}
 
 exit $script:ExitCode

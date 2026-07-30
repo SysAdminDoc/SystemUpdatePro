@@ -4,6 +4,7 @@ All notable changes to SystemUpdatePro will be documented in this file.
 
 ## [Unreleased]
 
+- Normalized OEM, Windows Update, and WinGet outcomes into a schema-versioned stage/item result contract with truthful totals, provider exit/HRESULT evidence, aligned process exit codes, and exactly-once terminal report/history/Event Log/webhook attempts.
 - Redesigned HTML reports as responsive operations dashboards with encoded data, clear update-channel states, device inventory, exception guidance, and print styles.
 
 ## [v4.1.0] - %Y->- (HEAD -> main, tag: v4.1.0, origin/main)

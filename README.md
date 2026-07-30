@@ -48,7 +48,7 @@ SystemUpdatePro is a fully automated, self-healing PowerShell script that handle
 - **Log Rotation**: Automatic cleanup of old log files
 - **HTML Reports**: Responsive operations-dashboard report with update channels, device profile, exceptions, and print styles
 - **Webhook Notifications**: Send completion status to Slack, Teams, or any generic webhook
-- **Update History**: JSON-based history tracking of all update runs with formatted display
+- **Update History**: Schema-versioned JSON history with stage/item outcomes, provider codes, and evidence-delivery status
 
 ---
 
@@ -255,17 +255,46 @@ When using `-WebhookUrl`, the following JSON payload is sent:
 
 ```json
 {
+  "schema_version": 1,
+  "run_id": "c59c67f1-2f28-45a2-b8de-14872cc4973e",
+  "started_at": "2026-07-29T19:00:00.0000000-04:00",
+  "completed_at": "2026-07-29T19:03:00.0000000-04:00",
   "hostname": "PCNAME",
   "status": "success|partial|failed",
   "oem_updates": 3,
   "windows_updates": 5,
   "winget_updates": 12,
+  "total_installed": 20,
+  "total_available": 20,
+  "total_failed": 0,
+  "reboot_required": true,
+  "exit_code": 1,
   "errors": [],
-  "runtime_seconds": 180
+  "warnings": [],
+  "runtime_seconds": 180,
+  "stages": [
+    {
+      "Name": "WindowsUpdate",
+      "Provider": "Windows Update",
+      "Status": "Succeeded",
+      "Attempted": 5,
+      "Available": 5,
+      "Installed": 5,
+      "Failed": 0,
+      "Skipped": 0,
+      "ProviderExitCode": 2,
+      "HResult": 0,
+      "RebootRequired": true,
+      "DurationSeconds": 94,
+      "Items": [],
+      "Evidence": []
+    }
+  ]
 }
 ```
 
 Slack and Teams webhooks are auto-detected by URL pattern and formatted appropriately.
+The JSON history entry uses the same stage schema and additionally records whether report, Event Log, webhook, and history delivery were attempted and succeeded.
 
 ---
 
@@ -371,10 +400,10 @@ Register-ScheduledTask -TaskName "SystemUpdatePro Weekly" -Action $action -Trigg
 |     +-- Disk Cleanup (update files, temp files)              |
 |                                                              |
 |  8. FINALIZATION                                             |
-|     +-- Save update history                                  |
 |     +-- Generate HTML report                                 |
-|     +-- Send webhook notification (if configured)            |
 |     +-- Write Event Log entry                                |
+|     +-- Send webhook notification (if configured)            |
+|     +-- Save schema-versioned history + delivery status       |
 |     +-- Create continuation task (if -ContinueAfterReboot)   |
 |     +-- Remove lock file                                     |
 |     +-- Initiate reboot (if -Reboot and required)            |
