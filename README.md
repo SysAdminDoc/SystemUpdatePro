@@ -20,13 +20,13 @@ SystemUpdatePro is a fully automated, self-healing PowerShell script that handle
 ### Multi-OEM Support
 | Manufacturer | Tool Used | Auto-Install |
 |--------------|-----------|--------------|
-| Dell / Alienware | Dell Command Update CLI | via Winget |
-| Lenovo | LSUClient PowerShell Module | via PSGallery |
-| HP | HP Image Assistant | Auto-download |
+| Dell / Alienware | Dell Command Update CLI 5.7.0+ | Exact WinGet package + publisher verification |
+| Lenovo | LSUClient PowerShell Module 1.8.1 | Exact SHA-256 package |
+| HP | HP Image Assistant 5.3.3+ | SHA-256 + HP publisher verification |
 | Other | Windows Update + Winget only | N/A |
 
 ### Self-Healing Capabilities
-- **Winget Auto-Install**: Automatically installs Winget on Windows 10 with all dependencies (VCLibs, UI.Xaml)
+- **WinGet Auto-Install**: Installs the pinned Microsoft App Installer bundle with its signed, architecture-specific dependencies
 - **Windows Update Repair**: Resets WU components, re-registers 30+ DLLs, clears cache
 - **Service Recovery**: Detects and repairs broken OEM services
 - **Retry Logic**: Exponential backoff with configurable retry attempts
@@ -39,6 +39,7 @@ SystemUpdatePro is a fully automated, self-healing PowerShell script that handle
 - **Pending Reboot Detection**: Checks 5 different sources for pending reboots
 - **DryRun Mode**: Preview all available updates without installing anything
 - **Driver Backup**: Export current drivers before installing updates for rollback capability
+- **Verified Dependencies**: Restricts downloads and redirects to approved HTTPS origins, checks hashes and publishers before execution, enforces safe version floors, and never changes PowerShell Gallery trust
 
 ### Enterprise Integration
 - **Event Log**: Writes to Windows Application log for RMM/SIEM visibility
@@ -46,9 +47,9 @@ SystemUpdatePro is a fully automated, self-healing PowerShell script that handle
 - **WSUS Bypass**: Option to bypass WSUS and connect directly to Microsoft
 - **Post-Reboot Continuation**: Versioned, bounded state machine resumes update stages with the original run settings
 - **Log Rotation**: Automatic cleanup of old log files
-- **HTML Reports**: Responsive operations-dashboard report with update channels, device profile, exceptions, and print styles
+- **HTML Reports**: Responsive operations-dashboard report with update channels, dependency provenance, device profile, exceptions, and print styles
 - **Webhook Notifications**: Send completion status to Slack, Teams, or any generic webhook
-- **Update History**: Schema-versioned JSON history with stage/item outcomes, provider codes, and evidence-delivery status
+- **Update History**: Schema-versioned JSON history with stage/item outcomes, provider codes, dependency provenance, and evidence-delivery status
 
 ---
 
@@ -190,6 +191,8 @@ cd SystemUpdatePro
 `-CleanupAfter` never uses `/ResetBase`. The separate `-ResetComponentBase` switch is intentionally high risk and also requests cleanup, so it does not need to be combined with `-CleanupAfter`. Use `-DryRun -ResetComponentBase` to preview the exact DISM command and rollback impact. Temporary Disk Cleanup `StateFlags0100` registry values are restored after each run, and restoration or `cleanmgr` failures are reported as partial cleanup.
 
 Firmware is excluded by default. With `-IncludeBIOS`, Dell Command Update, LSUClient, or HP Image Assistant must first complete an applicability scan for the detected model. Disk, AC, charge, or BitLocker query failures remain `Unknown` and block firmware even with `-Force`; non-firmware OEM updates may continue. Active BitLocker is accepted only for Dell's documented `-autoSuspendBitLocker=enable` path. Lenovo and HP require protection to be suspended beforehand.
+
+Elevated dependencies are defined in one in-script acquisition manifest. WinGet 1.29.280, PSWindowsUpdate 2.2.1.5, LSUClient 1.8.1, Dell Command Update 5.7.0, and HPIA 5.3.6 are pinned to their approved origins and digests. A valid newer installed WinGet, Dell CLI, or HP Image Assistant is accepted only when it meets the recorded minimum and publisher contract. Dell update execution also requires a signed Inventory Collector 13.8.0 or later. PowerShell modules are loaded by their verified versioned manifest path, so an unverified higher version cannot take precedence.
 
 ---
 

@@ -182,6 +182,11 @@ $script:ContinuationRegistered = $false
 $script:ContinuationState = $null
 $script:ResumeStageCursor = ""
 $script:FirmwarePrerequisites = $null
+$script:AcquisitionManifestVersion = 1
+$script:AcquisitionManifest = $null
+$script:AcquisitionProvenance = [System.Collections.ArrayList]::new()
+$script:PSModuleInstallRoot = Join-Path ([Environment]::GetFolderPath("ProgramFiles")) "WindowsPowerShell\Modules"
+$script:HPIAInstallRoot = "C:\ProgramData\SystemUpdatePro\HPIA"
 
 # Paths are declared without touching disk so read-only commands and tests can
 # load the script contract before privileged initialization.
@@ -238,7 +243,9 @@ function Write-Log {
 
     try {
         Add-Content -Path $script:LogFile -Value $logEntry -ErrorAction SilentlyContinue
-    } catch {}
+    } catch {
+        Write-Log "Existing App Installer registration could not be restored: $($_.Exception.Message)" "DEBUG"
+    }
 
     $colors = @{
         "HEADER"  = "Cyan"
@@ -590,6 +597,7 @@ function New-RunData {
         Warnings         = @($script:Warnings)
         DurationSeconds  = [math]::Max(0, [int]($CompletedAt - $StartedAt).TotalSeconds)
         Stages           = $stages
+        Dependencies     = @($script:AcquisitionProvenance)
         EvidenceDelivery = @{}
     }
 }
@@ -937,6 +945,7 @@ function New-ContinuationState {
         ScriptPath     = $ScriptPath
         Parameters     = Get-EffectiveRunParameter
         StageResults   = @($script:StageResults)
+        AcquisitionProvenance = @($script:AcquisitionProvenance)
         Errors         = @($script:Errors)
         Warnings       = @($script:Warnings)
     }
@@ -993,6 +1002,10 @@ function Import-ContinuationState {
     foreach ($message in @($State.Errors)) { [void]$script:Errors.Add([string]$message) }
     $script:Warnings = [System.Collections.ArrayList]::new()
     foreach ($message in @($State.Warnings)) { [void]$script:Warnings.Add([string]$message) }
+    $script:AcquisitionProvenance = [System.Collections.ArrayList]::new()
+    foreach ($dependency in @($State.AcquisitionProvenance)) {
+        [void]$script:AcquisitionProvenance.Add([PSCustomObject]$dependency)
+    }
 
     $script:LogFile = Join-Path $LogPath "$($script:ProductName)_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
     $script:TranscriptFile = Join-Path $LogPath "$($script:ProductName)_Transcript_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
@@ -1017,6 +1030,7 @@ function Set-ContinuationCursor {
 
     $script:ContinuationState.StageCursor = $StageCursor
     $script:ContinuationState.StageResults = @($script:StageResults)
+    $script:ContinuationState.AcquisitionProvenance = @($script:AcquisitionProvenance)
     $script:ContinuationState.Errors = @($script:Errors)
     $script:ContinuationState.Warnings = @($script:Warnings)
     $script:ContinuationState.Parameters = Get-EffectiveRunParameter
@@ -1104,6 +1118,7 @@ function Save-UpdateHistory {
             warnings          = @($RunData.Warnings)
             duration_seconds  = $RunData.DurationSeconds
             stages            = @($RunData.Stages)
+            dependencies      = @($RunData.Dependencies)
             evidence_delivery = $RunData.EvidenceDelivery
             parameters        = [ordered]@{
                 SkipOEM           = $SkipOEM.IsPresent
@@ -2176,96 +2191,594 @@ function Invoke-ComponentCleanup {
 }
 
 # ============================================================================
-# WINGET MANAGEMENT
+# VERIFIED DEPENDENCY ACQUISITION
 # ============================================================================
 
-function Test-WingetInstalled {
+function Get-AcquisitionManifest {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSUseShouldProcessForStateChangingFunctions", "", Justification = "Returns immutable acquisition metadata only.")]
+    param()
+
+    return @{
+        WinGet = [ordered]@{
+            Name             = "WinGet"
+            Kind             = "AppxBundle"
+            Uri              = "https://github.com/microsoft/winget-cli/releases/download/v1.29.280/Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle"
+            AllowedHosts     = @("github.com", "release-assets.githubusercontent.com")
+            ExactVersion     = "1.29.280"
+            MinimumVersion   = "1.29.280"
+            Architectures    = @("x64", "x86", "arm64")
+            Sha256           = "0809FA9F52E395D6E7DE692331DCE847AC991952675116BB4D8AAE2DDCC20946"
+            PublisherPattern = "^CN=Microsoft Corporation,"
+            DependencyBundle = [ordered]@{
+                Uri          = "https://github.com/microsoft/winget-cli/releases/download/v1.29.280/DesktopAppInstaller_Dependencies.zip"
+                AllowedHosts = @("github.com", "release-assets.githubusercontent.com")
+                Sha256       = "3BBFCAA5CB011C48FAC48D896D64A5C7C6898859A9F3D01555C8CD000F4E2962"
+                Packages     = @(
+                    "Microsoft.VCLibs.140.00_14.0.33519.0_{0}.appx",
+                    "Microsoft.VCLibs.140.00.UWPDesktop_14.0.33728.0_{0}.appx",
+                    "Microsoft.WindowsAppRuntime.1.8_8000.616.304.0_{0}.appx"
+                )
+                Versions     = @("14.0.33519.0", "14.0.33728.0", "8000.616.304.0")
+            }
+            License = [ordered]@{
+                Uri          = "https://github.com/microsoft/winget-cli/releases/download/v1.29.280/e53e159d00e04f729cc2180cffd1c02e_License1.xml"
+                AllowedHosts = @("github.com", "release-assets.githubusercontent.com")
+                Sha256       = "BCB15118EC47DF24E3E6013A7006147C3A15B3A8104ED660FE87C8B4ED01F485"
+            }
+        }
+        PSWindowsUpdate = [ordered]@{
+            Name              = "PSWindowsUpdate"
+            Kind              = "PowerShellModule"
+            Uri               = "https://www.powershellgallery.com/api/v2/package/PSWindowsUpdate/2.2.1.5"
+            AllowedHosts      = @("www.powershellgallery.com", "cdn.powershellgallery.com")
+            ExactVersion      = "2.2.1.5"
+            MinimumVersion    = "2.2.1.5"
+            Architectures     = @("neutral")
+            Sha256            = "174E05B1C194377F8D9AE0B004C93304C662EA9B5FC4DAFA19426049D2D5CF50"
+            PublisherPattern  = ""
+            PayloadTreeSha256 = "B0C4D34C5CDD931459EBCE0A509050A1C9AC305DDCF64978EDB86478DBCF2E62"
+        }
+        LSUClient = [ordered]@{
+            Name              = "LSUClient"
+            Kind              = "PowerShellModule"
+            Uri               = "https://www.powershellgallery.com/api/v2/package/LSUClient/1.8.1"
+            AllowedHosts      = @("www.powershellgallery.com", "cdn.powershellgallery.com")
+            ExactVersion      = "1.8.1"
+            MinimumVersion    = "1.8.1"
+            Architectures     = @("neutral")
+            Sha256            = "05F8DC57356FED994EB69D232B4C425DD450063352A5EED6A20C03C618848C94"
+            PublisherPattern  = ""
+            PayloadTreeSha256 = "CE2E9D22A7345C9CE01A7486E1E7E7FE868F88698957413F5D235182548FC96F"
+        }
+        DellCommandUpdate = [ordered]@{
+            Name                       = "Dell Command Update"
+            Kind                       = "WinGetPackage"
+            Uri                        = "https://dl.dell.com/FOLDER14424243M/1/Dell-Command-Update-Application_RXT5N_WIN64_5.7.0_A00.EXE"
+            AllowedHosts                = @("dl.dell.com")
+            ExactVersion                = "5.7.0"
+            MinimumVersion              = "5.7.0"
+            Architectures               = @("x64")
+            Sha256                      = "B6D0D06EDF25A7D9092208B2686502E031DEDA5CCB2D283BA8A434B27891F3CF"
+            PublisherPattern            = "^CN=Dell (?:Technologies )?Inc\.,"
+            PublisherDisplayName        = "Dell Inc."
+            PackageId                   = "Dell.CommandUpdate"
+            PackageSource               = "winget"
+            InventoryCollectorPath      = "C:\Program Files (x86)\Dell\UpdateService\Service\InvColPC\invcol.exe"
+            InventoryCollectorMinimum   = "13.8.0"
+            InventoryPublisherPattern   = "^CN=Dell (?:Technologies )?Inc\.,"
+        }
+        HPIA = [ordered]@{
+            Name                    = "HP Image Assistant"
+            Kind                    = "SelfExtractingArchive"
+            Uri                     = "https://hpia.hpcloud.hp.com/downloads/hpia/hp-hpia-5.3.6.exe"
+            AllowedHosts            = @("hpia.hpcloud.hp.com")
+            ExactVersion            = "5.3.6"
+            MinimumVersion          = "5.3.3"
+            Architectures           = @("x64", "arm64")
+            Sha256                  = "5E205A0300C1DC4F59D8A08CAA5FB1DAF434F1DC6CB05DF4E4D3F9EC83CD9CB7"
+            PublisherPattern        = "^CN=HP Inc\.,"
+            InstalledSha256         = "3A2658848E270F99ABA5FC3DAA4851891238A73A0C684A8404E547F23EF3DD85"
+            InstalledMinimumVersion   = "5.3.3"
+            InstalledPublisherPattern = "^CN=HP Inc\.,"
+        }
+    }
+}
+
+function Get-AcquisitionManifestEntry {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Name
+    )
+
+    if ($null -eq $script:AcquisitionManifest) {
+        $script:AcquisitionManifest = Get-AcquisitionManifest
+    }
+    if (-not $script:AcquisitionManifest.ContainsKey($Name)) {
+        throw "Dependency '$Name' is not present in the acquisition manifest"
+    }
+    return $script:AcquisitionManifest[$Name]
+}
+
+function Get-SystemArchitecture {
+    $architecture = [string]$env:PROCESSOR_ARCHITEW6432
+    if ([string]::IsNullOrWhiteSpace($architecture)) {
+        $architecture = [string]$env:PROCESSOR_ARCHITECTURE
+    }
+
+    switch -Regex ($architecture.ToUpperInvariant()) {
+        "^(AMD64|X64)$" { return "x64" }
+        "^ARM64$"       { return "arm64" }
+        "^X86$"         { return "x86" }
+        default         { return "unknown" }
+    }
+}
+
+function Test-AcquisitionUri {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Uri,
+        [Parameter(Mandatory = $true)]
+        [string[]]$AllowedHosts
+    )
+
     try {
-        $winget = Get-Command winget -ErrorAction Stop
-        $null = & winget --version 2>&1
-        return $true
+        $parsed = [Uri]$Uri
+        if (-not $parsed.IsAbsoluteUri -or $parsed.Scheme -ne "https") { return $false }
+        if (-not $parsed.IsDefaultPort -and $parsed.Port -ne 443) { return $false }
+        if (-not [string]::IsNullOrWhiteSpace($parsed.UserInfo)) { return $false }
+        $hostName = $parsed.DnsSafeHost.ToLowerInvariant()
+        return (@($AllowedHosts | ForEach-Object { $_.ToLowerInvariant() }) -contains $hostName)
     } catch {
         return $false
     }
 }
 
-function Install-Winget {
-    Write-Log "Installing Winget..." "STEP"
+function ConvertTo-SafeVersion {
+    param([AllowNull()][object]$Value)
 
-    if ($DryRun) {
-        Write-Log "Would install Winget and dependencies (VCLibs, UI.Xaml)" "INFO"
+    $text = [string]$Value
+    if ($text -match "(\d+(?:\.\d+){1,3})") {
+        try { return [Version]$Matches[1] } catch { return $null }
+    }
+    return $null
+}
+
+function Test-VersionAtLeast {
+    param(
+        [AllowNull()][object]$Version,
+        [Parameter(Mandatory = $true)]
+        [string]$MinimumVersion
+    )
+
+    $actual = ConvertTo-SafeVersion -Value $Version
+    $minimum = ConvertTo-SafeVersion -Value $MinimumVersion
+    return ($null -ne $actual -and $null -ne $minimum -and $actual -ge $minimum)
+}
+
+function Get-AuthenticodeEvidence {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+        [Parameter(Mandatory = $true)]
+        [string]$PublisherPattern
+    )
+
+    try {
+        $signature = Get-AuthenticodeSignature -LiteralPath $Path -ErrorAction Stop
+        $subject = if ($signature.SignerCertificate) { [string]$signature.SignerCertificate.Subject } else { "" }
+        $thumbprint = if ($signature.SignerCertificate) { [string]$signature.SignerCertificate.Thumbprint } else { "" }
+        if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid) {
+            return [PSCustomObject]@{
+                Valid = $false; Status = [string]$signature.Status; Subject = $subject
+                Thumbprint = $thumbprint; Reason = "Authenticode status is $($signature.Status)"
+            }
+        }
+        if ($subject -notmatch $PublisherPattern) {
+            return [PSCustomObject]@{
+                Valid = $false; Status = [string]$signature.Status; Subject = $subject
+                Thumbprint = $thumbprint; Reason = "Signer '$subject' does not match the approved publisher"
+            }
+        }
+        return [PSCustomObject]@{
+            Valid = $true; Status = [string]$signature.Status; Subject = $subject
+            Thumbprint = $thumbprint; Reason = ""
+        }
+    } catch {
+        return [PSCustomObject]@{
+            Valid = $false; Status = "Error"; Subject = ""; Thumbprint = ""
+            Reason = "Authenticode verification failed: $($_.Exception.Message)"
+        }
+    }
+}
+
+function Test-AcquiredFile {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+        [Parameter(Mandatory = $true)]
+        [ValidatePattern("^[A-Fa-f0-9]{64}$")]
+        [string]$ExpectedSha256,
+        [string]$PublisherPattern = ""
+    )
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return [PSCustomObject]@{
+            Valid = $false; Path = $Path; Sha256 = ""; Publisher = ""; Thumbprint = ""
+            Reason = "Downloaded file is missing"
+        }
+    }
+
+    try {
+        $actualHash = (Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash.ToUpperInvariant()
+    } catch {
+        return [PSCustomObject]@{
+            Valid = $false; Path = $Path; Sha256 = ""; Publisher = ""; Thumbprint = ""
+            Reason = "SHA-256 verification failed: $($_.Exception.Message)"
+        }
+    }
+
+    if ($actualHash -ne $ExpectedSha256.ToUpperInvariant()) {
+        return [PSCustomObject]@{
+            Valid = $false; Path = $Path; Sha256 = $actualHash; Publisher = ""; Thumbprint = ""
+            Reason = "SHA-256 mismatch"
+        }
+    }
+
+    $publisher = ""
+    $thumbprint = ""
+    if (-not [string]::IsNullOrWhiteSpace($PublisherPattern)) {
+        $signature = Get-AuthenticodeEvidence -Path $Path -PublisherPattern $PublisherPattern
+        if (-not $signature.Valid) {
+            return [PSCustomObject]@{
+                Valid = $false; Path = $Path; Sha256 = $actualHash; Publisher = $signature.Subject
+                Thumbprint = $signature.Thumbprint; Reason = $signature.Reason
+            }
+        }
+        $publisher = $signature.Subject
+        $thumbprint = $signature.Thumbprint
+    }
+
+    return [PSCustomObject]@{
+        Valid = $true; Path = $Path; Sha256 = $actualHash; Publisher = $publisher
+        Thumbprint = $thumbprint; Reason = ""
+    }
+}
+
+function Invoke-VerifiedDownload {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+        [Parameter(Mandatory = $true)]
+        [string]$Uri,
+        [Parameter(Mandatory = $true)]
+        [string[]]$AllowedHosts,
+        [Parameter(Mandatory = $true)]
+        [string]$ExpectedSha256,
+        [Parameter(Mandatory = $true)]
+        [string]$DestinationPath,
+        [string]$PublisherPattern = "",
+        [int]$MaximumRedirects = 8
+    )
+
+    if (-not (Test-AcquisitionUri -Uri $Uri -AllowedHosts $AllowedHosts)) {
+        throw "$Name has an unapproved acquisition URI: $Uri"
+    }
+    if (Test-Path -LiteralPath $DestinationPath) {
+        throw "$Name download destination already exists: $DestinationPath"
+    }
+
+    $destinationDirectory = Split-Path -Parent $DestinationPath
+    if (-not (Test-Path -LiteralPath $destinationDirectory)) {
+        New-Item -ItemType Directory -Path $destinationDirectory -Force -ErrorAction Stop | Out-Null
+    }
+
+    $partialPath = "$DestinationPath.partial.$([guid]::NewGuid().ToString('N'))"
+    $handler = $null
+    $client = $null
+    $response = $null
+
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        Add-Type -AssemblyName System.Net.Http -ErrorAction Stop
+        $handler = New-Object System.Net.Http.HttpClientHandler
+        $handler.AllowAutoRedirect = $false
+        $client = New-Object System.Net.Http.HttpClient($handler)
+        $client.Timeout = [TimeSpan]::FromMinutes(15)
+        $client.DefaultRequestHeaders.UserAgent.ParseAdd("SystemUpdatePro/$($script:Version)")
+
+        $currentUri = [Uri]$Uri
+        $redirectCount = 0
+        while ($true) {
+            if (-not (Test-AcquisitionUri -Uri $currentUri.AbsoluteUri -AllowedHosts $AllowedHosts)) {
+                throw "$Name redirected to an unapproved origin: $($currentUri.AbsoluteUri)"
+            }
+
+            $response = $client.GetAsync(
+                $currentUri,
+                [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead
+            ).GetAwaiter().GetResult()
+            $statusCode = [int]$response.StatusCode
+            if ($statusCode -in @(301, 302, 303, 307, 308)) {
+                if ($redirectCount -ge $MaximumRedirects) {
+                    throw "$Name exceeded $MaximumRedirects HTTPS redirects"
+                }
+                $location = $response.Headers.Location
+                if ($null -eq $location) { throw "$Name returned a redirect without a Location header" }
+                $nextUri = if ($location.IsAbsoluteUri) { $location } else { New-Object Uri($currentUri, $location) }
+                $response.Dispose()
+                $response = $null
+                $currentUri = $nextUri
+                $redirectCount++
+                continue
+            }
+
+            if (-not $response.IsSuccessStatusCode) {
+                throw "$Name download returned HTTP $statusCode"
+            }
+
+            $inputStream = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+            try {
+                $outputStream = New-Object System.IO.FileStream(
+                    $partialPath,
+                    [System.IO.FileMode]::CreateNew,
+                    [System.IO.FileAccess]::Write,
+                    [System.IO.FileShare]::None
+                )
+                try {
+                    $inputStream.CopyTo($outputStream)
+                    $outputStream.Flush()
+                } finally {
+                    $outputStream.Dispose()
+                }
+            } finally {
+                $inputStream.Dispose()
+            }
+            break
+        }
+
+        $verification = Test-AcquiredFile -Path $partialPath -ExpectedSha256 $ExpectedSha256 `
+            -PublisherPattern $PublisherPattern
+        if (-not $verification.Valid) {
+            throw "$Name was rejected before execution: $($verification.Reason)"
+        }
+
+        Move-Item -LiteralPath $partialPath -Destination $DestinationPath -ErrorAction Stop
+        $verification.Path = $DestinationPath
+        return $verification
+    } finally {
+        if ($response) { $response.Dispose() }
+        if ($client) { $client.Dispose() }
+        if ($handler) { $handler.Dispose() }
+        Remove-Item -LiteralPath $partialPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Add-AcquisitionProvenance {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSUseShouldProcessForStateChangingFunctions", "", Justification = "Updates in-memory run evidence only.")]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+        [Parameter(Mandatory = $true)]
+        [string]$Version,
+        [Parameter(Mandatory = $true)]
+        [string]$SourceUri,
+        [string]$Sha256 = "",
+        [string]$Publisher = "",
+        [string]$Thumbprint = "",
+        [string]$Architecture = "",
+        [string]$InstallPath = "",
+        [ValidateSet("Installed", "VerifiedExisting", "Provisioned")]
+        [string]$Status = "Installed",
+        [AllowEmptyCollection()][string[]]$Evidence = @()
+    )
+
+    if ($null -eq $script:AcquisitionProvenance) {
+        $script:AcquisitionProvenance = [System.Collections.ArrayList]::new()
+    }
+    for ($index = $script:AcquisitionProvenance.Count - 1; $index -ge 0; $index--) {
+        if ([string]$script:AcquisitionProvenance[$index].Name -eq $Name) {
+            $script:AcquisitionProvenance.RemoveAt($index)
+        }
+    }
+
+    $record = [PSCustomObject][ordered]@{
+        ManifestVersion = $script:AcquisitionManifestVersion
+        Name            = $Name
+        Version         = $Version
+        Status          = $Status
+        SourceUri       = $SourceUri
+        Sha256          = $Sha256
+        Publisher       = $Publisher
+        Thumbprint      = $Thumbprint
+        Architecture    = $Architecture
+        InstallPath     = $InstallPath
+        VerifiedAt      = (Get-Date).ToUniversalTime().ToString("o")
+        Evidence        = @($Evidence)
+    }
+    [void]$script:AcquisitionProvenance.Add($record)
+    return $record
+}
+
+function New-SystemUpdateProTemporaryDirectory {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSUseShouldProcessForStateChangingFunctions", "", Justification = "Creates a uniquely named run-owned temporary staging directory.")]
+    param([string]$Purpose = "Work")
+
+    $safePurpose = $Purpose -replace "[^A-Za-z0-9_-]", ""
+    $path = Join-Path ([IO.Path]::GetTempPath()) "SystemUpdatePro_$safePurpose`_$([guid]::NewGuid().ToString('N'))"
+    New-Item -ItemType Directory -Path $path -Force -ErrorAction Stop | Out-Null
+    return $path
+}
+
+function Remove-SystemUpdateProTemporaryDirectory {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSUseShouldProcessForStateChangingFunctions", "", Justification = "Removes only a validated run-owned temporary directory.")]
+    param([AllowNull()][string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) { return }
+    $temporaryRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd("\", "/")
+    $resolvedPath = [IO.Path]::GetFullPath($Path).TrimEnd("\", "/")
+    $expectedPrefix = "$temporaryRoot$([IO.Path]::DirectorySeparatorChar)SystemUpdatePro_"
+    if (-not $resolvedPath.StartsWith($expectedPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Refusing to remove an unowned temporary directory: $resolvedPath"
+    }
+    Remove-Item -LiteralPath $resolvedPath -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# ============================================================================
+# WINGET MANAGEMENT
+# ============================================================================
+
+function Get-WingetTrustEvidence {
+    $spec = Get-AcquisitionManifestEntry -Name "WinGet"
+
+    try {
+        $null = Get-Command winget -ErrorAction Stop
+        $versionOutput = & winget --version 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            throw "winget --version exited with $LASTEXITCODE"
+        }
+        $version = ConvertTo-SafeVersion -Value (($versionOutput | Out-String).Trim())
+        if (-not (Test-VersionAtLeast -Version $version -MinimumVersion $spec.MinimumVersion)) {
+            throw "WinGet $version is below the approved minimum $($spec.MinimumVersion)"
+        }
+
+        $package = $null
+        try {
+            $package = Get-AppxPackage -Name "Microsoft.DesktopAppInstaller" -AllUsers -ErrorAction Stop |
+                Sort-Object Version -Descending | Select-Object -First 1
+        } catch {
+            $package = $null
+        }
+        if (-not $package) {
+            $package = Get-AppxPackage -Name "Microsoft.DesktopAppInstaller" -ErrorAction Stop |
+                Sort-Object Version -Descending | Select-Object -First 1
+        }
+        if (-not $package) { throw "The Microsoft Desktop App Installer package was not found" }
+        if ([string]$package.Publisher -notmatch $spec.PublisherPattern) {
+            throw "App Installer publisher '$($package.Publisher)' is not approved"
+        }
+
+        return [PSCustomObject]@{
+            Valid        = $true
+            Version      = [string]$version
+            PackageVersion = [string]$package.Version
+            Publisher    = [string]$package.Publisher
+            Architecture = ([string]$package.Architecture).ToLowerInvariant()
+            InstallPath  = [string]$package.InstallLocation
+            Reason       = ""
+        }
+    } catch {
+        return [PSCustomObject]@{
+            Valid = $false; Version = ""; PackageVersion = ""; Publisher = ""
+            Architecture = ""; InstallPath = ""; Reason = $_.Exception.Message
+        }
+    }
+}
+
+function Test-WingetInstalled {
+    $evidence = Get-WingetTrustEvidence
+    if (-not $evidence.Valid) { return $false }
+
+    $spec = Get-AcquisitionManifestEntry -Name "WinGet"
+    [void](Add-AcquisitionProvenance -Name $spec.Name -Version $evidence.Version `
+        -SourceUri $spec.Uri -Publisher $evidence.Publisher -Architecture $evidence.Architecture `
+        -InstallPath $evidence.InstallPath -Status "VerifiedExisting" `
+        -Evidence @("App Installer package $($evidence.PackageVersion)"))
+    return $true
+}
+
+function Install-Winget {
+    $spec = Get-AcquisitionManifestEntry -Name "WinGet"
+    if (Test-WingetInstalled) {
+        Write-Log "Verified WinGet v$($spec.MinimumVersion) or later from Microsoft App Installer" "DEBUG"
         return $true
     }
 
-    # Method 1: App Installer registration
+    Write-Log "Installing verified WinGet $($spec.ExactVersion)..." "STEP"
+
+    if ($DryRun) {
+        Write-Log "Would install the pinned WinGet bundle and signed architecture-specific dependencies" "INFO"
+        return $true
+    }
+
+    $architecture = Get-SystemArchitecture
+    if ($architecture -notin @($spec.Architectures)) {
+        Write-Log "WinGet acquisition does not support architecture '$architecture'" "WARNING"
+        return $false
+    }
+
+    # Re-register a trusted package that is present but whose execution alias
+    # has not been registered for the current account.
     try {
         Add-AppxPackage -RegisterByFamilyName -MainPackage Microsoft.DesktopAppInstaller_8wekyb3d8bbwe -ErrorAction Stop
-        Start-Sleep -Seconds 3
+        Start-Sleep -Seconds 2
         if (Test-WingetInstalled) {
-            Write-Log "Winget installed via App Installer" "SUCCESS"
+            Write-Log "WinGet restored from the verified App Installer package" "SUCCESS"
             return $true
         }
     } catch {}
 
-    # Method 2: Full installation with dependencies
-    Write-Log "Installing Winget with dependencies..." "DEBUG"
-
-    $tempDir = Join-Path $env:TEMP "WingetInstall_$(Get-Random)"
-    New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
+    $tempDir = New-SystemUpdateProTemporaryDirectory -Purpose "WinGet"
 
     try {
-        # VCLibs
-        try {
-            $vcLibsUrl = "https://aka.ms/Microsoft.VCLibs.x64.14.00.Desktop.appx"
-            $vcLibsPath = Join-Path $tempDir "VCLibs.appx"
-            Invoke-WebRequest -Uri $vcLibsUrl -OutFile $vcLibsPath -UseBasicParsing -ErrorAction Stop
-            Add-AppxPackage -Path $vcLibsPath -ErrorAction SilentlyContinue
-        } catch {}
-
-        # UI.Xaml
-        try {
-            $xamlUrl = "https://www.nuget.org/api/v2/package/Microsoft.UI.Xaml/2.8.6"
-            $xamlZip = Join-Path $tempDir "xaml.zip"
-            Invoke-WebRequest -Uri $xamlUrl -OutFile $xamlZip -UseBasicParsing -ErrorAction Stop
-            Expand-Archive -Path $xamlZip -DestinationPath (Join-Path $tempDir "xaml") -Force
-            $xamlAppx = Get-ChildItem -Path (Join-Path $tempDir "xaml") -Filter "*x64*.appx" -Recurse | Select-Object -First 1
-            if ($xamlAppx) {
-                Add-AppxPackage -Path $xamlAppx.FullName -ErrorAction SilentlyContinue
-            }
-        } catch {}
-
-        # Winget bundle
-        $release = Invoke-RestMethod -Uri "https://api.github.com/repos/microsoft/winget-cli/releases/latest" -ErrorAction Stop
-        $bundleUrl = ($release.assets | Where-Object { $_.name -match "\.msixbundle$" -and $_.name -notmatch "License" }).browser_download_url
-        $licenseUrl = ($release.assets | Where-Object { $_.name -match "License.*\.xml$" }).browser_download_url
-
         $bundlePath = Join-Path $tempDir "winget.msixbundle"
-        Invoke-WebRequest -Uri $bundleUrl -OutFile $bundlePath -UseBasicParsing -ErrorAction Stop
+        $dependenciesZip = Join-Path $tempDir "dependencies.zip"
+        $licensePath = Join-Path $tempDir "License.xml"
+        $dependenciesRoot = Join-Path $tempDir "dependencies"
 
-        $licensePath = $null
-        if ($licenseUrl) {
-            $licensePath = Join-Path $tempDir "License.xml"
-            try {
-                Invoke-WebRequest -Uri $licenseUrl -OutFile $licensePath -UseBasicParsing
-            } catch { $licensePath = $null }
+        $bundleEvidence = Invoke-VerifiedDownload -Name "WinGet bundle" -Uri $spec.Uri `
+            -AllowedHosts $spec.AllowedHosts -ExpectedSha256 $spec.Sha256 `
+            -PublisherPattern $spec.PublisherPattern -DestinationPath $bundlePath
+        $dependencyEvidence = Invoke-VerifiedDownload -Name "WinGet dependency bundle" `
+            -Uri $spec.DependencyBundle.Uri -AllowedHosts $spec.DependencyBundle.AllowedHosts `
+            -ExpectedSha256 $spec.DependencyBundle.Sha256 -DestinationPath $dependenciesZip
+        $null = Invoke-VerifiedDownload -Name "WinGet license" -Uri $spec.License.Uri `
+            -AllowedHosts $spec.License.AllowedHosts -ExpectedSha256 $spec.License.Sha256 `
+            -DestinationPath $licensePath
+
+        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+        [IO.Compression.ZipFile]::ExtractToDirectory($dependenciesZip, $dependenciesRoot)
+        $dependencyPaths = @()
+        foreach ($packageTemplate in @($spec.DependencyBundle.Packages)) {
+            $packageName = $packageTemplate -f $architecture
+            $packagePath = Join-Path (Join-Path $dependenciesRoot $architecture) $packageName
+            if (-not (Test-Path -LiteralPath $packagePath -PathType Leaf)) {
+                throw "WinGet dependency '$packageName' is missing from the verified bundle"
+            }
+            $signature = Get-AuthenticodeEvidence -Path $packagePath -PublisherPattern $spec.PublisherPattern
+            if (-not $signature.Valid) {
+                throw "WinGet dependency '$packageName' was rejected before installation: $($signature.Reason)"
+            }
+            $dependencyPaths += $packagePath
         }
 
-        if ($licensePath -and (Test-Path $licensePath)) {
-            Add-AppxProvisionedPackage -Online -PackagePath $bundlePath -LicensePath $licensePath -ErrorAction Stop | Out-Null
-        } else {
-            Add-AppxPackage -Path $bundlePath -ErrorAction Stop
+        try {
+            Add-AppxProvisionedPackage -Online -PackagePath $bundlePath -LicensePath $licensePath `
+                -DependencyPackagePath $dependencyPaths -ErrorAction Stop | Out-Null
+        } catch {
+            Write-Log "Machine provisioning failed; installing the same verified bundle for the current account" "DEBUG"
+            Add-AppxPackage -Path $bundlePath -DependencyPath $dependencyPaths -ErrorAction Stop
         }
 
-        Start-Sleep -Seconds 3
+        Start-Sleep -Seconds 2
 
         if (Test-WingetInstalled) {
-            Write-Log "Winget installed successfully" "SUCCESS"
+            $installedEvidence = Get-WingetTrustEvidence
+            [void](Add-AcquisitionProvenance -Name $spec.Name -Version $installedEvidence.Version `
+                -SourceUri $spec.Uri -Sha256 $bundleEvidence.Sha256 -Publisher $bundleEvidence.Publisher `
+                -Thumbprint $bundleEvidence.Thumbprint -Architecture $architecture `
+                -InstallPath $installedEvidence.InstallPath -Status "Provisioned" `
+                -Evidence @(
+                    "Dependency bundle SHA-256 $($dependencyEvidence.Sha256)",
+                    "Dependencies $($spec.DependencyBundle.Versions -join ', ')"
+                ))
+            Write-Log "WinGet $($installedEvidence.Version) installed from verified Microsoft artifacts" "SUCCESS"
             return $true
         }
+        throw "WinGet did not pass version and publisher verification after installation"
     } catch {
         Write-Log "Winget installation error: $($_.Exception.Message)" "WARNING"
     } finally {
-        Remove-Item -Path $tempDir -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-SystemUpdateProTemporaryDirectory -Path $tempDir
     }
 
     Write-Log "Failed to install Winget" "WARNING"
@@ -2358,52 +2871,218 @@ function Invoke-WingetUpgradeAll {
 # POWERSHELL MODULE MANAGEMENT
 # ============================================================================
 
-function Install-PSModuleWithRetry {
+function Get-DirectoryPayloadHash {
     param(
-        [string]$ModuleName,
-        [switch]$AcceptLicense
+        [Parameter(Mandatory = $true)]
+        [string]$Path
     )
 
-    $existing = Get-Module -ListAvailable -Name $ModuleName -ErrorAction SilentlyContinue
-    if ($existing) {
-        Write-Log "$ModuleName v$($existing.Version) available" "DEBUG"
+    $resolvedRoot = (Resolve-Path -LiteralPath $Path -ErrorAction Stop).Path.TrimEnd("\", "/")
+    $lines = [System.Collections.Generic.List[string]]::new()
+    foreach ($file in @(Get-ChildItem -LiteralPath $resolvedRoot -File -Recurse -Force -ErrorAction Stop |
+        Sort-Object FullName)) {
+        $relativePath = $file.FullName.Substring($resolvedRoot.Length).TrimStart("\", "/").Replace("\", "/")
+        $fileHash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256 -ErrorAction Stop).Hash.ToUpperInvariant()
+        $lines.Add("$relativePath|$fileHash")
+    }
+
+    $payload = [Text.Encoding]::UTF8.GetBytes(($lines -join "`n"))
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        return [BitConverter]::ToString($sha.ComputeHash($payload)).Replace("-", "")
+    } finally {
+        $sha.Dispose()
+    }
+}
+
+function Get-PSModuleInstallPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ModuleName,
+        [Parameter(Mandatory = $true)]
+        [string]$Version
+    )
+
+    if ([string]::IsNullOrWhiteSpace([string]$script:PSModuleInstallRoot)) {
+        $script:PSModuleInstallRoot = Join-Path ([Environment]::GetFolderPath("ProgramFiles")) "WindowsPowerShell\Modules"
+    }
+    return Join-Path (Join-Path $script:PSModuleInstallRoot $ModuleName) $Version
+}
+
+function Test-InstalledPSModule {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ModuleName
+    )
+
+    try {
+        $spec = Get-AcquisitionManifestEntry -Name $ModuleName
+        if ($spec.Kind -ne "PowerShellModule") { throw "'$ModuleName' is not an approved PowerShell module" }
+        $installPath = Get-PSModuleInstallPath -ModuleName $ModuleName -Version $spec.ExactVersion
+        $manifestPath = Join-Path $installPath "$ModuleName.psd1"
+        if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+            throw "The pinned module manifest is missing"
+        }
+
+        $moduleManifest = Import-PowerShellDataFile -LiteralPath $manifestPath -ErrorAction Stop
+        if ([string]$moduleManifest.ModuleVersion -ne [string]$spec.ExactVersion) {
+            throw "Installed module version '$($moduleManifest.ModuleVersion)' is not the pinned version $($spec.ExactVersion)"
+        }
+        $payloadHash = Get-DirectoryPayloadHash -Path $installPath
+        if ($payloadHash -ne [string]$spec.PayloadTreeSha256) {
+            throw "Installed module payload hash does not match the verified package"
+        }
+
+        return [PSCustomObject]@{
+            Valid = $true; Version = [string]$moduleManifest.ModuleVersion
+            Path = $manifestPath; InstallPath = $installPath; Sha256 = $payloadHash; Reason = ""
+        }
+    } catch {
+        return [PSCustomObject]@{
+            Valid = $false; Version = ""; Path = ""; InstallPath = ""; Sha256 = ""
+            Reason = $_.Exception.Message
+        }
+    }
+}
+
+function Get-VerifiedPSModulePath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ModuleName
+    )
+
+    $evidence = Test-InstalledPSModule -ModuleName $ModuleName
+    if ($evidence.Valid) { return $evidence.Path }
+    return $null
+}
+
+function Install-VerifiedPSModule {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ModuleName
+    )
+
+    $spec = Get-AcquisitionManifestEntry -Name $ModuleName
+    if ($spec.Kind -ne "PowerShellModule") {
+        throw "'$ModuleName' is not approved for module acquisition"
+    }
+
+    $existing = Test-InstalledPSModule -ModuleName $ModuleName
+    if ($existing.Valid) {
+        [void](Add-AcquisitionProvenance -Name $spec.Name -Version $existing.Version `
+            -SourceUri $spec.Uri -Sha256 $spec.Sha256 -Architecture "neutral" `
+            -InstallPath $existing.InstallPath -Status "VerifiedExisting" `
+            -Evidence @("Installed payload SHA-256 $($existing.Sha256)"))
         return $true
     }
 
-    Write-Log "Installing $ModuleName module..." "INFO"
+    $temporaryDirectory = New-SystemUpdateProTemporaryDirectory -Purpose $ModuleName
+    $packagePath = Join-Path $temporaryDirectory "$ModuleName.nupkg"
+    $extractPath = Join-Path $temporaryDirectory "payload"
+    $moduleBase = Split-Path -Parent (Get-PSModuleInstallPath -ModuleName $ModuleName -Version $spec.ExactVersion)
+    $destinationPath = Get-PSModuleInstallPath -ModuleName $ModuleName -Version $spec.ExactVersion
+    $stagingPath = Join-Path $moduleBase ".$ModuleName.$([guid]::NewGuid().ToString('N')).staging"
+    $backupPath = Join-Path $moduleBase ".$ModuleName.$([guid]::NewGuid().ToString('N')).untrusted"
+    $committed = $false
+
+    try {
+        $download = Invoke-VerifiedDownload -Name "$ModuleName module" -Uri $spec.Uri `
+            -AllowedHosts $spec.AllowedHosts -ExpectedSha256 $spec.Sha256 `
+            -DestinationPath $packagePath
+
+        New-Item -ItemType Directory -Path $extractPath -Force -ErrorAction Stop | Out-Null
+        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+        [IO.Compression.ZipFile]::ExtractToDirectory($packagePath, $extractPath)
+
+        foreach ($metadataDirectory in @("_rels", "package")) {
+            $metadataPath = Join-Path $extractPath $metadataDirectory
+            Remove-Item -LiteralPath $metadataPath -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        foreach ($metadataFile in @("[Content_Types].xml", "PSGetModuleInfo.xml")) {
+            Remove-Item -LiteralPath (Join-Path $extractPath $metadataFile) -Force -ErrorAction SilentlyContinue
+        }
+        Get-ChildItem -LiteralPath $extractPath -Filter "*.nuspec" -File -ErrorAction SilentlyContinue |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+
+        $manifestPath = Join-Path $extractPath "$ModuleName.psd1"
+        if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+            throw "$ModuleName package does not contain its module manifest"
+        }
+        $moduleManifest = Import-PowerShellDataFile -LiteralPath $manifestPath -ErrorAction Stop
+        if ([string]$moduleManifest.ModuleVersion -ne [string]$spec.ExactVersion) {
+            throw "$ModuleName package declares version '$($moduleManifest.ModuleVersion)', expected $($spec.ExactVersion)"
+        }
+        $payloadHash = Get-DirectoryPayloadHash -Path $extractPath
+        if ($payloadHash -ne [string]$spec.PayloadTreeSha256) {
+            throw "$ModuleName extracted payload was rejected before installation: tree hash mismatch"
+        }
+
+        New-Item -ItemType Directory -Path $moduleBase -Force -ErrorAction Stop | Out-Null
+        New-Item -ItemType Directory -Path $stagingPath -Force -ErrorAction Stop | Out-Null
+        Get-ChildItem -LiteralPath $extractPath -Force -ErrorAction Stop |
+            Copy-Item -Destination $stagingPath -Recurse -Force -ErrorAction Stop
+        if ((Get-DirectoryPayloadHash -Path $stagingPath) -ne [string]$spec.PayloadTreeSha256) {
+            throw "$ModuleName staging copy failed payload verification"
+        }
+
+        if (Test-Path -LiteralPath $destinationPath) {
+            Move-Item -LiteralPath $destinationPath -Destination $backupPath -ErrorAction Stop
+        }
+        try {
+            Move-Item -LiteralPath $stagingPath -Destination $destinationPath -ErrorAction Stop
+            $installed = Test-InstalledPSModule -ModuleName $ModuleName
+            if (-not $installed.Valid) {
+                throw "$ModuleName failed installed verification: $($installed.Reason)"
+            }
+            $committed = $true
+        } catch {
+            Remove-Item -LiteralPath $destinationPath -Recurse -Force -ErrorAction SilentlyContinue
+            if (Test-Path -LiteralPath $backupPath) {
+                Move-Item -LiteralPath $backupPath -Destination $destinationPath -ErrorAction SilentlyContinue
+            }
+            throw
+        }
+
+        Remove-Item -LiteralPath $backupPath -Recurse -Force -ErrorAction SilentlyContinue
+        [void](Add-AcquisitionProvenance -Name $spec.Name -Version $spec.ExactVersion `
+            -SourceUri $spec.Uri -Sha256 $download.Sha256 -Architecture "neutral" `
+            -InstallPath $destinationPath -Status "Installed" `
+            -Evidence @("Installed payload SHA-256 $($spec.PayloadTreeSha256)"))
+        Write-Log "$ModuleName $($spec.ExactVersion) installed from a verified package" "SUCCESS"
+        return $true
+    } finally {
+        if (-not $committed) {
+            Remove-Item -LiteralPath $stagingPath -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        Remove-SystemUpdateProTemporaryDirectory -Path $temporaryDirectory
+    }
+}
+
+function Install-PSModuleWithRetry {
+    param(
+        [string]$ModuleName
+    )
+
+    $spec = Get-AcquisitionManifestEntry -Name $ModuleName
+    $existing = Test-InstalledPSModule -ModuleName $ModuleName
+    if ($existing.Valid) {
+        [void](Add-AcquisitionProvenance -Name $spec.Name -Version $existing.Version `
+            -SourceUri $spec.Uri -Sha256 $spec.Sha256 -Architecture "neutral" `
+            -InstallPath $existing.InstallPath -Status "VerifiedExisting" `
+            -Evidence @("Installed payload SHA-256 $($existing.Sha256)"))
+        Write-Log "$ModuleName v$($existing.Version) verified" "DEBUG"
+        return $true
+    }
+
+    Write-Log "Installing verified $ModuleName $($spec.ExactVersion) module..." "INFO"
 
     if ($DryRun) {
-        Write-Log "Would install $ModuleName from PSGallery" "INFO"
+        Write-Log "Would install $ModuleName from its pinned PowerShell Gallery package without changing repository trust" "INFO"
         return $true
     }
 
     return Invoke-WithRetry -OperationName "Install $ModuleName" -ScriptBlock {
-        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-
-        $nuget = Get-PackageProvider -Name NuGet -ListAvailable -ErrorAction SilentlyContinue
-        if (-not $nuget -or $nuget.Version -lt [Version]"2.8.5.201") {
-            Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope AllUsers | Out-Null
-        }
-
-        Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction SilentlyContinue
-
-        $params = @{
-            Name = $ModuleName
-            Force = $true
-            AllowClobber = $true
-            SkipPublisherCheck = $true
-            Scope = "AllUsers"
-        }
-
-        if ($AcceptLicense) { $params.AcceptLicense = $true }
-
-        Install-Module @params -ErrorAction Stop
-
-        $installed = Get-Module -ListAvailable -Name $ModuleName
-        if (-not $installed) { throw "Verification failed" }
-
-        Write-Log "$ModuleName installed" "SUCCESS"
-        return $true
+        return Install-VerifiedPSModule -ModuleName $ModuleName
     }
 }
 
@@ -2411,18 +3090,177 @@ function Install-PSModuleWithRetry {
 # DELL COMMAND UPDATE
 # ============================================================================
 
+function Get-InstalledExecutableEvidence {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+        [Parameter(Mandatory = $true)]
+        [string]$MinimumVersion,
+        [Parameter(Mandatory = $true)]
+        [string]$PublisherPattern,
+        [string]$ExpectedSha256 = ""
+    )
+
+    try {
+        if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+            throw "Executable is missing: $Path"
+        }
+        $file = Get-Item -LiteralPath $Path -ErrorAction Stop
+        $rawVersion = if (-not [string]::IsNullOrWhiteSpace([string]$file.VersionInfo.ProductVersion)) {
+            [string]$file.VersionInfo.ProductVersion
+        } else {
+            [string]$file.VersionInfo.FileVersion
+        }
+        $version = ConvertTo-SafeVersion -Value $rawVersion
+        if (-not (Test-VersionAtLeast -Version $version -MinimumVersion $MinimumVersion)) {
+            throw "Executable version '$rawVersion' is below the approved minimum $MinimumVersion"
+        }
+
+        $hash = (Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash.ToUpperInvariant()
+        if (-not [string]::IsNullOrWhiteSpace($ExpectedSha256) -and
+            $hash -ne $ExpectedSha256.ToUpperInvariant()) {
+            throw "Installed executable SHA-256 does not match the pinned payload"
+        }
+        $signature = Get-AuthenticodeEvidence -Path $Path -PublisherPattern $PublisherPattern
+        if (-not $signature.Valid) { throw $signature.Reason }
+
+        return [PSCustomObject]@{
+            Valid = $true; Path = $Path; Version = [string]$version; Sha256 = $hash
+            Publisher = $signature.Subject; Thumbprint = $signature.Thumbprint; Reason = ""
+        }
+    } catch {
+        return [PSCustomObject]@{
+            Valid = $false; Path = $Path; Version = ""; Sha256 = ""; Publisher = ""
+            Thumbprint = ""; Reason = $_.Exception.Message
+        }
+    }
+}
+
+function Test-WingetPackageContractText {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$OutputText,
+        [Parameter(Mandatory = $true)]
+        [string]$ExpectedUri,
+        [Parameter(Mandatory = $true)]
+        [string]$ExpectedSha256,
+        [Parameter(Mandatory = $true)]
+        [string]$ExpectedPublisher
+    )
+
+    return (
+        $OutputText.IndexOf($ExpectedUri, [StringComparison]::OrdinalIgnoreCase) -ge 0 -and
+        $OutputText.IndexOf($ExpectedSha256, [StringComparison]::OrdinalIgnoreCase) -ge 0 -and
+        $OutputText.IndexOf($ExpectedPublisher, [StringComparison]::OrdinalIgnoreCase) -ge 0
+    )
+}
+
+function Test-DellWinGetPackageContract {
+    $spec = Get-AcquisitionManifestEntry -Name "DellCommandUpdate"
+    $output = & winget show --exact --id $spec.PackageId --version $spec.ExactVersion `
+        --source $spec.PackageSource --accept-source-agreements --disable-interactivity 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw "WinGet could not resolve $($spec.PackageId) $($spec.ExactVersion) (exit $LASTEXITCODE)"
+    }
+    $outputText = ($output | Out-String)
+    if (-not (Test-WingetPackageContractText -OutputText $outputText `
+        -ExpectedUri $spec.Uri -ExpectedSha256 $spec.Sha256 `
+        -ExpectedPublisher $spec.PublisherDisplayName)) {
+        throw "WinGet source metadata for $($spec.PackageId) $($spec.ExactVersion) does not match the pinned URI, SHA-256, and publisher"
+    }
+    return $true
+}
+
 function Get-DCUPath {
-    @(
+    $spec = Get-AcquisitionManifestEntry -Name "DellCommandUpdate"
+    $candidates = @(
         "${env:ProgramFiles}\Dell\CommandUpdate\dcu-cli.exe",
         "${env:ProgramFiles(x86)}\Dell\CommandUpdate\dcu-cli.exe"
-    ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+    )
+    foreach ($path in $candidates) {
+        $evidence = Get-InstalledExecutableEvidence -Path $path -MinimumVersion $spec.MinimumVersion `
+            -PublisherPattern $spec.PublisherPattern
+        if ($evidence.Valid) {
+            [void](Add-AcquisitionProvenance -Name $spec.Name -Version $evidence.Version `
+                -SourceUri $spec.Uri -Sha256 $evidence.Sha256 -Publisher $evidence.Publisher `
+                -Thumbprint $evidence.Thumbprint -Architecture (Get-SystemArchitecture) `
+                -InstallPath $path -Status "VerifiedExisting" `
+                -Evidence @("WinGet package $($spec.PackageId) $($spec.ExactVersion)"))
+            return $path
+        }
+    }
+    return $null
+}
+
+function Get-DellInventoryCollectorEvidence {
+    $spec = Get-AcquisitionManifestEntry -Name "DellCommandUpdate"
+    return Get-InstalledExecutableEvidence -Path $spec.InventoryCollectorPath `
+        -MinimumVersion $spec.InventoryCollectorMinimum `
+        -PublisherPattern $spec.InventoryPublisherPattern
+}
+
+function Test-DellInventoryCollector {
+    $spec = Get-AcquisitionManifestEntry -Name "DellCommandUpdate"
+    $evidence = Get-DellInventoryCollectorEvidence
+    if (-not $evidence.Valid) { return $false }
+
+    [void](Add-AcquisitionProvenance -Name "Dell Inventory Collector" -Version $evidence.Version `
+        -SourceUri $spec.Uri -Sha256 $evidence.Sha256 -Publisher $evidence.Publisher `
+        -Thumbprint $evidence.Thumbprint -Architecture (Get-SystemArchitecture) `
+        -InstallPath $evidence.Path -Status "VerifiedExisting" `
+        -Evidence @("Minimum remediated version $($spec.InventoryCollectorMinimum)"))
+    return $true
+}
+
+function Update-DellInventoryCollector {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSUseShouldProcessForStateChangingFunctions", "", Justification = "Performs Dell's documented signed inventory refresh prerequisite.")]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$DCUPath
+    )
+
+    if (Test-DellInventoryCollector) { return $true }
+    if ($DryRun) { return $false }
+
+    $spec = Get-AcquisitionManifestEntry -Name "DellCommandUpdate"
+    $inventoryLog = Join-Path $LogPath "DCU_InventoryCollector_$((Get-Date).ToString('yyyyMMdd_HHmmss')).log"
+    Write-Log "Refreshing Dell Inventory Collector before update execution..." "INFO"
+    $process = Start-Process -FilePath $DCUPath `
+        -ArgumentList "/scan -silent -outputLog=`"$inventoryLog`"" `
+        -Wait -NoNewWindow -PassThru -ErrorAction Stop
+    if ($process.ExitCode -notin @(0, 500)) {
+        throw "Dell Inventory Collector refresh scan exited with $($process.ExitCode)"
+    }
+
+    $deadline = (Get-Date).AddSeconds(30)
+    do {
+        if (Test-DellInventoryCollector) { return $true }
+        Start-Sleep -Seconds 2
+    } while ((Get-Date) -lt $deadline)
+
+    $evidence = Get-DellInventoryCollectorEvidence
+    throw "Dell Inventory Collector was rejected before update execution: $($evidence.Reason). Version $($spec.InventoryCollectorMinimum) or later is required"
 }
 
 function Install-DellCommandUpdate {
-    Write-Log "Installing Dell Command Update..." "INFO"
+    param([switch]$ForceRepair)
+
+    $spec = Get-AcquisitionManifestEntry -Name "DellCommandUpdate"
+    $architecture = Get-SystemArchitecture
+    if ($architecture -notin @($spec.Architectures)) {
+        Write-Log "Dell Command Update $($spec.ExactVersion) is not approved for architecture '$architecture'" "WARNING"
+        return $false
+    }
+
+    $existingPath = Get-DCUPath
+    if (-not $ForceRepair -and $existingPath -and (Test-DellInventoryCollector)) {
+        return $true
+    }
+
+    Write-Log "Installing verified Dell Command Update $($spec.ExactVersion)..." "INFO"
 
     if ($DryRun) {
-        Write-Log "Would install Dell Command Update via winget" "INFO"
+        Write-Log "Would install exact package $($spec.PackageId) $($spec.ExactVersion) and verify Inventory Collector $($spec.InventoryCollectorMinimum)+" "INFO"
         return $true
     }
 
@@ -2432,16 +3270,40 @@ function Install-DellCommandUpdate {
 
     return Invoke-WithRetry -OperationName "Install DCU" -ScriptBlock {
         & winget source update --disable-interactivity 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "WinGet source update exited with $LASTEXITCODE" }
+        if (-not (Test-DellWinGetPackageContract)) {
+            throw "Dell Command Update source contract verification failed"
+        }
 
-        $wingetArgs = @("install", "--id", "Dell.CommandUpdate", "--source", "winget",
-                  "--accept-package-agreements", "--accept-source-agreements", "--silent")
+        $wingetArgs = @(
+            "install", "--exact", "--id", $spec.PackageId, "--version", $spec.ExactVersion,
+            "--source", $spec.PackageSource, "--scope", "machine", "--silent", "--force",
+            "--accept-package-agreements", "--accept-source-agreements", "--disable-interactivity"
+        )
 
-        Start-Process -FilePath "winget" -ArgumentList $wingetArgs -Wait -NoNewWindow
-        Start-Sleep -Seconds 5
+        $installProcess = Start-Process -FilePath "winget" -ArgumentList $wingetArgs `
+            -Wait -NoNewWindow -PassThru -ErrorAction Stop
+        if ($installProcess.ExitCode -ne 0) {
+            throw "WinGet rejected Dell Command Update installation with exit $($installProcess.ExitCode)"
+        }
+        Start-Sleep -Seconds 3
 
-        if (-not (Get-DCUPath)) { throw "DCU not found after install" }
+        $dcuPath = Get-DCUPath
+        if (-not $dcuPath) { throw "DCU failed version or publisher verification after installation" }
+        if (-not (Update-DellInventoryCollector -DCUPath $dcuPath)) {
+            throw "Dell Inventory Collector $($spec.InventoryCollectorMinimum)+ was not verified"
+        }
 
-        Write-Log "Dell Command Update installed" "SUCCESS"
+        $dcuEvidence = Get-InstalledExecutableEvidence -Path $dcuPath `
+            -MinimumVersion $spec.MinimumVersion -PublisherPattern $spec.PublisherPattern
+        [void](Add-AcquisitionProvenance -Name $spec.Name -Version $dcuEvidence.Version `
+            -SourceUri $spec.Uri -Sha256 $dcuEvidence.Sha256 -Publisher $dcuEvidence.Publisher `
+            -Thumbprint $dcuEvidence.Thumbprint -Architecture $architecture -InstallPath $dcuPath `
+            -Status "Installed" -Evidence @(
+                "WinGet source contract SHA-256 $($spec.Sha256)",
+                "Package $($spec.PackageId) $($spec.ExactVersion)"
+            ))
+        Write-Log "Dell Command Update and Inventory Collector passed provenance verification" "SUCCESS"
         return $true
     }
 }
@@ -2453,9 +3315,8 @@ function Repair-DellServices {
     $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
 
     if (-not $service) {
-        Write-Log "Dell service not found - reinstalling DCU" "WARNING"
-        & winget uninstall --id Dell.CommandUpdate --silent 2>&1 | Out-Null
-        return (Install-DellCommandUpdate)
+        Write-Log "Dell service not found - repairing the pinned DCU installation" "WARNING"
+        return (Install-DellCommandUpdate -ForceRepair)
     }
 
     if ($service.Status -ne "Running") {
@@ -2489,17 +3350,19 @@ function Invoke-DellUpdate {
         Write-Log "Service Tag: $($sysInfo.SerialNumber)" "INFO"
 
         $dcuPath = Get-DCUPath
-        if (-not $dcuPath) {
+        $inventoryCollectorReady = $dcuPath -and (Test-DellInventoryCollector)
+        if (-not $dcuPath -or -not $inventoryCollectorReady) {
             if (-not (Install-DellCommandUpdate)) {
-                $result.Message = "Dell Command Update could not be installed; repair WinGet/network access and rerun"
+                $result.Message = "Dell Command Update or its remediated Inventory Collector could not be verified; repair WinGet/network access and rerun"
                 $result.Failed = 1
             }
             $dcuPath = Get-DCUPath
+            $inventoryCollectorReady = $dcuPath -and (Test-DellInventoryCollector)
         }
 
-        if (-not $dcuPath) {
+        if (-not $dcuPath -or -not $inventoryCollectorReady) {
             $readiness = Test-FirmwareReadiness -Requested:$IncludeBIOS -Provider "Dell" -SystemInfo $sysInfo `
-                -ToolState "Unknown" -ToolMessage "Dell Command Update is unavailable. Install or repair DCU and rerun its applicability scan" `
+                -ToolState "Unknown" -ToolMessage "Dell Command Update and Inventory Collector 13.8.0+ are not both verified. Install or repair DCU and rerun its applicability scan" `
                 -SupportsBitLockerAutoSuspend $true -Prerequisites $FirmwarePrerequisites
             $result.FirmwareReadiness = $readiness
             $result.Items += New-FirmwareReadinessItem -Readiness $readiness
@@ -2510,7 +3373,7 @@ function Invoke-DellUpdate {
                 $result.Message = "DCU would be installed before scanning; $($readiness.Message)"
             } else {
                 $result.Failed = [math]::Max(1, $result.Failed)
-                $result.Message = "Dell Command Update was not found after installation"
+                $result.Message = "Dell Command Update dependency trust could not be established after installation"
             }
             Write-Log $result.Message $(if ($result.Success) { "WARNING" } else { "ERROR" })
             return $result
@@ -2693,7 +3556,8 @@ function Invoke-LenovoUpdate {
         return $result
     }
 
-    if (-not (Get-Module -ListAvailable -Name "LSUClient" -ErrorAction SilentlyContinue)) {
+    $lsuClientPath = Get-VerifiedPSModulePath -ModuleName "LSUClient"
+    if (-not $lsuClientPath) {
         $readiness = Test-FirmwareReadiness -Requested:$IncludeBIOS -Provider "Lenovo" -SystemInfo $sysInfo `
             -ToolState "Unknown" -ToolMessage "LSUClient is not installed, so model support cannot be scanned. Install the module and rerun" `
             -Prerequisites $FirmwarePrerequisites
@@ -2713,7 +3577,7 @@ function Invoke-LenovoUpdate {
     }
 
     try {
-        Import-Module LSUClient -Force -ErrorAction Stop
+        Import-Module $lsuClientPath -Force -ErrorAction Stop
 
         Write-Log "Scanning for updates..." "INFO"
         $allUpdates = @(Get-LSUpdate -ErrorAction Stop | Where-Object { $_.Installer.Unattended -eq $true })
@@ -2860,44 +3724,134 @@ function Invoke-LenovoUpdate {
 # ============================================================================
 
 function Get-HPIAPath {
+    $spec = Get-AcquisitionManifestEntry -Name "HPIA"
+    if ([string]::IsNullOrWhiteSpace([string]$script:HPIAInstallRoot)) {
+        $script:HPIAInstallRoot = "C:\ProgramData\SystemUpdatePro\HPIA"
+    }
     $searchPaths = @(
-        "C:\ProgramData\SystemUpdatePro\HPIA",
+        $script:HPIAInstallRoot,
         "C:\SWSetup\SP*",
         "${env:ProgramFiles}\HP\HPIA"
     )
 
     foreach ($path in $searchPaths) {
-        $found = Get-ChildItem -Path $path -Filter "HPImageAssistant.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($found) { return $found.FullName }
+        $candidates = @(Get-ChildItem -Path $path -Filter "HPImageAssistant.exe" -File -Recurse -ErrorAction SilentlyContinue)
+        foreach ($found in $candidates) {
+            $evidence = Get-InstalledExecutableEvidence -Path $found.FullName `
+                -MinimumVersion $spec.InstalledMinimumVersion `
+                -PublisherPattern $spec.InstalledPublisherPattern
+            if ($evidence.Valid) {
+                [void](Add-AcquisitionProvenance -Name $spec.Name -Version $evidence.Version `
+                    -SourceUri $spec.Uri -Sha256 $evidence.Sha256 -Publisher $evidence.Publisher `
+                    -Thumbprint $evidence.Thumbprint -Architecture (Get-SystemArchitecture) `
+                    -InstallPath $found.FullName -Status "VerifiedExisting" `
+                    -Evidence @("Minimum remediated version $($spec.MinimumVersion)"))
+                return $found.FullName
+            }
+        }
     }
     return $null
 }
 
 function Install-HPIA {
-    Write-Log "Installing HP Image Assistant..." "INFO"
+    $spec = Get-AcquisitionManifestEntry -Name "HPIA"
+    $architecture = Get-SystemArchitecture
+    if ($architecture -notin @($spec.Architectures)) {
+        Write-Log "HP Image Assistant $($spec.ExactVersion) is not approved for architecture '$architecture'" "WARNING"
+        return $false
+    }
+    if (Get-HPIAPath) { return $true }
+
+    Write-Log "Installing verified HP Image Assistant $($spec.ExactVersion)..." "INFO"
 
     if ($DryRun) {
-        Write-Log "Would download and install HP Image Assistant" "INFO"
+        Write-Log "Would download HP Image Assistant from its pinned HP release and verify both signatures" "INFO"
         return $true
     }
 
     return Invoke-WithRetry -OperationName "Install HPIA" -ScriptBlock {
-        $hpiaDir = "C:\ProgramData\SystemUpdatePro\HPIA"
-        New-Item -ItemType Directory -Path $hpiaDir -Force | Out-Null
+        $hpiaDir = $script:HPIAInstallRoot
+        $hpiaParent = Split-Path -Parent $hpiaDir
+        $temporaryDirectory = New-SystemUpdateProTemporaryDirectory -Purpose "HPIA"
+        $extractPath = Join-Path $temporaryDirectory "payload"
+        $installer = Join-Path $temporaryDirectory "hp-hpia-$($spec.ExactVersion).exe"
+        $stagingPath = "$hpiaDir.staging.$([guid]::NewGuid().ToString('N'))"
+        $backupPath = "$hpiaDir.untrusted.$([guid]::NewGuid().ToString('N'))"
+        $committed = $false
 
-        $hpiaUrl = "https://hpia.hpcloud.hp.com/downloads/hpia/hp-hpia-5.2.0.exe"
-        $installer = Join-Path $env:TEMP "hp-hpia.exe"
+        try {
+            $download = Invoke-VerifiedDownload -Name $spec.Name -Uri $spec.Uri `
+                -AllowedHosts $spec.AllowedHosts -ExpectedSha256 $spec.Sha256 `
+                -PublisherPattern $spec.PublisherPattern -DestinationPath $installer
+            New-Item -ItemType Directory -Path $extractPath -Force -ErrorAction Stop | Out-Null
+            $extractProcess = Start-Process -FilePath $installer `
+                -ArgumentList "/s /e /f `"$extractPath`"" -Wait -NoNewWindow -PassThru -ErrorAction Stop
 
-        Invoke-WebRequest -Uri $hpiaUrl -OutFile $installer -UseBasicParsing -ErrorAction Stop
-        Start-Process -FilePath $installer -ArgumentList "/s /e /f `"$hpiaDir`"" -Wait -NoNewWindow
-        Start-Sleep -Seconds 5
-        Remove-Item $installer -Force -ErrorAction SilentlyContinue
+            $extractedExecutable = Get-ChildItem -LiteralPath $extractPath -Filter "HPImageAssistant.exe" `
+                -File -Recurse -ErrorAction Stop | Select-Object -First 1
+            if (-not $extractedExecutable) {
+                throw "HPIA extraction exited with $($extractProcess.ExitCode) without producing HPImageAssistant.exe"
+            }
+            $extractedEvidence = Get-InstalledExecutableEvidence -Path $extractedExecutable.FullName `
+                -MinimumVersion $spec.InstalledMinimumVersion `
+                -PublisherPattern $spec.InstalledPublisherPattern `
+                -ExpectedSha256 $spec.InstalledSha256
+            if (-not $extractedEvidence.Valid) {
+                throw "HPIA payload was rejected before installation: $($extractedEvidence.Reason)"
+            }
 
-        $hpiaExe = Get-ChildItem -Path $hpiaDir -Filter "HPImageAssistant.exe" -Recurse | Select-Object -First 1
-        if (-not $hpiaExe) { throw "HPIA not found after extraction" }
+            New-Item -ItemType Directory -Path $hpiaParent -Force -ErrorAction Stop | Out-Null
+            New-Item -ItemType Directory -Path $stagingPath -Force -ErrorAction Stop | Out-Null
+            Get-ChildItem -LiteralPath $extractedExecutable.Directory.FullName -Force -ErrorAction Stop |
+                Copy-Item -Destination $stagingPath -Recurse -Force -ErrorAction Stop
+            $stagedExecutable = Join-Path $stagingPath "HPImageAssistant.exe"
+            $stagedEvidence = Get-InstalledExecutableEvidence -Path $stagedExecutable `
+                -MinimumVersion $spec.InstalledMinimumVersion `
+                -PublisherPattern $spec.InstalledPublisherPattern `
+                -ExpectedSha256 $spec.InstalledSha256
+            if (-not $stagedEvidence.Valid) {
+                throw "HPIA staging copy failed payload verification: $($stagedEvidence.Reason)"
+            }
 
-        Write-Log "HPIA installed" "SUCCESS"
-        return $true
+            if (Test-Path -LiteralPath $hpiaDir) {
+                Move-Item -LiteralPath $hpiaDir -Destination $backupPath -ErrorAction Stop
+            }
+            try {
+                Move-Item -LiteralPath $stagingPath -Destination $hpiaDir -ErrorAction Stop
+                $installedExecutable = Join-Path $hpiaDir "HPImageAssistant.exe"
+                $installedEvidence = Get-InstalledExecutableEvidence -Path $installedExecutable `
+                    -MinimumVersion $spec.InstalledMinimumVersion `
+                    -PublisherPattern $spec.InstalledPublisherPattern `
+                    -ExpectedSha256 $spec.InstalledSha256
+                if (-not $installedEvidence.Valid) {
+                    throw "Installed HPIA failed provenance verification: $($installedEvidence.Reason)"
+                }
+                $committed = $true
+            } catch {
+                Remove-Item -LiteralPath $hpiaDir -Recurse -Force -ErrorAction SilentlyContinue
+                if (Test-Path -LiteralPath $backupPath) {
+                    Move-Item -LiteralPath $backupPath -Destination $hpiaDir -ErrorAction SilentlyContinue
+                }
+                throw
+            }
+
+            Remove-Item -LiteralPath $backupPath -Recurse -Force -ErrorAction SilentlyContinue
+            [void](Add-AcquisitionProvenance -Name $spec.Name -Version $installedEvidence.Version `
+                -SourceUri $spec.Uri -Sha256 $installedEvidence.Sha256 `
+                -Publisher $installedEvidence.Publisher -Thumbprint $installedEvidence.Thumbprint `
+                -Architecture $architecture -InstallPath $installedEvidence.Path -Status "Installed" `
+                -Evidence @(
+                    "Outer package SHA-256 $($download.Sha256)",
+                    "Extractor exit $($extractProcess.ExitCode)"
+                ))
+            Write-Log "HP Image Assistant $($installedEvidence.Version) installed from verified HP artifacts" "SUCCESS"
+            return $true
+        } finally {
+            if (-not $committed) {
+                Remove-Item -LiteralPath $stagingPath -Recurse -Force -ErrorAction SilentlyContinue
+            }
+            Remove-SystemUpdateProTemporaryDirectory -Path $temporaryDirectory
+        }
     }
 }
 
@@ -3179,7 +4133,11 @@ function Invoke-WindowsUpdatePSWU {
     }
 
     try {
-        Import-Module PSWindowsUpdate -Force -ErrorAction Stop
+        $psWindowsUpdatePath = Get-VerifiedPSModulePath -ModuleName "PSWindowsUpdate"
+        if (-not $psWindowsUpdatePath) {
+            throw "The pinned PSWindowsUpdate module failed installed-payload verification"
+        }
+        Import-Module $psWindowsUpdatePath -Force -ErrorAction Stop
 
         $updates = @(Get-WindowsUpdate -MicrosoftUpdate -NotCategory "Drivers","Feature Packs" -NotTitle "Preview" -ErrorAction Stop)
 
@@ -3480,6 +4438,38 @@ function New-HTMLReport {
         "1 item"
     } else {
         "$attentionCount items"
+    }
+
+    $dependencies = @($RunData.Dependencies)
+    $dependencyRows = ""
+    foreach ($dependency in $dependencies) {
+        $dependencyName = & $displayValue $dependency.Name "Unnamed dependency"
+        $dependencyVersion = & $displayValue $dependency.Version "Unknown version"
+        $dependencyStatus = & $displayValue $dependency.Status "Verified"
+        $dependencyPublisher = & $displayValue $dependency.Publisher "Exact package hash"
+        $dependencyArchitecture = & $displayValue $dependency.Architecture "neutral"
+        $dependencyPath = & $displayValue $dependency.InstallPath "No install path recorded"
+        $dependencyHash = [string]$dependency.Sha256
+        $dependencyHashDisplay = if ([string]::IsNullOrWhiteSpace($dependencyHash)) {
+            "Publisher verified"
+        } else {
+            $shortHashLength = [math]::Min(16, $dependencyHash.Length)
+            $shortHash = & $encode ($dependencyHash.Substring(0, $shortHashLength))
+            "SHA-256 $shortHash..."
+        }
+        $dependencyRows += @"
+<li class="dependency">
+  <div><strong>$dependencyName <span>v$dependencyVersion</span></strong><p>$dependencyStatus · $dependencyPublisher · $dependencyArchitecture · $dependencyHashDisplay</p></div>
+  <code>$dependencyPath</code>
+</li>
+"@
+    }
+    if ([string]::IsNullOrWhiteSpace($dependencyRows)) {
+        $dependencyRows = @"
+<li class="dependency dependency--empty">
+  <div><strong>No acquired dependencies</strong><p>This run did not need to install or load an external update provider.</p></div>
+</li>
+"@
     }
 
     $biosDate = "Not reported"
@@ -4122,6 +5112,64 @@ function New-HTMLReport {
     border-color: rgba(82, 214, 167, 0.2);
   }
 
+  .dependencies {
+    grid-column: 1 / -1;
+  }
+
+  .dependency-list {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    gap: 10px;
+    margin: 0;
+    padding: 14px 18px 18px;
+    list-style: none;
+  }
+
+  .dependency {
+    min-width: 0;
+    padding: 13px 14px;
+    background: rgba(54, 197, 240, 0.045);
+    border: 1px solid rgba(54, 197, 240, 0.18);
+    border-radius: 9px;
+  }
+
+  .dependency strong,
+  .dependency p,
+  .dependency code {
+    display: block;
+    overflow-wrap: anywhere;
+  }
+
+  .dependency strong {
+    margin-bottom: 4px;
+    color: var(--text);
+    font-size: 13px;
+  }
+
+  .dependency strong span {
+    color: var(--cyan);
+    font-family: "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
+    font-size: 11px;
+  }
+
+  .dependency p {
+    margin: 0 0 7px;
+    color: var(--muted-strong);
+    font-size: 11px;
+    line-height: 1.55;
+  }
+
+  .dependency code {
+    color: var(--muted);
+    font-size: 10px;
+  }
+
+  .dependency--empty {
+    color: var(--muted);
+    background: transparent;
+    border-color: var(--line-soft);
+  }
+
   .run-details {
     grid-column: 1 / -1;
   }
@@ -4215,6 +5263,7 @@ function New-HTMLReport {
     .channels,
     .device-profile,
     .attention,
+    .dependencies,
     .run-details {
       grid-column: 1;
       grid-row: auto;
@@ -4577,6 +5626,17 @@ function New-HTMLReport {
       <ul class="notice-list">$noticeRows</ul>
     </section>
 
+    <section class="panel dependencies" aria-labelledby="dependencies-heading">
+      <div class="panel-heading">
+        <div>
+          <h2 id="dependencies-heading">Dependency provenance</h2>
+          <p>Version, publisher, digest, architecture, and installed location verified during this run</p>
+        </div>
+        <span class="section-count">$($dependencies.Count) verified</span>
+      </div>
+      <ul class="dependency-list">$dependencyRows</ul>
+    </section>
+
     <section class="panel run-details" aria-labelledby="details-heading">
       <div class="panel-heading">
         <div>
@@ -4666,6 +5726,7 @@ function Send-WebhookNotification {
         errors          = @($RunData.Errors)
         warnings        = @($RunData.Warnings)
         stages          = @($RunData.Stages)
+        dependencies    = @($RunData.Dependencies)
         runtime_seconds = $RunData.DurationSeconds
     }
 

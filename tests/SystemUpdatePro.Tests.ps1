@@ -20,6 +20,18 @@ BeforeAll {
         "Add-StageResult",
         "Get-RunExitCode",
         "New-RunData",
+        "Get-AcquisitionManifest",
+        "Get-AcquisitionManifestEntry",
+        "Get-SystemArchitecture",
+        "Test-AcquisitionUri",
+        "ConvertTo-SafeVersion",
+        "Test-VersionAtLeast",
+        "Get-AuthenticodeEvidence",
+        "Test-AcquiredFile",
+        "Invoke-VerifiedDownload",
+        "Add-AcquisitionProvenance",
+        "New-SystemUpdateProTemporaryDirectory",
+        "Remove-SystemUpdateProTemporaryDirectory",
         "ConvertTo-Hashtable",
         "Get-EffectiveRunParameter",
         "Get-ContinuationParameterName",
@@ -45,7 +57,21 @@ BeforeAll {
         "Test-FirmwareReadiness",
         "Get-FirmwareUpdatePolicy",
         "New-FirmwareReadinessItem",
+        "Get-DirectoryPayloadHash",
+        "Get-PSModuleInstallPath",
+        "Test-InstalledPSModule",
+        "Get-VerifiedPSModulePath",
+        "Install-VerifiedPSModule",
+        "Get-InstalledExecutableEvidence",
+        "Test-WingetPackageContractText",
+        "Test-DellWinGetPackageContract",
+        "Get-WingetTrustEvidence",
+        "Test-WingetInstalled",
+        "Install-Winget",
         "Get-DCUPath",
+        "Get-DellInventoryCollectorEvidence",
+        "Test-DellInventoryCollector",
+        "Update-DellInventoryCollector",
         "Install-DellCommandUpdate",
         "Repair-DellServices",
         "Invoke-DellUpdate",
@@ -114,6 +140,12 @@ BeforeAll {
         $script:ContinuationState = $null
         $script:ResumeStageCursor = ""
         $script:FirmwarePrerequisites = $null
+        $script:Version = "4.1.0"
+        $script:AcquisitionManifestVersion = 1
+        $script:AcquisitionManifest = Get-AcquisitionManifest
+        $script:AcquisitionProvenance = [System.Collections.ArrayList]::new()
+        $script:PSModuleInstallRoot = Join-Path $stateTestDirectory "Modules"
+        $script:HPIAInstallRoot = Join-Path $stateTestDirectory "HPIA"
 
         $script:SkipOEM = [switch]$false
         $script:SkipWindows = [switch]$false
@@ -227,6 +259,172 @@ Describe "Schema-versioned result contract" {
     }
 }
 
+Describe "Verified elevated dependency acquisition" {
+    BeforeEach {
+        Initialize-SystemUpdateProTestState
+    }
+
+    It "defines a complete manifest contract for every elevated dependency" {
+        $manifest = Get-AcquisitionManifest
+
+        @($manifest.Keys).Count | Should -Be 5
+        foreach ($name in @("WinGet", "PSWindowsUpdate", "LSUClient", "DellCommandUpdate", "HPIA")) {
+            $entry = $manifest[$name]
+            $entry.Uri | Should -Match "^https://"
+            (Test-AcquisitionUri -Uri $entry.Uri -AllowedHosts $entry.AllowedHosts) | Should -BeTrue
+            $entry.ExactVersion | Should -Not -BeNullOrEmpty
+            $entry.MinimumVersion | Should -Not -BeNullOrEmpty
+            @($entry.Architectures).Count | Should -BeGreaterThan 0
+            $entry.Sha256 | Should -Match "^[A-F0-9]{64}$"
+        }
+    }
+
+    It "pins remediated HP and Dell security floors" {
+        $manifest = Get-AcquisitionManifest
+
+        $manifest.HPIA.ExactVersion | Should -Be "5.3.6"
+        (Test-VersionAtLeast -Version $manifest.HPIA.ExactVersion `
+            -MinimumVersion $manifest.HPIA.MinimumVersion) | Should -BeTrue
+        $manifest.HPIA.MinimumVersion | Should -Be "5.3.3"
+        $manifest.DellCommandUpdate.ExactVersion | Should -Be "5.7.0"
+        $manifest.DellCommandUpdate.InventoryCollectorMinimum | Should -Be "13.8.0"
+    }
+
+    It "requires the Dell WinGet source to match the pinned URI, digest, and publisher" {
+        $spec = (Get-AcquisitionManifest).DellCommandUpdate
+        $matching = @"
+Publisher: Dell Inc.
+Installer Url: $($spec.Uri)
+Installer SHA256: $($spec.Sha256)
+"@
+
+        (Test-WingetPackageContractText -OutputText $matching -ExpectedUri $spec.Uri `
+            -ExpectedSha256 $spec.Sha256 -ExpectedPublisher $spec.PublisherDisplayName) | Should -BeTrue
+        (Test-WingetPackageContractText -OutputText ($matching -replace $spec.Sha256, ("0" * 64)) `
+            -ExpectedUri $spec.Uri -ExpectedSha256 $spec.Sha256 `
+            -ExpectedPublisher $spec.PublisherDisplayName) | Should -BeFalse
+    }
+
+    It "rejects non-HTTPS, credentialed, nonstandard-port, and unapproved origins" {
+        $allowed = @("downloads.example.test")
+
+        (Test-AcquisitionUri -Uri "https://downloads.example.test/file.exe" -AllowedHosts $allowed) | Should -BeTrue
+        (Test-AcquisitionUri -Uri "http://downloads.example.test/file.exe" -AllowedHosts $allowed) | Should -BeFalse
+        (Test-AcquisitionUri -Uri "https://user:pass@downloads.example.test/file.exe" -AllowedHosts $allowed) | Should -BeFalse
+        (Test-AcquisitionUri -Uri "https://downloads.example.test:8443/file.exe" -AllowedHosts $allowed) | Should -BeFalse
+        (Test-AcquisitionUri -Uri "https://redirect.example.test/file.exe" -AllowedHosts $allowed) | Should -BeFalse
+    }
+
+    It "rejects a tampered file before publisher verification" {
+        $path = Join-Path $TestDrive "tampered.bin"
+        Set-Content -LiteralPath $path -Value "tampered" -NoNewline
+        Mock Get-AuthenticodeEvidence {
+            [PSCustomObject]@{ Valid = $true; Subject = "CN=Approved"; Thumbprint = "ABC"; Reason = "" }
+        }
+
+        $result = Test-AcquiredFile -Path $path `
+            -ExpectedSha256 ("0" * 64) -PublisherPattern "^CN=Approved"
+
+        $result.Valid | Should -BeFalse
+        $result.Reason | Should -Match "SHA-256 mismatch"
+        Should -Invoke Get-AuthenticodeEvidence -Times 0 -Exactly
+    }
+
+    It "rejects a wrong publisher after a matching digest" {
+        $path = Join-Path $TestDrive "wrong-publisher.exe"
+        Set-Content -LiteralPath $path -Value "verified bytes" -NoNewline
+        $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
+        Mock Get-AuthenticodeEvidence {
+            [PSCustomObject]@{
+                Valid = $false; Subject = "CN=Unexpected Corp"; Thumbprint = "BAD"
+                Reason = "Signer does not match the approved publisher"
+            }
+        }
+
+        $result = Test-AcquiredFile -Path $path -ExpectedSha256 $hash `
+            -PublisherPattern "^CN=Approved Corp,"
+
+        $result.Valid | Should -BeFalse
+        $result.Reason | Should -Match "approved publisher"
+    }
+
+    It "rejects an executable below its approved minimum version" {
+        Mock Test-Path { $true }
+        Mock Get-Item {
+            [PSCustomObject]@{
+                VersionInfo = [PSCustomObject]@{ ProductVersion = "13.7.9"; FileVersion = "13.7.9" }
+            }
+        }
+
+        $result = Get-InstalledExecutableEvidence -Path "C:\unsafe\invcol.exe" `
+            -MinimumVersion "13.8.0" -PublisherPattern "^CN=Dell Inc\.,"
+
+        $result.Valid | Should -BeFalse
+        $result.Reason | Should -Match "below the approved minimum"
+    }
+
+    It "rejects a changed installed module payload" {
+        $modulePath = Get-PSModuleInstallPath -ModuleName "LSUClient" -Version "1.8.1"
+        New-Item -ItemType Directory -Path $modulePath -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $modulePath "LSUClient.psd1") -Value @"
+@{
+    RootModule = 'LSUClient.psm1'
+    ModuleVersion = '1.8.1'
+}
+"@
+        Set-Content -LiteralPath (Join-Path $modulePath "LSUClient.psm1") -Value "# changed payload"
+
+        $result = Test-InstalledPSModule -ModuleName "LSUClient"
+
+        $result.Valid | Should -BeFalse
+        $result.Reason | Should -Match "payload hash"
+    }
+
+    It "never changes PowerShell Gallery trust or skips publisher checks" {
+        $source = Get-Content -LiteralPath $script:SourceScriptPath -Raw
+
+        $source | Should -Not -Match "Set-PSRepository"
+        $source | Should -Not -Match "SkipPublisherCheck"
+        $source | Should -Not -Match "(?m)^\s*Install-Module\b"
+    }
+
+    It "carries verified dependency provenance into terminal run data" {
+        [void](Add-AcquisitionProvenance -Name "LSUClient" -Version "1.8.1" `
+            -SourceUri "https://www.powershellgallery.com/api/v2/package/LSUClient/1.8.1" `
+            -Sha256 ("A" * 64) -Architecture "neutral" -InstallPath "C:\Modules\LSUClient\1.8.1" `
+            -Status "Installed")
+
+        $run = New-RunData -StartedAt (Get-Date).AddSeconds(-1)
+
+        $run.Dependencies.Count | Should -Be 1
+        $run.Dependencies[0].Name | Should -Be "LSUClient"
+        $run.Dependencies[0].ManifestVersion | Should -Be 1
+    }
+
+    It "renders installed provenance in the operator report" {
+        $script:LogFile = Join-Path $TestDrive "run.log"
+        Mock Start-Process {}
+        [void](Add-AcquisitionProvenance -Name "HP Image Assistant" -Version "5.3.6.649" `
+            -SourceUri "https://hpia.hpcloud.hp.com/downloads/hpia/hp-hpia-5.3.6.exe" `
+            -Sha256 ("B" * 64) -Publisher "CN=HP Inc." -Architecture "x64" `
+            -InstallPath "C:\ProgramData\SystemUpdatePro\HPIA\HPImageAssistant.exe")
+        $run = New-RunData -StartedAt (Get-Date).AddSeconds(-1)
+        $system = @{
+            Manufacturer = "HP"; Model = "EliteBook"; SerialNumber = "123"
+            OSName = "Windows"; OSBuild = "1"; BIOSVersion = "1"; BIOSDate = Get-Date
+            Processor = "CPU"; TotalRAM = 16
+        }
+
+        $reportPath = New-HTMLReport -SysInfo $system -RunData $run
+        $report = Get-Content -LiteralPath $reportPath -Raw
+
+        $report | Should -Match "Dependency provenance"
+        $report | Should -Match "HP Image Assistant"
+        $report | Should -Match "5\.3\.6\.649"
+        $report | Should -Match "C:\\ProgramData\\SystemUpdatePro\\HPIA"
+    }
+}
+
 Describe "PowerShell 5.1 continuation state machine" {
     BeforeEach {
         Initialize-SystemUpdateProTestState
@@ -242,6 +440,9 @@ Describe "PowerShell 5.1 continuation state machine" {
         $script:IncludeBIOS = [switch]$true
         $script:WebhookUrl = "https://example.invalid/private-hook"
         [void]$script:StageResults.Add((New-StageResult -Name "OEM" -Status "Succeeded" -Attempted 1 -Installed 1))
+        [void](Add-AcquisitionProvenance -Name "LSUClient" -Version "1.8.1" `
+            -SourceUri "https://www.powershellgallery.com/api/v2/package/LSUClient/1.8.1" `
+            -Sha256 ("A" * 64) -Architecture "neutral" -InstallPath "C:\Modules\LSUClient\1.8.1")
         $state = New-ContinuationState -StageCursor "WindowsUpdate" -ScriptPath $script:SourceScriptPath
 
         $firstSave = Save-State -State $state
@@ -255,6 +456,8 @@ Describe "PowerShell 5.1 continuation state machine" {
         $loaded.Phase | Should -Be "AwaitingReboot"
         $loaded.RunId | Should -Be "11111111-1111-1111-1111-111111111111"
         $loaded.Parameters.Count | Should -Be 22
+        $loaded.AcquisitionProvenance.Count | Should -Be 1
+        $loaded.AcquisitionProvenance[0].Name | Should -Be "LSUClient"
         $loaded.Parameters.SkipOEM | Should -BeTrue
         $loaded.Parameters.IncludeBIOS | Should -BeTrue
         $loaded.Parameters.WebhookUrl | Should -Be "https://example.invalid/private-hook"
@@ -576,6 +779,7 @@ Describe "Fail-closed firmware safety" {
             BitLocker = $script:ReadyFirmwarePrerequisites.BitLocker
         }
         Mock Get-DCUPath { "C:\Program Files\Dell\CommandUpdate\dcu-cli.exe" }
+        Mock Test-DellInventoryCollector { $true }
         Mock Repair-DellServices { $true }
         Mock Get-Service { @() }
         Mock Start-Process { [PSCustomObject]@{ ExitCode = 0 } }
@@ -600,7 +804,7 @@ Describe "Fail-closed firmware safety" {
             BitLocker = $script:ReadyFirmwarePrerequisites.BitLocker
         }
         Mock Install-PSModuleWithRetry { $true }
-        Mock Get-Module { [PSCustomObject]@{ Name = "LSUClient"; Version = [Version]"1.8.1" } }
+        Mock Get-VerifiedPSModulePath { "C:\Program Files\WindowsPowerShell\Modules\LSUClient\1.8.1\LSUClient.psd1" }
         Mock Import-Module {}
         Mock Remove-Item {}
         Mock Get-LSUpdate {
