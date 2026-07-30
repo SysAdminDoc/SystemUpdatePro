@@ -43,6 +43,8 @@
     Force Windows Update component repair before updating
 .PARAMETER CleanupAfter
     Run DISM component cleanup after updates to reclaim space
+.PARAMETER ResetComponentBase
+    Irreversibly remove superseded component versions; installed updates can no longer be uninstalled
 .PARAMETER ContinueAfterReboot
     Create scheduled task to continue updates after reboot
 .PARAMETER DryRun
@@ -119,6 +121,7 @@ param(
     [switch]$BypassWSUS,
     [switch]$RepairWindowsUpdate,
     [switch]$CleanupAfter,
+    [switch]$ResetComponentBase,
     [switch]$ContinueAfterReboot,
     [switch]$DryRun,
     [switch]$BackupDrivers,
@@ -142,7 +145,7 @@ $script:Version = "4.1.0"
 $script:ProductName = "SystemUpdatePro"
 $script:EventLogSource = "SystemUpdatePro"
 $script:ResultSchemaVersion = 1
-$script:StateSchemaVersion = 1
+$script:StateSchemaVersion = 2
 $script:MaxContinuationAttempts = 3
 $script:RunId = [guid]::NewGuid().ToString()
 $script:RunStartedAt = Get-Date
@@ -442,6 +445,7 @@ function ConvertTo-StageResult {
     $installed = [int](Get-ResultValue -Result $Result -Names @("TotalInstalled", "Installed", "UpdateCount") -Default 0)
     $failed = [int](Get-ResultValue -Result $Result -Names @("TotalFailed", "Failed") -Default 0)
     $skipped = [int](Get-ResultValue -Result $Result -Names @("Skipped") -Default 0)
+    $reportedStatus = [string](Get-ResultValue -Result $Result -Names @("Status") -Default "")
     $attempted = [int](Get-ResultValue -Result $Result -Names @("Attempted", "TotalAttempted") -Default 0)
     $available = [int](Get-ResultValue -Result $Result -Names @("Available") -Default 0)
     $message = [string](Get-ResultValue -Result $Result -Names @("Message") -Default "")
@@ -489,7 +493,9 @@ function ConvertTo-StageResult {
         $failed = 1
     }
 
-    $status = if (-not $success) {
+    $status = if ($reportedStatus -in @("Succeeded", "Partial", "Failed", "Skipped")) {
+        $reportedStatus
+    } elseif (-not $success) {
         if ($installed -gt 0) { "Partial" } else { "Failed" }
     } elseif ($failed -gt 0) {
         if ($installed -gt 0) { "Partial" } else { "Failed" }
@@ -664,6 +670,7 @@ function Get-EffectiveRunParameter {
         BypassWSUS         = $BypassWSUS.IsPresent
         RepairWindowsUpdate = $RepairWindowsUpdate.IsPresent
         CleanupAfter       = $CleanupAfter.IsPresent
+        ResetComponentBase = $ResetComponentBase.IsPresent
         ContinueAfterReboot = $ContinueAfterReboot.IsPresent
         DryRun             = $DryRun.IsPresent
         BackupDrivers      = $BackupDrivers.IsPresent
@@ -683,7 +690,7 @@ function Get-EffectiveRunParameter {
 function Get-ContinuationParameterName {
     return @(
         "SkipOEM", "SkipWindows", "SkipWinget", "IncludeBIOS", "BypassWSUS",
-        "RepairWindowsUpdate", "CleanupAfter", "ContinueAfterReboot", "DryRun",
+        "RepairWindowsUpdate", "CleanupAfter", "ResetComponentBase", "ContinueAfterReboot", "DryRun",
         "BackupDrivers", "ShowHistory", "WebhookUrl", "HistoryCount", "MaxRetries",
         "MaxUpdatePasses", "MinDiskSpaceGB", "LogPath", "LogRetentionDays", "Reboot", "Force"
     )
@@ -944,7 +951,7 @@ function Import-ContinuationState {
 
     $switchNames = @(
         "SkipOEM", "SkipWindows", "SkipWinget", "IncludeBIOS", "BypassWSUS",
-        "RepairWindowsUpdate", "CleanupAfter", "ContinueAfterReboot", "DryRun",
+        "RepairWindowsUpdate", "CleanupAfter", "ResetComponentBase", "ContinueAfterReboot", "DryRun",
         "BackupDrivers", "ShowHistory", "Reboot", "Force"
     )
     $integerNames = @(
@@ -1098,6 +1105,7 @@ function Save-UpdateHistory {
                 IncludeBIOS       = $IncludeBIOS.IsPresent
                 BackupDrivers     = $BackupDrivers.IsPresent
                 CleanupAfter      = $CleanupAfter.IsPresent
+                ResetComponentBase = $ResetComponentBase.IsPresent
                 ContinueAfterReboot = $ContinueAfterReboot.IsPresent
             }
         }
@@ -1673,54 +1681,177 @@ function Unregister-ContinuationTask {
 # CLEANUP
 # ============================================================================
 
-function Invoke-ComponentCleanup {
-    Write-Log "Running DISM component cleanup..." "STEP"
+function Get-RegistryValueSnapshot {
+    param(
+        [string]$Path,
+        [string]$Name
+    )
 
-    if ($DryRun) {
-        Write-Log "Would run DISM /Online /Cleanup-Image /StartComponentCleanup /ResetBase" "INFO"
-        Write-Log "Would run Disk Cleanup for update files and temp files" "INFO"
-        return $true
+    $key = Get-Item -LiteralPath $Path -ErrorAction Stop
+    $valueNames = @($key.GetValueNames())
+    $exists = $valueNames -contains $Name
+    return [ordered]@{
+        Path   = $Path
+        Name   = $Name
+        Exists = $exists
+        Value  = $(if ($exists) { $key.GetValue($Name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) } else { $null })
+        Kind   = $(if ($exists) { $key.GetValueKind($Name).ToString() } else { "" })
     }
+}
+
+function Restore-RegistryValueSnapshot {
+    param([System.Collections.IDictionary]$Snapshot)
 
     try {
-        $dismArgs = "/Online /Cleanup-Image /StartComponentCleanup /ResetBase"
-        $process = Start-Process -FilePath "dism.exe" -ArgumentList $dismArgs -Wait -NoNewWindow -PassThru
-
-        if ($process.ExitCode -eq 0) {
-            Write-Log "Component cleanup completed" "SUCCESS"
-
-            # Also run disk cleanup for update files
-            Write-Log "Cleaning Windows Update files..." "DEBUG"
-
-            # Set StateFlags for cleanup
-            $volCachePath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\VolumeCaches"
-            $cleanupItems = @(
-                "Update Cleanup",
-                "Windows Update Cleanup",
-                "Temporary Files",
-                "System error memory dump files",
-                "Delivery Optimization Files"
-            )
-
-            foreach ($item in $cleanupItems) {
-                $itemPath = Join-Path $volCachePath $item
-                if (Test-Path $itemPath) {
-                    Set-ItemProperty -Path $itemPath -Name StateFlags0100 -Value 2 -Type DWord -ErrorAction SilentlyContinue
-                }
-            }
-
-            # Run cleanmgr
-            Start-Process -FilePath "cleanmgr.exe" -ArgumentList "/sagerun:100" -Wait -NoNewWindow -ErrorAction SilentlyContinue
-
-            return $true
+        if ([bool]$Snapshot.Exists) {
+            New-ItemProperty -LiteralPath $Snapshot.Path -Name $Snapshot.Name -Value $Snapshot.Value `
+                -PropertyType $Snapshot.Kind -Force -ErrorAction Stop | Out-Null
         } else {
-            Write-Log "DISM cleanup returned code: $($process.ExitCode)" "WARNING"
+            Remove-ItemProperty -LiteralPath $Snapshot.Path -Name $Snapshot.Name -Force -ErrorAction SilentlyContinue
+        }
+
+        $restored = Get-RegistryValueSnapshot -Path $Snapshot.Path -Name $Snapshot.Name
+        if ([bool]$restored.Exists -ne [bool]$Snapshot.Exists) { return $false }
+        if ($Snapshot.Exists -and
+            ([string]$restored.Kind -ne [string]$Snapshot.Kind -or [string]$restored.Value -ne [string]$Snapshot.Value)) {
             return $false
         }
+        return $true
     } catch {
-        Write-Log "Cleanup error: $($_.Exception.Message)" "WARNING"
         return $false
     }
+}
+
+function Invoke-ComponentCleanup {
+    $dismArguments = "/Online /Cleanup-Image /StartComponentCleanup"
+    $rollbackImpact = "Installed update uninstallability is retained"
+    if ($ResetComponentBase) {
+        $dismArguments += " /ResetBase"
+        $rollbackImpact = "IRREVERSIBLE: installed Windows updates can no longer be uninstalled"
+    }
+
+    $result = @{
+        Success = $false; Status = "Failed"; RebootRequired = $false
+        Attempted = 0; Installed = 0; Failed = 0; Skipped = 0
+        ExitCode = $null; HResult = $null; Items = @()
+        Evidence = @("dism.exe $dismArguments", "cleanmgr.exe /sagerun:100")
+        ResetBase = $ResetComponentBase.IsPresent; RollbackImpact = $rollbackImpact; Message = ""
+    }
+
+    Write-Log "Running DISM component cleanup..." "STEP"
+    if ($ResetComponentBase) {
+        Write-Log $rollbackImpact "WARNING"
+    } else {
+        Write-Log $rollbackImpact "INFO"
+    }
+
+    if ($DryRun) {
+        Write-Log "Would run DISM $dismArguments" "INFO"
+        Write-Log "Would run Disk Cleanup and restore all temporary StateFlags0100 values" "INFO"
+        $result.Success = $true
+        $result.Status = "Succeeded"
+        $result.Skipped = 2
+        $result.Message = "Cleanup plan only; $rollbackImpact"
+        $result.Items = @(
+            (New-UpdateItemResult -Name "DISM component cleanup" -Status "Skipped" -Message $dismArguments),
+            (New-UpdateItemResult -Name "Disk Cleanup" -Status "Skipped" -Message "StateFlags0100 values would be restored")
+        )
+        return $result
+    }
+
+    $dismSucceeded = $false
+    try {
+        $result.Attempted++
+        $process = Start-Process -FilePath "dism.exe" -ArgumentList $dismArguments -Wait -NoNewWindow -PassThru -ErrorAction Stop
+        $result.ExitCode = $process.ExitCode
+        if ($process.ExitCode -ne 0) {
+            $result.Failed++
+            $result.Items += New-UpdateItemResult -Name "DISM component cleanup" -Status "Failed" `
+                -ProviderCode $process.ExitCode -Message $rollbackImpact -Evidence @("dism.exe $dismArguments")
+            $result.Message = "DISM cleanup returned code $($process.ExitCode); $rollbackImpact"
+            Write-Log $result.Message "WARNING"
+            return $result
+        }
+
+        $dismSucceeded = $true
+        $result.Items += New-UpdateItemResult -Name "DISM component cleanup" -Status "Succeeded" `
+            -ProviderCode $process.ExitCode -Message $rollbackImpact -Evidence @("dism.exe $dismArguments")
+        Write-Log "Component cleanup completed; $rollbackImpact" "SUCCESS"
+    } catch {
+        $result.Failed++
+        $result.HResult = $_.Exception.HResult
+        $result.Items += New-UpdateItemResult -Name "DISM component cleanup" -Status "Failed" `
+            -HResult $_.Exception.HResult -Message $_.Exception.Message -Evidence @("dism.exe $dismArguments")
+        $result.Message = "DISM cleanup error: $($_.Exception.Message)"
+        Write-Log $result.Message "WARNING"
+        return $result
+    }
+
+    $volCachePath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\VolumeCaches"
+    $cleanupItems = @(
+        "Update Cleanup",
+        "Windows Update Cleanup",
+        "Temporary Files",
+        "System error memory dump files",
+        "Delivery Optimization Files"
+    )
+    $snapshots = [System.Collections.ArrayList]::new()
+    $flagFailures = [System.Collections.ArrayList]::new()
+    $cleanMgrSucceeded = $false
+
+    try {
+        foreach ($item in $cleanupItems) {
+            $itemPath = Join-Path $volCachePath $item
+            if (-not (Test-Path -LiteralPath $itemPath)) { continue }
+
+            try {
+                $snapshot = Get-RegistryValueSnapshot -Path $itemPath -Name "StateFlags0100"
+                [void]$snapshots.Add($snapshot)
+                New-ItemProperty -LiteralPath $itemPath -Name "StateFlags0100" -Value 2 `
+                    -PropertyType DWord -Force -ErrorAction Stop | Out-Null
+            } catch {
+                [void]$flagFailures.Add("$item`: $($_.Exception.Message)")
+            }
+        }
+
+        $result.Attempted++
+        $cleanMgr = Start-Process -FilePath "cleanmgr.exe" -ArgumentList "/sagerun:100" `
+            -Wait -NoNewWindow -PassThru -ErrorAction Stop
+        if ($cleanMgr.ExitCode -eq 0) {
+            $cleanMgrSucceeded = $true
+        } else {
+            $result.ExitCode = $cleanMgr.ExitCode
+            [void]$flagFailures.Add("cleanmgr exit code $($cleanMgr.ExitCode)")
+        }
+    } catch {
+        $result.HResult = $_.Exception.HResult
+        [void]$flagFailures.Add($_.Exception.Message)
+    } finally {
+        foreach ($snapshot in @($snapshots)) {
+            if (-not (Restore-RegistryValueSnapshot -Snapshot $snapshot)) {
+                [void]$flagFailures.Add("Could not restore $($snapshot.Path)\$($snapshot.Name)")
+            }
+        }
+    }
+
+    if ($cleanMgrSucceeded -and $flagFailures.Count -eq 0) {
+        $result.Success = $true
+        $result.Status = "Succeeded"
+        $result.Items += New-UpdateItemResult -Name "Disk Cleanup" -Status "Succeeded" `
+            -ProviderCode 0 -Message "Temporary registry flags restored" -Evidence @("cleanmgr.exe /sagerun:100")
+        $result.Message = "Component and disk cleanup completed; $rollbackImpact"
+    } else {
+        $result.Failed += [math]::Max(1, $flagFailures.Count)
+        $result.Status = $(if ($dismSucceeded) { "Partial" } else { "Failed" })
+        $failureMessage = if ($flagFailures.Count) { $flagFailures -join "; " } else { "Disk Cleanup failed" }
+        $result.Items += New-UpdateItemResult -Name "Disk Cleanup" -Status "Failed" `
+            -ProviderCode $result.ExitCode -HResult $result.HResult -Message $failureMessage `
+            -Evidence @("cleanmgr.exe /sagerun:100")
+        $result.Message = "Component cleanup completed with Disk Cleanup failures: $failureMessage; $rollbackImpact"
+        Write-Log $result.Message "WARNING"
+    }
+
+    return $result
 }
 
 # ============================================================================
@@ -2713,6 +2844,13 @@ function New-HTMLReport {
     $summaryVerb = if ($DryRun) { "identified" } else { "processed" }
     $rebootLabel = if ($RunData.RebootRequired) { "Required" } else { "Not required" }
     $rebootClass = if ($RunData.RebootRequired) { "metric--reboot" } else { "metric--clear" }
+    $componentRollbackDisplay = & $encode $(if ($ResetComponentBase) {
+        "Disabled by irreversible /ResetBase"
+    } elseif ($CleanupAfter) {
+        "Retained after standard cleanup"
+    } else {
+        "Not changed"
+    })
 
     $getChannelState = {
         param(
@@ -3922,6 +4060,7 @@ function New-HTMLReport {
         <div class="detail-item"><dt>Exit code</dt><dd>$exitCode</dd></div>
         <div class="detail-item"><dt>Duration</dt><dd>$durationDisplay · $durationSeconds seconds</dd></div>
         <div class="detail-item"><dt>Reboot</dt><dd>$rebootLabel</dd></div>
+        <div class="detail-item"><dt>Component rollback</dt><dd>$componentRollbackDisplay</dd></div>
       </dl>
       <div class="log-path"><span>Log file</span><code>$logFileDisplay</code></div>
     </section>
@@ -4469,13 +4608,13 @@ try {
 
         if (Test-ShouldRunContinuationStage -Stage "Cleanup") {
             $cleanupStart = Get-Date
-            if ($CleanupAfter) {
-                $cleanupSucceeded = [bool](Invoke-ComponentCleanup)
+            if ($CleanupAfter -or $ResetComponentBase) {
+                $cleanupResult = Invoke-ComponentCleanup
                 $cleanupStage = ConvertTo-StageResult -Name "Cleanup" -Provider "DISM and cleanmgr" `
-                    -Result @{ Success = $cleanupSucceeded; Message = $(if ($cleanupSucceeded) { "Component cleanup completed" } else { "Component cleanup failed" }) } `
+                    -Result $cleanupResult `
                     -StartedAt $cleanupStart
                 [void](Add-StageResult $cleanupStage)
-                if ($cleanupStage.Status -eq "Failed") { $script:ExitCode = 2 }
+                if ($cleanupStage.Status -in @("Failed", "Partial")) { $script:ExitCode = 2 }
                 Write-Host ""
             } else {
                 [void](Add-StageResult (New-StageResult -Name "Cleanup" -Provider "DISM and cleanmgr" `

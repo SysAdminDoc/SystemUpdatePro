@@ -37,6 +37,9 @@ BeforeAll {
         "Register-ContinuationTask",
         "Test-ContinuationTask",
         "Unregister-ContinuationTask",
+        "Get-RegistryValueSnapshot",
+        "Restore-RegistryValueSnapshot",
+        "Invoke-ComponentCleanup",
         "Invoke-WindowsUpdate",
         "New-HTMLReport",
         "Initialize-EventLog",
@@ -72,7 +75,7 @@ BeforeAll {
         $script:RunFinalized = $false
         $script:LastEvidenceDelivery = $null
         $script:WindowsUpdates = [System.Collections.ArrayList]::new()
-        $script:StateSchemaVersion = 1
+        $script:StateSchemaVersion = 2
         $script:MaxContinuationAttempts = 3
         $script:RunStartedAt = Get-Date
         $stateTestDirectory = Join-Path $TestDrive ([guid]::NewGuid().ToString("N"))
@@ -94,6 +97,7 @@ BeforeAll {
         $script:BypassWSUS = [switch]$false
         $script:RepairWindowsUpdate = [switch]$false
         $script:CleanupAfter = [switch]$false
+        $script:ResetComponentBase = [switch]$false
         $script:ContinueAfterReboot = [switch]$true
         $script:BackupDrivers = [switch]$false
         $script:ShowHistory = [switch]$false
@@ -221,10 +225,10 @@ Describe "PowerShell 5.1 continuation state machine" {
         if (-not $secondSave) { throw "Second atomic save failed: $script:LastStateError" }
         $loaded = Get-State
 
-        $loaded.SchemaVersion | Should -Be 1
+        $loaded.SchemaVersion | Should -Be 2
         $loaded.Phase | Should -Be "AwaitingReboot"
         $loaded.RunId | Should -Be "11111111-1111-1111-1111-111111111111"
-        $loaded.Parameters.Count | Should -Be 20
+        $loaded.Parameters.Count | Should -Be 21
         $loaded.Parameters.SkipOEM | Should -BeTrue
         $loaded.Parameters.IncludeBIOS | Should -BeTrue
         $loaded.Parameters.WebhookUrl | Should -Be "https://example.invalid/private-hook"
@@ -242,6 +246,7 @@ Describe "PowerShell 5.1 continuation state machine" {
         $script:BypassWSUS = [switch]$true
         $script:RepairWindowsUpdate = [switch]$true
         $script:CleanupAfter = [switch]$true
+        $script:ResetComponentBase = [switch]$true
         $script:BackupDrivers = [switch]$true
         $script:Force = [switch]$true
         $script:WebhookUrl = "https://example.invalid/hook"
@@ -270,6 +275,7 @@ Describe "PowerShell 5.1 continuation state machine" {
         $script:BypassWSUS.IsPresent | Should -BeTrue
         $script:RepairWindowsUpdate.IsPresent | Should -BeTrue
         $script:CleanupAfter.IsPresent | Should -BeTrue
+        $script:ResetComponentBase.IsPresent | Should -BeTrue
         $script:BackupDrivers.IsPresent | Should -BeTrue
         $script:Force.IsPresent | Should -BeTrue
         $script:WebhookUrl | Should -Be "https://example.invalid/hook"
@@ -369,6 +375,103 @@ Describe "PowerShell 5.1 continuation state machine" {
 
         Test-Path -LiteralPath $script:StateFile | Should -BeFalse
         Should -Invoke Unregister-ScheduledTask -Times 1 -Exactly
+    }
+}
+
+Describe "Explicit component cleanup safety" {
+    BeforeEach {
+        Initialize-SystemUpdateProTestState
+        Mock Write-Log {}
+    }
+
+    It "retains update uninstallability during normal cleanup" {
+        $script:DryRun = [switch]$true
+        $script:CleanupAfter = [switch]$true
+
+        $result = Invoke-ComponentCleanup
+
+        $result.Success | Should -BeTrue
+        $result.Status | Should -Be "Succeeded"
+        $result.ResetBase | Should -BeFalse
+        $result.RollbackImpact | Should -Match "retained"
+        $result.Evidence[0] | Should -Not -Match "/ResetBase"
+        $result.Items.Count | Should -Be 2
+    }
+
+    It "uses ResetBase only after the explicit high-risk switch" {
+        $script:DryRun = [switch]$true
+        $script:ResetComponentBase = [switch]$true
+
+        $result = Invoke-ComponentCleanup
+
+        $result.Success | Should -BeTrue
+        $result.ResetBase | Should -BeTrue
+        $result.RollbackImpact | Should -Match "IRREVERSIBLE"
+        $result.Evidence[0] | Should -Match "/ResetBase"
+        Should -Invoke Write-Log -ParameterFilter { $Level -eq "WARNING" -and $Message -match "IRREVERSIBLE" }
+    }
+
+    It "restores every temporary cleanmgr registry flag" {
+        Mock Start-Process { [PSCustomObject]@{ ExitCode = 0 } }
+        Mock Test-Path { $true }
+        Mock Get-RegistryValueSnapshot {
+            [ordered]@{ Path = $Path; Name = $Name; Exists = $true; Value = 7; Kind = "DWord" }
+        }
+        Mock New-ItemProperty {}
+        Mock Restore-RegistryValueSnapshot { $true }
+
+        $result = Invoke-ComponentCleanup
+
+        $result.Success | Should -BeTrue
+        $result.Status | Should -Be "Succeeded"
+        Should -Invoke Restore-RegistryValueSnapshot -Times 5 -Exactly
+        Should -Invoke New-ItemProperty -Times 5 -Exactly -ParameterFilter {
+            $Name -eq "StateFlags0100" -and $Value -eq 2
+        }
+    }
+
+    It "reports Disk Cleanup or restoration faults as partial success" {
+        Mock Start-Process {
+            if ($FilePath -eq "dism.exe") { return [PSCustomObject]@{ ExitCode = 0 } }
+            return [PSCustomObject]@{ ExitCode = 5 }
+        }
+        Mock Test-Path { $true }
+        Mock Get-RegistryValueSnapshot {
+            [ordered]@{ Path = $Path; Name = $Name; Exists = $false; Value = $null; Kind = "" }
+        }
+        Mock New-ItemProperty {}
+        Mock Restore-RegistryValueSnapshot { $false }
+
+        $result = Invoke-ComponentCleanup
+        $stage = ConvertTo-StageResult -Name "Cleanup" -Provider "DISM and cleanmgr" -Result $result
+
+        $result.Success | Should -BeFalse
+        $result.Status | Should -Be "Partial"
+        $stage.Status | Should -Be "Partial"
+        $stage.Failed | Should -BeGreaterThan 0
+        $stage.Message | Should -Match "failures"
+        Should -Invoke Restore-RegistryValueSnapshot -Times 5 -Exactly
+    }
+
+    It "states irreversible rollback impact in the HTML report" {
+        $script:ResetComponentBase = [switch]$true
+        $script:LogFile = Join-Path $TestDrive "run.log"
+        Mock Start-Process {}
+        $run = @{
+            ExitCode = 0; DurationSeconds = 5; OEMUpdates = 0; WindowsUpdates = 0; WingetUpdates = 0
+            RebootRequired = $false; Errors = @(); Warnings = @(); TotalInstalled = 0
+        }
+        $system = @{
+            Manufacturer = "Test"; Model = "Device"; SerialNumber = "123"
+            OSName = "Windows"; OSBuild = "1"; BIOSVersion = "1"; BIOSDate = Get-Date
+            Processor = "CPU"; TotalRAM = 16
+        }
+
+        $reportPath = New-HTMLReport -SysInfo $system -RunData $run
+        $report = Get-Content -LiteralPath $reportPath -Raw
+
+        $report | Should -Match "Component rollback"
+        $report | Should -Match "Disabled by irreversible /ResetBase"
     }
 }
 

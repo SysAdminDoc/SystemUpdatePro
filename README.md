@@ -145,6 +145,9 @@ cd SystemUpdatePro
 # Repair broken Windows Update then run updates
 .\SystemUpdatePro.ps1 -RepairWindowsUpdate -BypassWSUS
 
+# Irreversibly remove superseded component versions (prevents update uninstall)
+.\SystemUpdatePro.ps1 -ResetComponentBase
+
 # Force run despite warnings (low disk, pending reboot, battery)
 .\SystemUpdatePro.ps1 -Force -IncludeBIOS
 
@@ -167,7 +170,8 @@ cd SystemUpdatePro
 | `-IncludeBIOS` | Switch | False | Include BIOS updates (requires AC power) |
 | `-BypassWSUS` | Switch | False | Bypass WSUS, connect directly to Microsoft |
 | `-RepairWindowsUpdate` | Switch | False | Repair Windows Update components before updating |
-| `-CleanupAfter` | Switch | False | Run DISM component cleanup after updates |
+| `-CleanupAfter` | Switch | False | Run standard DISM cleanup while retaining installed-update rollback |
+| `-ResetComponentBase` | Switch | False | Run irreversible `/ResetBase`; installed Windows updates can no longer be uninstalled |
 | `-ContinueAfterReboot` | Switch | False | Resume update stages after reboot with the original run settings (maximum 3 attempts) |
 | `-DryRun` | Switch | False | Preview updates without installing |
 | `-BackupDrivers` | Switch | False | Export current drivers before updating |
@@ -181,6 +185,8 @@ cd SystemUpdatePro
 | `-LogRetentionDays` | Int | 30 | Days to keep old logs |
 | `-Reboot` | Switch | False | Allow automatic reboot if required |
 | `-Force` | Switch | False | Continue despite warnings |
+
+`-CleanupAfter` never uses `/ResetBase`. The separate `-ResetComponentBase` switch is intentionally high risk and also requests cleanup, so it does not need to be combined with `-CleanupAfter`. Use `-DryRun -ResetComponentBase` to preview the exact DISM command and rollback impact. Temporary Disk Cleanup `StateFlags0100` registry values are restored after each run, and restoration or `cleanmgr` failures are reported as partial cleanup.
 
 ---
 
@@ -397,8 +403,9 @@ Register-ScheduledTask -TaskName "SystemUpdatePro Weekly" -Action $action -Trigg
 |     +-- Install Winget if missing (Win10 compatible)         |
 |     +-- winget upgrade --all                                 |
 |                                                              |
-|  7. CLEANUP (if -CleanupAfter)                               |
-|     +-- DISM /StartComponentCleanup /ResetBase               |
+|  7. CLEANUP (if cleanup requested)                           |
+|     +-- DISM component cleanup (rollback retained by default) |
+|     +-- Optional explicit /ResetBase (irreversible)           |
 |     +-- Disk Cleanup (update files, temp files)              |
 |                                                              |
 |  8. FINALIZATION                                             |
