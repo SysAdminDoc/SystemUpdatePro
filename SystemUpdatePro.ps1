@@ -9,8 +9,7 @@
     - Windows Update with automatic service repair
     - Winget upgrade all (auto-installs winget on Windows 10)
     - Self-healing: repairs corrupted Windows Update components
-    - BitLocker-aware BIOS handling
-    - Battery safety: blocks BIOS updates on battery power
+    - Fail-closed firmware gating for OEM/model, tool, disk, AC/charge, and BitLocker readiness
     - Disk space verification before updates
     - Post-reboot continuation via scheduled task
     - Event Log integration for RMM visibility
@@ -36,7 +35,7 @@
 .PARAMETER SkipWinget
     Skip Winget upgrade all
 .PARAMETER IncludeBIOS
-    Include BIOS updates (requires AC power, handles BitLocker)
+    Include BIOS and firmware updates only after every safety prerequisite is known-ready
 .PARAMETER BypassWSUS
     Bypass WSUS and connect directly to Microsoft Update
 .PARAMETER RepairWindowsUpdate
@@ -63,6 +62,8 @@
     Maximum Windows Update passes (default: 3)
 .PARAMETER MinDiskSpaceGB
     Minimum free disk space required in GB (default: 10)
+.PARAMETER MinFirmwareChargePercent
+    Minimum battery charge required for firmware updates (default: 50)
 .PARAMETER LogPath
     Custom log directory (default: C:\ProgramData\SystemUpdatePro\Logs)
 .PARAMETER LogRetentionDays
@@ -70,7 +71,7 @@
 .PARAMETER Reboot
     Allow automatic reboot if required
 .PARAMETER Force
-    Continue despite warnings (pending reboot, low disk, battery)
+    Continue despite non-firmware warnings (pending reboot, low disk); never overrides unknown firmware safety state
 .EXAMPLE
     .\SystemUpdatePro.ps1
     # Standard update: OEM + Windows + Winget
@@ -107,7 +108,7 @@
         4 = Insufficient disk space
         5 = Pending reboot blocked execution
         6 = Already running (lock file exists)
-        7 = Battery power (BIOS update blocked)
+        7 = Firmware safety prerequisites blocked
 #>
 
 #Requires -Version 5.1
@@ -131,6 +132,8 @@ param(
     [int]$MaxRetries = 3,
     [int]$MaxUpdatePasses = 3,
     [int]$MinDiskSpaceGB = 10,
+    [ValidateRange(10, 100)]
+    [int]$MinFirmwareChargePercent = 50,
     [string]$LogPath = "C:\ProgramData\SystemUpdatePro\Logs",
     [int]$LogRetentionDays = 30,
     [switch]$Reboot,
@@ -145,7 +148,7 @@ $script:Version = "4.1.0"
 $script:ProductName = "SystemUpdatePro"
 $script:EventLogSource = "SystemUpdatePro"
 $script:ResultSchemaVersion = 1
-$script:StateSchemaVersion = 2
+$script:StateSchemaVersion = 3
 $script:MaxContinuationAttempts = 3
 $script:RunId = [guid]::NewGuid().ToString()
 $script:RunStartedAt = Get-Date
@@ -178,6 +181,7 @@ $script:ContinuationActive = $false
 $script:ContinuationRegistered = $false
 $script:ContinuationState = $null
 $script:ResumeStageCursor = ""
+$script:FirmwarePrerequisites = $null
 
 # Paths are declared without touching disk so read-only commands and tests can
 # load the script contract before privileged initialization.
@@ -680,6 +684,7 @@ function Get-EffectiveRunParameter {
         MaxRetries         = [int]$MaxRetries
         MaxUpdatePasses    = [int]$MaxUpdatePasses
         MinDiskSpaceGB     = [int]$MinDiskSpaceGB
+        MinFirmwareChargePercent = [int]$MinFirmwareChargePercent
         LogPath            = [string]$LogPath
         LogRetentionDays   = [int]$LogRetentionDays
         Reboot             = $Reboot.IsPresent
@@ -692,7 +697,8 @@ function Get-ContinuationParameterName {
         "SkipOEM", "SkipWindows", "SkipWinget", "IncludeBIOS", "BypassWSUS",
         "RepairWindowsUpdate", "CleanupAfter", "ResetComponentBase", "ContinueAfterReboot", "DryRun",
         "BackupDrivers", "ShowHistory", "WebhookUrl", "HistoryCount", "MaxRetries",
-        "MaxUpdatePasses", "MinDiskSpaceGB", "LogPath", "LogRetentionDays", "Reboot", "Force"
+        "MaxUpdatePasses", "MinDiskSpaceGB", "MinFirmwareChargePercent", "LogPath",
+        "LogRetentionDays", "Reboot", "Force"
     )
 }
 
@@ -955,7 +961,8 @@ function Import-ContinuationState {
         "BackupDrivers", "ShowHistory", "Reboot", "Force"
     )
     $integerNames = @(
-        "HistoryCount", "MaxRetries", "MaxUpdatePasses", "MinDiskSpaceGB", "LogRetentionDays"
+        "HistoryCount", "MaxRetries", "MaxUpdatePasses", "MinDiskSpaceGB",
+        "MinFirmwareChargePercent", "LogRetentionDays"
     )
 
     foreach ($name in $switchNames) {
@@ -1103,6 +1110,7 @@ function Save-UpdateHistory {
                 SkipWindows       = $SkipWindows.IsPresent
                 SkipWinget        = $SkipWinget.IsPresent
                 IncludeBIOS       = $IncludeBIOS.IsPresent
+                MinFirmwareChargePercent = $MinFirmwareChargePercent
                 BackupDrivers     = $BackupDrivers.IsPresent
                 CleanupAfter      = $CleanupAfter.IsPresent
                 ResetComponentBase = $ResetComponentBase.IsPresent
@@ -1255,43 +1263,135 @@ function Test-InternetConnection {
 function Test-DiskSpace {
     param([int]$MinGB = 10)
 
-    $systemDrive = $env:SystemDrive
-    $disk = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='$systemDrive'" -ErrorAction SilentlyContinue
+    try {
+        $systemDrive = [string]$env:SystemDrive
+        if ([string]::IsNullOrWhiteSpace($systemDrive)) {
+            throw "The system drive environment variable is empty"
+        }
 
-    if ($disk) {
+        $disk = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='$systemDrive'" -ErrorAction Stop
+        if ($null -eq $disk -or $null -eq $disk.FreeSpace) {
+            throw "CIM did not return free-space data for $systemDrive"
+        }
+
         $freeGB = [math]::Round($disk.FreeSpace / 1GB, 2)
         return @{
+            Status = $(if ($freeGB -ge $MinGB) { "Ready" } else { "Blocked" })
             Sufficient = ($freeGB -ge $MinGB)
             FreeGB = $freeGB
             RequiredGB = $MinGB
+            Message = $(if ($freeGB -ge $MinGB) {
+                "$freeGB GB free on $systemDrive"
+            } else {
+                "Only $freeGB GB is free on $systemDrive; free at least $MinGB GB before firmware or update installation"
+            })
+        }
+    } catch {
+        return @{
+            Status = "Unknown"
+            Sufficient = $false
+            FreeGB = $null
+            RequiredGB = $MinGB
+            Message = "Disk space could not be verified: $($_.Exception.Message). Repair CIM/WMI and rerun"
         }
     }
+}
 
-    return @{ Sufficient = $true; FreeGB = 0; RequiredGB = $MinGB }
+function Get-SystemPowerStatus {
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+        $power = [System.Windows.Forms.SystemInformation]::PowerStatus
+        return [PSCustomObject]@{
+            PowerLineStatus = [string]$power.PowerLineStatus
+            BatteryStatus = [string]$power.BatteryChargeStatus
+            BatteryLifePercent = [double]$power.BatteryLifePercent
+        }
+    } catch {
+        throw "Windows power status query failed: $($_.Exception.Message)"
+    }
 }
 
 function Test-BatteryPower {
-    try {
-        $battery = Get-CimInstance -ClassName Win32_Battery -ErrorAction SilentlyContinue
-        if ($battery) {
-            # BatteryStatus: 1=Discharging, 2=AC Power
-            $onBattery = $battery.BatteryStatus -eq 1
-            $chargePercent = $battery.EstimatedChargeRemaining
+    param([int]$MinimumChargePercent = 50)
 
+    try {
+        $power = Get-SystemPowerStatus
+        $lineStatus = [string]$power.PowerLineStatus
+        $batteryStatus = [string]$power.BatteryStatus
+        $hasBattery = $batteryStatus -notmatch "(?i)NoSystemBattery"
+        $chargePercent = $null
+        $lifePercent = [double]$power.BatteryLifePercent
+        if ($hasBattery -and $lifePercent -ge 0 -and $lifePercent -le 1) {
+            $chargePercent = [int][math]::Round($lifePercent * 100)
+        }
+
+        if ($lineStatus -eq "Unknown" -or [string]::IsNullOrWhiteSpace($lineStatus)) {
             return @{
-                HasBattery = $true
-                OnBattery = $onBattery
-                OnACPower = -not $onBattery
+                Status = "Unknown"; HasBattery = $hasBattery; OnBattery = $false; OnACPower = $false
                 ChargePercent = $chargePercent
+                RequiredChargePercent = $MinimumChargePercent
+                Message = "AC power state is unknown. Connect a verified AC adapter and repair the Windows power-status provider"
             }
         }
-    } catch {}
 
-    return @{
-        HasBattery = $false
-        OnBattery = $false
-        OnACPower = $true
-        ChargePercent = 100
+        if ($lineStatus -eq "Offline") {
+            return @{
+                Status = "Blocked"; HasBattery = $hasBattery; OnBattery = $true; OnACPower = $false
+                ChargePercent = $chargePercent
+                RequiredChargePercent = $MinimumChargePercent
+                Message = "The system is running on battery power. Connect a verified AC adapter before firmware installation"
+            }
+        }
+
+        if ($lineStatus -ne "Online") {
+            return @{
+                Status = "Unknown"; HasBattery = $hasBattery; OnBattery = $false; OnACPower = $false
+                ChargePercent = $chargePercent
+                RequiredChargePercent = $MinimumChargePercent
+                Message = "Unexpected AC power state '$lineStatus'. Verify the adapter and rerun"
+            }
+        }
+
+        if (-not $hasBattery) {
+            return @{
+                Status = "Ready"; HasBattery = $false; OnBattery = $false; OnACPower = $true
+                ChargePercent = $null
+                RequiredChargePercent = $MinimumChargePercent
+                Message = "Line power is online and Windows reports no system battery"
+            }
+        }
+
+        if ($batteryStatus -match "(?i)Unknown" -or $null -eq $chargePercent) {
+            return @{
+                Status = "Unknown"; HasBattery = $true; OnBattery = $false; OnACPower = $true
+                ChargePercent = $chargePercent
+                RequiredChargePercent = $MinimumChargePercent
+                Message = "Battery charge could not be verified. Keep AC connected, repair the battery/power provider, and rerun"
+            }
+        }
+
+        if ($chargePercent -lt $MinimumChargePercent) {
+            return @{
+                Status = "Blocked"; HasBattery = $true; OnBattery = $false; OnACPower = $true
+                ChargePercent = $chargePercent
+                RequiredChargePercent = $MinimumChargePercent
+                Message = "Battery charge is $chargePercent%; charge to at least $MinimumChargePercent% while connected to AC before firmware installation"
+            }
+        }
+
+        return @{
+            Status = "Ready"; HasBattery = $true; OnBattery = $false; OnACPower = $true
+            ChargePercent = $chargePercent
+            RequiredChargePercent = $MinimumChargePercent
+            Message = "AC power is online and battery charge is $chargePercent%"
+        }
+    } catch {
+        return @{
+            Status = "Unknown"; HasBattery = $null; OnBattery = $false; OnACPower = $false
+            ChargePercent = $null
+            RequiredChargePercent = $MinimumChargePercent
+            Message = "$($_.Exception.Message). Connect AC, repair the power-status provider, and rerun"
+        }
     }
 }
 
@@ -1341,15 +1441,236 @@ function Test-PendingReboot {
 
 function Test-BitLockerEnabled {
     try {
+        if (-not (Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue)) {
+            throw "Get-BitLockerVolume is unavailable"
+        }
+
         $bl = Get-BitLockerVolume -MountPoint $env:SystemDrive -ErrorAction Stop
+        if ($null -eq $bl) { throw "No BitLocker volume was returned for $env:SystemDrive" }
+
+        $protectionStatus = [string]$bl.ProtectionStatus
+        $volumeStatus = [string]$bl.VolumeStatus
+        $encryptionMethod = [string]$bl.EncryptionMethod
+        $canSuspend = [bool](Get-Command Suspend-BitLocker -ErrorAction SilentlyContinue) -and
+            [bool](Get-Command Resume-BitLocker -ErrorAction SilentlyContinue)
+
+        if ($protectionStatus -notin @("On", "Off")) {
+            throw "Unexpected protection state '$protectionStatus'"
+        }
+
+        $encryptionActive = $encryptionMethod -notin @("", "None", "0") -and $volumeStatus -ne "FullyDecrypted"
+        $protectionOn = $protectionStatus -eq "On"
+        $suspended = $encryptionActive -and -not $protectionOn
+        $state = if ($protectionOn) { "Protected" } elseif ($suspended) { "Suspended" } else { "Disabled" }
+
         return @{
-            Enabled = ($bl.ProtectionStatus -eq "On")
-            Status = $bl.ProtectionStatus
-            Method = $bl.EncryptionMethod
+            Status = "Ready"
+            State = $state
+            Enabled = $encryptionActive
+            ProtectionOn = $protectionOn
+            Suspended = $suspended
+            CanSuspend = $canSuspend
+            Method = $encryptionMethod
+            Message = $(if ($protectionOn) {
+                "BitLocker protection is active; firmware requires a verified provider auto-suspend path"
+            } elseif ($suspended) {
+                "BitLocker is already suspended"
+            } else {
+                "BitLocker is disabled on the operating-system volume"
+            })
         }
     } catch {
-        return @{ Enabled = $false; Status = "Unknown"; Method = "N/A" }
+        return @{
+            Status = "Unknown"; State = "Unknown"; Enabled = $null; ProtectionOn = $null
+            Suspended = $null; CanSuspend = $false; Method = "Unknown"
+            Message = "BitLocker state could not be verified: $($_.Exception.Message). Run Get-BitLockerVolume for $env:SystemDrive and resolve the error"
+        }
     }
+}
+
+function Test-OEMUpdateIsFirmware {
+    param([AllowNull()][object]$Update)
+
+    if ($null -eq $Update) { return $false }
+    $identity = @(
+        [string](Get-ResultValue -Result $Update -Names @("Title", "Name") -Default ""),
+        [string](Get-ResultValue -Result $Update -Names @("Category") -Default ""),
+        [string](Get-ResultValue -Result $Update -Names @("Type") -Default "")
+    ) -join " "
+    return $identity -match "(?i)(^|\W)(BIOS|UEFI|firmware)(\W|$)"
+}
+
+function Test-FirmwareReadiness {
+    param(
+        [switch]$Requested,
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("Dell", "Lenovo", "HP")]
+        [string]$Provider,
+        [AllowNull()][object]$SystemInfo,
+        [ValidateSet("Ready", "Blocked", "Unknown")]
+        [string]$ToolState = "Unknown",
+        [string]$ToolMessage = "",
+        [bool]$SupportsBitLockerAutoSuspend = $false,
+        [AllowNull()][object]$Prerequisites = $null
+    )
+
+    if (-not $Requested) {
+        return [PSCustomObject][ordered]@{
+            Requested = $false; Safe = $false; Status = "NotRequested"; Provider = $Provider
+            Model = [string](Get-ResultValue -Result $SystemInfo -Names @("Model") -Default "")
+            BitLockerProtectionOn = $false; RequiresBitLockerSuspension = $false
+            Message = "Firmware and BIOS updates were not requested; use -IncludeBIOS after reviewing the safety prerequisites"
+            Checks = @()
+        }
+    }
+
+    $disk = Get-ResultValue -Result $Prerequisites -Names @("Disk") -Default $null
+    $power = Get-ResultValue -Result $Prerequisites -Names @("Power") -Default $null
+    $bitLocker = Get-ResultValue -Result $Prerequisites -Names @("BitLocker") -Default $null
+    if ($null -eq $disk) { $disk = Test-DiskSpace -MinGB $MinDiskSpaceGB }
+    if ($null -eq $power) { $power = Test-BatteryPower -MinimumChargePercent $MinFirmwareChargePercent }
+    if ($null -eq $bitLocker) { $bitLocker = Test-BitLockerEnabled }
+
+    $checks = [System.Collections.ArrayList]::new()
+    $manufacturer = [string](Get-ResultValue -Result $SystemInfo -Names @("Manufacturer") -Default "")
+    $model = [string](Get-ResultValue -Result $SystemInfo -Names @("Model") -Default "")
+    $manufacturerPattern = if ($Provider -eq "Dell") {
+        "DELL|ALIENWARE"
+    } elseif ($Provider -eq "Lenovo") {
+        "LENOVO"
+    } else {
+        "HP|HEWLETT"
+    }
+
+    if ([string]::IsNullOrWhiteSpace($manufacturer) -or [string]::IsNullOrWhiteSpace($model)) {
+        [void]$checks.Add([PSCustomObject]@{
+            Name = "Model"; Status = "Unknown"
+            Message = "Manufacturer/model inventory is incomplete. Repair CIM/WMI (Win32_ComputerSystem) and rerun"
+        })
+    } elseif ($manufacturer -notmatch $manufacturerPattern) {
+        [void]$checks.Add([PSCustomObject]@{
+            Name = "Model"; Status = "Blocked"
+            Message = "Model '$manufacturer $model' does not match the $Provider adapter. Use the matching OEM updater"
+        })
+    } else {
+        [void]$checks.Add([PSCustomObject]@{
+            Name = "Model"; Status = "Ready"; Message = "Detected $manufacturer $model"
+        })
+    }
+
+    $effectiveToolMessage = if ([string]::IsNullOrWhiteSpace($ToolMessage)) {
+        if ($ToolState -eq "Ready") {
+            "$Provider tooling completed an applicability scan for this model"
+        } else {
+            "$Provider tooling did not prove model support. Repair or install the OEM tool and rerun its applicability scan"
+        }
+    } else {
+        $ToolMessage
+    }
+    [void]$checks.Add([PSCustomObject]@{ Name = "Tool"; Status = $ToolState; Message = $effectiveToolMessage })
+
+    $diskStatus = [string](Get-ResultValue -Result $disk -Names @("Status") -Default "Unknown")
+    $diskMessage = [string](Get-ResultValue -Result $disk -Names @("Message") -Default "Disk readiness is unknown; repair CIM/WMI and rerun")
+    [void]$checks.Add([PSCustomObject]@{ Name = "Disk"; Status = $diskStatus; Message = $diskMessage })
+
+    $powerStatus = [string](Get-ResultValue -Result $power -Names @("Status") -Default "Unknown")
+    $powerMessage = [string](Get-ResultValue -Result $power -Names @("Message") -Default "Power readiness is unknown; connect AC and rerun")
+    [void]$checks.Add([PSCustomObject]@{ Name = "Power"; Status = $powerStatus; Message = $powerMessage })
+
+    $bitLockerStatus = [string](Get-ResultValue -Result $bitLocker -Names @("Status") -Default "Unknown")
+    $bitLockerProtectionOn = [bool](Get-ResultValue -Result $bitLocker -Names @("ProtectionOn") -Default $false)
+    if ($bitLockerStatus -ne "Ready") {
+        [void]$checks.Add([PSCustomObject]@{
+            Name = "BitLocker"; Status = "Unknown"
+            Message = [string](Get-ResultValue -Result $bitLocker -Names @("Message") -Default "BitLocker state is unknown; verify it and rerun")
+        })
+    } elseif ($bitLockerProtectionOn -and -not $SupportsBitLockerAutoSuspend) {
+        [void]$checks.Add([PSCustomObject]@{
+            Name = "BitLocker"; Status = "Blocked"
+            Message = "$Provider has no verified automatic BitLocker suspension path. Suspend protection for one reboot, verify recovery-key escrow, and rerun"
+        })
+    } elseif ($bitLockerProtectionOn) {
+        [void]$checks.Add([PSCustomObject]@{
+            Name = "BitLocker"; Status = "Ready"
+            Message = "$Provider supports automatic one-update BitLocker suspension"
+        })
+    } else {
+        [void]$checks.Add([PSCustomObject]@{
+            Name = "BitLocker"; Status = "Ready"
+            Message = [string](Get-ResultValue -Result $bitLocker -Names @("Message") -Default "BitLocker does not block firmware")
+        })
+    }
+
+    $unknownChecks = @($checks | Where-Object { $_.Status -eq "Unknown" })
+    $blockedChecks = @($checks | Where-Object { $_.Status -eq "Blocked" })
+    $status = if ($unknownChecks.Count -gt 0) {
+        "Unknown"
+    } elseif ($blockedChecks.Count -gt 0) {
+        "Blocked"
+    } else {
+        "Ready"
+    }
+    $reasons = @($checks | Where-Object { $_.Status -ne "Ready" } | ForEach-Object { "$($_.Name): $($_.Message)" })
+    $message = if ($status -eq "Ready") {
+        "$Provider firmware prerequisites are known-ready for $model"
+    } else {
+        "$Provider firmware safety is $($status.ToLowerInvariant()): $($reasons -join '; '). -Force cannot override firmware safety"
+    }
+
+    return [PSCustomObject][ordered]@{
+        Requested = $true
+        Safe = ($status -eq "Ready")
+        Status = $status
+        Provider = $Provider
+        Model = $model
+        BitLockerProtectionOn = $bitLockerProtectionOn
+        RequiresBitLockerSuspension = ($status -eq "Ready" -and $bitLockerProtectionOn)
+        Message = $message
+        Checks = @($checks)
+    }
+}
+
+function Get-FirmwareUpdatePolicy {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Readiness
+    )
+
+    $includeFirmware = [bool](Get-ResultValue -Result $Readiness -Names @("Requested") -Default $false) -and
+        [string](Get-ResultValue -Result $Readiness -Names @("Status") -Default "Unknown") -eq "Ready"
+    return [PSCustomObject][ordered]@{
+        IncludeFirmware = $includeFirmware
+        DellUpdateTypes = $(if ($includeFirmware) {
+            @("bios", "firmware", "driver", "application", "others")
+        } else {
+            @("driver", "application", "others")
+        })
+        HPCategories = $(if ($includeFirmware) { @("Drivers", "Firmware", "BIOS") } else { @("Drivers") })
+        LenovoExcludeFirmware = (-not $includeFirmware)
+        DellAutoSuspendBitLocker = ($includeFirmware -and
+            [string](Get-ResultValue -Result $Readiness -Names @("Provider") -Default "") -eq "Dell" -and
+            [bool](Get-ResultValue -Result $Readiness -Names @("RequiresBitLockerSuspension") -Default $false))
+    }
+}
+
+function New-FirmwareReadinessItem {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Readiness
+    )
+
+    $readinessStatus = [string](Get-ResultValue -Result $Readiness -Names @("Status") -Default "Unknown")
+    $itemStatus = if ($readinessStatus -eq "Ready") {
+        "Succeeded"
+    } elseif ($readinessStatus -eq "NotRequested") {
+        "Skipped"
+    } elseif ($readinessStatus -eq "Blocked") {
+        "Blocked"
+    } else {
+        "Unknown"
+    }
+    return New-UpdateItemResult -Name "Firmware safety" -Status $itemStatus `
+        -Message ([string](Get-ResultValue -Result $Readiness -Names @("Message") -Default "Firmware readiness was not reported"))
 }
 
 function Test-MeteredConnection {
@@ -2148,130 +2469,190 @@ function Repair-DellServices {
 }
 
 function Invoke-DellUpdate {
-    param([switch]$IncludeBIOS)
+    param(
+        [switch]$IncludeBIOS,
+        [AllowNull()][object]$SystemInfo = $null,
+        [AllowNull()][object]$FirmwarePrerequisites = $null
+    )
 
     $result = @{
-        Success = $false; RebootRequired = $false
+        Success = $false; Status = "Failed"; RebootRequired = $false
         UpdateCount = 0; Available = 0; Attempted = 0; Installed = 0; Failed = 0; Skipped = 0
         ExitCode = $null; HResult = $null; Items = @(); Evidence = @(); Message = ""
+        FirmwareReadiness = $null
     }
 
     try {
+        Write-Log "========== DELL COMMAND UPDATE ==========" "HEADER"
 
-    Write-Log "========== DELL COMMAND UPDATE ==========" "HEADER"
+        $sysInfo = if ($null -ne $SystemInfo) { $SystemInfo } else { Get-SystemInfo }
+        Write-Log "Service Tag: $($sysInfo.SerialNumber)" "INFO"
 
-    $sysInfo = Get-SystemInfo
-    Write-Log "Service Tag: $($sysInfo.SerialNumber)" "INFO"
+        $dcuPath = Get-DCUPath
+        if (-not $dcuPath) {
+            if (-not (Install-DellCommandUpdate)) {
+                $result.Message = "Dell Command Update could not be installed; repair WinGet/network access and rerun"
+                $result.Failed = 1
+            }
+            $dcuPath = Get-DCUPath
+        }
 
-    $dcuPath = Get-DCUPath
-    if (-not $dcuPath) {
-        if (-not (Install-DellCommandUpdate)) {
-            $result.Message = "Failed to install DCU"
+        if (-not $dcuPath) {
+            $readiness = Test-FirmwareReadiness -Requested:$IncludeBIOS -Provider "Dell" -SystemInfo $sysInfo `
+                -ToolState "Unknown" -ToolMessage "Dell Command Update is unavailable. Install or repair DCU and rerun its applicability scan" `
+                -SupportsBitLockerAutoSuspend $true -Prerequisites $FirmwarePrerequisites
+            $result.FirmwareReadiness = $readiness
+            $result.Items += New-FirmwareReadinessItem -Readiness $readiness
+            $result.Skipped = $(if ($IncludeBIOS) { 1 } else { 0 })
+            if ($DryRun) {
+                $result.Success = $true
+                $result.Status = $(if ($IncludeBIOS) { "Partial" } else { "Succeeded" })
+                $result.Message = "DCU would be installed before scanning; $($readiness.Message)"
+            } else {
+                $result.Failed = [math]::Max(1, $result.Failed)
+                $result.Message = "Dell Command Update was not found after installation"
+            }
+            Write-Log $result.Message $(if ($result.Success) { "WARNING" } else { "ERROR" })
+            return $result
+        }
+
+        if (-not (Repair-DellServices)) {
+            Write-Log "Dell Client Management Service was not verified; the applicability scan must succeed before any update is applied" "WARNING"
+        }
+
+        if (-not $DryRun) {
+            # Disable nonessential Dell services while preserving the DCU service.
+            Get-Service -ErrorAction SilentlyContinue | Where-Object {
+                ($_.DisplayName -like "*Dell*" -or $_.Name -like "*DDV*" -or $_.Name -like "*SupportAssist*") -and
+                $_.Name -ne "DellClientManagementService"
+            } | ForEach-Object {
+                Stop-Service -Name $_.Name -Force -ErrorAction SilentlyContinue
+                Set-Service -Name $_.Name -StartupType Disabled -ErrorAction SilentlyContinue
+            }
+        }
+
+        $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+        $scanLog = Join-Path $LogPath "DCU_Scan_$timestamp.log"
+        $scanTypes = if ($IncludeBIOS) {
+            @("bios", "firmware", "driver", "application", "others")
+        } else {
+            @("driver", "application", "others")
+        }
+        $scanArgs = @(
+            "/scan", "-silent", "-updateSeverity=security,critical,recommended",
+            "-updateType=$($scanTypes -join ',')", "-outputLog=`"$scanLog`""
+        )
+        Write-Log "Verifying Dell model/tool applicability..." "INFO"
+        $scanProcess = Start-Process -FilePath $dcuPath -ArgumentList ($scanArgs -join " ") `
+            -Wait -NoNewWindow -PassThru -ErrorAction Stop
+        $result.Attempted++
+        $result.ExitCode = $scanProcess.ExitCode
+        $result.Evidence = @($scanLog)
+        $scanSucceeded = $scanProcess.ExitCode -in @(0, 500)
+        $readiness = Test-FirmwareReadiness -Requested:$IncludeBIOS -Provider "Dell" -SystemInfo $sysInfo `
+            -ToolState $(if ($scanSucceeded) { "Ready" } else { "Unknown" }) `
+            -ToolMessage $(if ($scanSucceeded) {
+                "Dell Command Update completed an applicability scan for this model"
+            } else {
+                "DCU scan exit $($scanProcess.ExitCode) did not verify support. Review $scanLog, repair DCU, and rerun"
+            }) -SupportsBitLockerAutoSuspend $true -Prerequisites $FirmwarePrerequisites
+        $result.FirmwareReadiness = $readiness
+        $result.Items += New-FirmwareReadinessItem -Readiness $readiness
+        $policy = Get-FirmwareUpdatePolicy -Readiness $readiness
+
+        if (-not $scanSucceeded) {
             $result.Failed = 1
+            $result.Message = "DCU applicability scan failed with exit $($scanProcess.ExitCode); no updates were applied"
             Write-Log $result.Message "ERROR"
             return $result
         }
-        $dcuPath = Get-DCUPath
-    }
 
-    if (-not (Repair-DellServices)) {
-        Write-Log "Dell service issues - proceeding anyway" "WARNING"
-    }
-
-    if (-not $DryRun) {
-        # Disable bloat services
-        Get-Service -ErrorAction SilentlyContinue | Where-Object {
-            ($_.DisplayName -like "*Dell*" -or $_.Name -like "*DDV*" -or $_.Name -like "*SupportAssist*") -and
-            $_.Name -ne "DellClientManagementService"
-        } | ForEach-Object {
-            Stop-Service -Name $_.Name -Force -ErrorAction SilentlyContinue
-            Set-Service -Name $_.Name -StartupType Disabled -ErrorAction SilentlyContinue
-        }
-    }
-
-    # Build arguments
-    $bitlocker = Test-BitLockerEnabled
-
-    if ($DryRun) {
-        # Scan only, do not install
-        $dcuArgs = @("/scan", "-silent", "-updateSeverity=security,critical,recommended")
-        if (-not $IncludeBIOS -or ($bitlocker.Enabled -and -not $IncludeBIOS)) {
-            $dcuArgs += "-updateType=driver,firmware,application"
+        if ($IncludeBIOS -and -not $readiness.Safe) {
+            $result.Skipped++
+            $result.Status = "Partial"
+            Write-Log $readiness.Message "WARNING"
         }
 
-        $dcuLog = Join-Path $LogPath "DCU_DryRun_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
-        $dcuArgs += "-outputLog=`"$dcuLog`""
-
-        Write-Log "Scanning for available Dell updates (dry run)..." "INFO"
-
-        if ($dcuPath) {
-            $process = Start-Process -FilePath $dcuPath -ArgumentList ($dcuArgs -join " ") -Wait -NoNewWindow -PassThru
-            $result.Attempted = 1
-            $result.ExitCode = $process.ExitCode
-            $result.Success = ($process.ExitCode -in @(0, 500))
-            if (-not $result.Success) { $result.Failed = 1 }
-            $result.Message = "DCU scan completed (exit: $($process.ExitCode)) - no updates installed (dry run)"
-        } else {
+        if ($DryRun) {
             $result.Success = $true
-            $result.Message = "DCU not installed - would install and scan (dry run)"
+            if ($result.Status -ne "Partial") { $result.Status = "Succeeded" }
+            $result.Message = "DCU applicability scan completed (exit: $($scanProcess.ExitCode)); no updates installed. $($readiness.Message)"
+            Write-Log $result.Message $(if ($readiness.Safe -or -not $IncludeBIOS) { "INFO" } else { "WARNING" })
+            return $result
         }
 
-        Write-Log $result.Message $(if ($result.Success) { "INFO" } else { "WARNING" })
-        $result.Evidence = @($dcuLog)
+        if ($scanProcess.ExitCode -eq 500) {
+            $result.Success = $true
+            if ($result.Status -ne "Partial") { $result.Status = "Succeeded" }
+            $result.Message = "No applicable Dell updates were found; $($readiness.Message)"
+            Write-Log $result.Message "SUCCESS"
+            return $result
+        }
+
+        $dcuLog = Join-Path $LogPath "DCU_Apply_$timestamp.log"
+        $dcuArgs = @(
+            "/applyUpdates", "-silent", "-updateSeverity=security,critical,recommended", "-reboot=disable",
+            "-updateType=$($policy.DellUpdateTypes -join ',')", "-outputLog=`"$dcuLog`""
+        )
+        if ($policy.DellAutoSuspendBitLocker) {
+            $dcuArgs += "-autoSuspendBitLocker=enable"
+        }
+        $result.Evidence += $dcuLog
+        Write-Log "Applying Dell updates with types: $($policy.DellUpdateTypes -join ', ')..." "INFO"
+
+        $attempts = 0
+        while ($attempts -lt $MaxRetries) {
+            $attempts++
+            $process = Start-Process -FilePath $dcuPath -ArgumentList ($dcuArgs -join " ") `
+                -Wait -NoNewWindow -PassThru -ErrorAction Stop
+            $result.Attempted++
+            $result.ExitCode = $process.ExitCode
+
+            switch ($process.ExitCode) {
+                0   { $result.Success = $true; $result.Message = "Updates applied"; break }
+                1   { $result.Success = $true; $result.RebootRequired = $true; $result.Message = "Updates applied - reboot required"; break }
+                500 { $result.Success = $true; $result.Message = "No updates available"; break }
+                3000 {
+                    if ($attempts -lt $MaxRetries -and (Repair-DellServices)) { continue }
+                    $result.Message = "Dell Client Management Service is not running; repair DCU and rerun"
+                    break
+                }
+                3003 {
+                    if ($attempts -lt $MaxRetries) { Start-Sleep -Seconds 30; continue }
+                    $result.Message = "DCU remained busy after $MaxRetries attempts; close other DCU sessions and rerun"
+                    break
+                }
+                default { $result.Message = "DCU apply exit code $($process.ExitCode); review $dcuLog and rerun"; break }
+            }
+            break
+        }
+
+        if ($result.Success) {
+            if ($result.Status -ne "Partial") { $result.Status = "Succeeded" }
+            $result.Items += New-UpdateItemResult -Name "Dell update application" -Status "Succeeded" `
+                -ProviderCode $result.ExitCode -RebootRequired $result.RebootRequired -Message $result.Message -Evidence @($dcuLog)
+        } else {
+            $result.Failed = 1
+            $result.Status = "Failed"
+            $result.Items += New-UpdateItemResult -Name "Dell update application" -Status "Failed" `
+                -ProviderCode $result.ExitCode -Message $result.Message -Evidence @($dcuLog)
+        }
+        Write-Log $result.Message $(if ($result.Success) { "SUCCESS" } else { "WARNING" })
         $script:OEMUpdateCount = $result.UpdateCount
         return $result
-    }
-
-    $dcuArgs = @("/applyUpdates", "-silent", "-updateSeverity=security,critical,recommended", "-reboot=disable")
-
-    if (-not $IncludeBIOS -or ($bitlocker.Enabled -and -not $IncludeBIOS)) {
-        $dcuArgs += "-updateType=driver,firmware,application"
-    } else {
-        $dcuArgs += "-autoSuspendBitLocker=enable"
-    }
-
-    $dcuLog = Join-Path $LogPath "DCU_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
-    $dcuArgs += "-outputLog=`"$dcuLog`""
-
-    Write-Log "Applying Dell updates..." "INFO"
-
-    $attempts = 0
-    while ($attempts -lt $MaxRetries) {
-        $attempts++
-
-        $process = Start-Process -FilePath $dcuPath -ArgumentList ($dcuArgs -join " ") -Wait -NoNewWindow -PassThru
-        $result.Attempted++
-        $result.ExitCode = $process.ExitCode
-
-        switch ($process.ExitCode) {
-            0   { $result.Success = $true; $result.Message = "Updates applied"; break }
-            1   { $result.Success = $true; $result.RebootRequired = $true; $result.Message = "Updates applied - reboot required"; break }
-            500 { $result.Success = $true; $result.Message = "No updates available"; break }
-            3000 {
-                if ($attempts -lt $MaxRetries -and (Repair-DellServices)) { continue }
-                $result.Message = "Dell service not running"
-                break
-            }
-            3003 {
-                if ($attempts -lt $MaxRetries) { Start-Sleep -Seconds 30; continue }
-                $result.Message = "DCU service busy"
-                break
-            }
-            default { $result.Message = "DCU exit code: $($process.ExitCode)"; break }
-        }
-        break
-    }
-
-    if (-not $result.Success) { $result.Failed = 1 }
-    $result.Evidence = @($dcuLog)
-    Write-Log $result.Message $(if ($result.Success) { "SUCCESS" } else { "WARNING" })
-    $script:OEMUpdateCount = $result.UpdateCount
-    return $result
     } catch {
         $result.Success = $false
+        $result.Status = "Failed"
         $result.Failed = [math]::Max(1, $result.Failed)
         $result.HResult = $_.Exception.HResult
         $result.Message = "Dell update error: $($_.Exception.Message)"
+        if ($null -eq $result.FirmwareReadiness) {
+            $readiness = Test-FirmwareReadiness -Requested:$IncludeBIOS -Provider "Dell" -SystemInfo $SystemInfo `
+                -ToolState "Unknown" -ToolMessage "Dell tooling failed before support could be verified: $($_.Exception.Message). Repair DCU and rerun" `
+                -SupportsBitLockerAutoSuspend $true -Prerequisites $FirmwarePrerequisites
+            $result.FirmwareReadiness = $readiness
+            $result.Items += New-FirmwareReadinessItem -Readiness $readiness
+        }
         Write-Log $result.Message "ERROR"
         return $result
     }
@@ -2282,23 +2663,52 @@ function Invoke-DellUpdate {
 # ============================================================================
 
 function Invoke-LenovoUpdate {
-    param([switch]$IncludeBIOS)
+    param(
+        [switch]$IncludeBIOS,
+        [AllowNull()][object]$SystemInfo = $null,
+        [AllowNull()][object]$FirmwarePrerequisites = $null
+    )
 
     $result = @{
-        Success = $false; RebootRequired = $false
+        Success = $false; Status = "Failed"; RebootRequired = $false
         UpdateCount = 0; Available = 0; Attempted = 0; Installed = 0; Failed = 0; Skipped = 0
         ExitCode = $null; HResult = $null; Items = @(); Evidence = @(); Message = ""
+        FirmwareReadiness = $null
     }
 
     Write-Log "========== LENOVO SYSTEM UPDATE ==========" "HEADER"
 
-    $sysInfo = Get-SystemInfo
+    $sysInfo = if ($null -ne $SystemInfo) { $SystemInfo } else { Get-SystemInfo }
     Write-Log "Serial: $($sysInfo.SerialNumber)" "INFO"
 
     if (-not (Install-PSModuleWithRetry -ModuleName "LSUClient")) {
-        $result.Message = "Failed to install LSUClient"
+        $readiness = Test-FirmwareReadiness -Requested:$IncludeBIOS -Provider "Lenovo" -SystemInfo $sysInfo `
+            -ToolState "Unknown" -ToolMessage "LSUClient could not be installed. Repair PowerShell Gallery/module access and rerun" `
+            -Prerequisites $FirmwarePrerequisites
+        $result.FirmwareReadiness = $readiness
+        $result.Items += New-FirmwareReadinessItem -Readiness $readiness
+        $result.Message = "Failed to install LSUClient; no Lenovo updates were attempted"
         $result.Failed = 1
         Write-Log $result.Message "ERROR"
+        return $result
+    }
+
+    if (-not (Get-Module -ListAvailable -Name "LSUClient" -ErrorAction SilentlyContinue)) {
+        $readiness = Test-FirmwareReadiness -Requested:$IncludeBIOS -Provider "Lenovo" -SystemInfo $sysInfo `
+            -ToolState "Unknown" -ToolMessage "LSUClient is not installed, so model support cannot be scanned. Install the module and rerun" `
+            -Prerequisites $FirmwarePrerequisites
+        $result.FirmwareReadiness = $readiness
+        $result.Items += New-FirmwareReadinessItem -Readiness $readiness
+        if ($DryRun) {
+            $result.Success = $true
+            $result.Status = $(if ($IncludeBIOS) { "Partial" } else { "Succeeded" })
+            $result.Skipped = $(if ($IncludeBIOS) { 1 } else { 0 })
+            $result.Message = "LSUClient would be installed before scanning; $($readiness.Message)"
+        } else {
+            $result.Failed = 1
+            $result.Message = "LSUClient was not found after installation"
+        }
+        Write-Log $result.Message $(if ($result.Success) { "WARNING" } else { "ERROR" })
         return $result
     }
 
@@ -2306,17 +2716,54 @@ function Invoke-LenovoUpdate {
         Import-Module LSUClient -Force -ErrorAction Stop
 
         Write-Log "Scanning for updates..." "INFO"
-        $updates = Get-LSUpdate -ErrorAction Stop | Where-Object { $_.Installer.Unattended -eq $true }
+        $allUpdates = @(Get-LSUpdate -ErrorAction Stop | Where-Object { $_.Installer.Unattended -eq $true })
+        $readiness = Test-FirmwareReadiness -Requested:$IncludeBIOS -Provider "Lenovo" -SystemInfo $sysInfo `
+            -ToolState "Ready" -ToolMessage "LSUClient completed an applicability scan for this model" `
+            -Prerequisites $FirmwarePrerequisites
+        $result.FirmwareReadiness = $readiness
+        $result.Items += New-FirmwareReadinessItem -Readiness $readiness
+        $policy = Get-FirmwareUpdatePolicy -Readiness $readiness
 
-        $bitlocker = Test-BitLockerEnabled
-        if (-not $IncludeBIOS -or $bitlocker.Enabled) {
-            $updates = $updates | Where-Object { $_.Category -notmatch "BIOS|UEFI" -and $_.Type -ne "BIOS" }
+        $firmwareUpdates = @($allUpdates | Where-Object { Test-OEMUpdateIsFirmware -Update $_ })
+        $updates = @(
+            if ($policy.LenovoExcludeFirmware) {
+                $allUpdates | Where-Object { -not (Test-OEMUpdateIsFirmware -Update $_) }
+            } else {
+                $allUpdates
+            }
+        )
+
+        if ($policy.LenovoExcludeFirmware) {
+            $blockedStatus = if (-not $IncludeBIOS) {
+                "Skipped"
+            } elseif ($readiness.Status -eq "Unknown") {
+                "Unknown"
+            } else {
+                "Blocked"
+            }
+            foreach ($firmwareUpdate in $firmwareUpdates) {
+                $firmwareName = [string](Get-ResultValue -Result $firmwareUpdate -Names @("Title", "Name") -Default "Lenovo firmware update")
+                $result.Items += New-UpdateItemResult -Name $firmwareName `
+                    -Id ([string](Get-ResultValue -Result $firmwareUpdate -Names @("ID", "Id") -Default "")) `
+                    -Status $blockedStatus -Message $readiness.Message
+                $result.Skipped++
+            }
         }
 
-        if (-not $updates -or $updates.Count -eq 0) {
+        if ($IncludeBIOS -and -not $readiness.Safe) {
+            $result.Status = "Partial"
+            Write-Log $readiness.Message "WARNING"
+        }
+
+        if ($updates.Count -eq 0) {
             $result.Success = $true
-            $result.Message = "No updates available"
-            Write-Log $result.Message "SUCCESS"
+            if ($result.Status -ne "Partial") { $result.Status = "Succeeded" }
+            $result.Message = if ($firmwareUpdates.Count -gt 0 -and $policy.LenovoExcludeFirmware) {
+                "No non-firmware Lenovo updates are available; $($firmwareUpdates.Count) firmware update(s) were not attempted. $($readiness.Message)"
+            } else {
+                "No applicable Lenovo updates are available; $($readiness.Message)"
+            }
+            Write-Log $result.Message $(if ($result.Status -eq "Partial") { "WARNING" } else { "SUCCESS" })
             $script:OEMUpdateCount = 0
             return $result
         }
@@ -2325,13 +2772,16 @@ function Invoke-LenovoUpdate {
             $result.UpdateCount = $updates.Count
             $result.Available = $updates.Count
             $result.Success = $true
-            $result.Message = "$($updates.Count) updates available (dry run - not installed)"
+            if ($result.Status -ne "Partial") { $result.Status = "Succeeded" }
+            $result.Message = "$($updates.Count) nonblocked Lenovo update(s) available (dry run - not installed); $($readiness.Message)"
             Write-Log "Available Lenovo updates:" "INFO"
             foreach ($u in $updates) {
                 Write-Log "  -- $($u.Title) ($($u.Category))" "INFO"
                 [void]$script:OEMUpdates.Add("$($u.Title) ($($u.Category))")
+                $result.Items += New-UpdateItemResult -Name $u.Title -Id $u.ID -Status "Available" `
+                    -Message ([string]$u.Category)
             }
-            Write-Log $result.Message "INFO"
+            Write-Log $result.Message $(if ($result.Status -eq "Partial") { "WARNING" } else { "INFO" })
             $script:OEMUpdateCount = $result.UpdateCount
             return $result
         }
@@ -2375,14 +2825,28 @@ function Invoke-LenovoUpdate {
             if ($action -in @("REBOOT", "SHUTDOWN")) { $result.RebootRequired = $true }
         }
 
-        $result.Success = ($result.Failed -eq 0 -and $result.Items.Count -eq $result.Attempted)
+        $installationItems = @($result.Items | Where-Object { $_.Name -ne "Firmware safety" -and $_.Status -notin @("Skipped", "Blocked", "Unknown") })
+        $result.Success = ($result.Failed -eq 0 -and $installationItems.Count -eq $result.Attempted)
+        if (-not $result.Success) {
+            $result.Status = $(if ($result.Installed -gt 0) { "Partial" } else { "Failed" })
+        } elseif ($result.Status -ne "Partial") {
+            $result.Status = "Succeeded"
+        }
         $result.Message = "Installed: $($result.Installed), Failed: $($result.Failed)"
         Write-Log $result.Message $(if ($result.Success) { "SUCCESS" } else { "WARNING" })
 
     } catch {
+        $result.Status = "Failed"
         $result.Message = "Lenovo error: $($_.Exception.Message)"
         $result.Failed = [math]::Max(1, $result.Failed)
         $result.HResult = $_.Exception.HResult
+        if ($null -eq $result.FirmwareReadiness) {
+            $readiness = Test-FirmwareReadiness -Requested:$IncludeBIOS -Provider "Lenovo" -SystemInfo $sysInfo `
+                -ToolState "Unknown" -ToolMessage "LSUClient failed before support could be verified: $($_.Exception.Message). Repair the module and rerun" `
+                -Prerequisites $FirmwarePrerequisites
+            $result.FirmwareReadiness = $readiness
+            $result.Items += New-FirmwareReadinessItem -Readiness $readiness
+        }
         Write-Log $result.Message "ERROR"
     }
 
@@ -2438,107 +2902,172 @@ function Install-HPIA {
 }
 
 function Invoke-HPUpdate {
-    param([switch]$IncludeBIOS)
+    param(
+        [switch]$IncludeBIOS,
+        [AllowNull()][object]$SystemInfo = $null,
+        [AllowNull()][object]$FirmwarePrerequisites = $null
+    )
 
     $result = @{
-        Success = $false; RebootRequired = $false
+        Success = $false; Status = "Failed"; RebootRequired = $false
         UpdateCount = 0; Available = 0; Attempted = 0; Installed = 0; Failed = 0; Skipped = 0
         ExitCode = $null; HResult = $null; Items = @(); Evidence = @(); Message = ""
+        FirmwareReadiness = $null
     }
 
     try {
+        Write-Log "========== HP IMAGE ASSISTANT ==========" "HEADER"
 
-    Write-Log "========== HP IMAGE ASSISTANT ==========" "HEADER"
+        $sysInfo = if ($null -ne $SystemInfo) { $SystemInfo } else { Get-SystemInfo }
+        Write-Log "Serial: $($sysInfo.SerialNumber)" "INFO"
 
-    $sysInfo = Get-SystemInfo
-    Write-Log "Serial: $($sysInfo.SerialNumber)" "INFO"
+        $hpiaPath = Get-HPIAPath
+        if (-not $hpiaPath) {
+            if (-not (Install-HPIA)) {
+                $result.Message = "HP Image Assistant could not be installed; repair download access and rerun"
+                $result.Failed = 1
+            }
+            $hpiaPath = Get-HPIAPath
+        }
 
-    $hpiaPath = Get-HPIAPath
-    if (-not $hpiaPath) {
-        if (-not (Install-HPIA)) {
-            $result.Message = "Failed to install HPIA"
+        if (-not $hpiaPath) {
+            $readiness = Test-FirmwareReadiness -Requested:$IncludeBIOS -Provider "HP" -SystemInfo $sysInfo `
+                -ToolState "Unknown" -ToolMessage "HP Image Assistant is unavailable. Install or repair HPIA and rerun its applicability scan" `
+                -Prerequisites $FirmwarePrerequisites
+            $result.FirmwareReadiness = $readiness
+            $result.Items += New-FirmwareReadinessItem -Readiness $readiness
+            $result.Skipped = $(if ($IncludeBIOS) { 1 } else { 0 })
+            if ($DryRun) {
+                $result.Success = $true
+                $result.Status = $(if ($IncludeBIOS) { "Partial" } else { "Succeeded" })
+                $result.Message = "HPIA would be installed before scanning; $($readiness.Message)"
+            } else {
+                $result.Failed = [math]::Max(1, $result.Failed)
+                $result.Message = "HP Image Assistant was not found after installation"
+            }
+            Write-Log $result.Message $(if ($result.Success) { "WARNING" } else { "ERROR" })
+            return $result
+        }
+
+        if (-not $DryRun) {
+            Get-Process -Name "HPImageAssistant*" -ErrorAction SilentlyContinue |
+                Stop-Process -Force -ErrorAction SilentlyContinue
+        }
+
+        $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+        $reportDir = Join-Path $LogPath "HPIA_$timestamp"
+        $softpaqDir = Join-Path $env:TEMP "HPSoftpaqs"
+        New-Item -ItemType Directory -Path $reportDir -Force | Out-Null
+        if (-not $DryRun) {
+            New-Item -ItemType Directory -Path $softpaqDir -Force | Out-Null
+        }
+
+        $scanCategories = if ($IncludeBIOS) { @("Drivers", "Firmware", "BIOS") } else { @("Drivers") }
+        $scanArgs = @(
+            "/Operation:Analyze", "/Action:List", "/Selection:All",
+            "/Category:$($scanCategories -join ',')", "/Silent", "/Noninteractive",
+            "/ReportFolder:`"$reportDir`""
+        )
+        Write-Log "Verifying HP model/tool applicability..." "INFO"
+        $scanProcess = Start-Process -FilePath $hpiaPath -ArgumentList ($scanArgs -join " ") `
+            -Wait -NoNewWindow -PassThru -ErrorAction Stop
+        $result.Attempted++
+        $result.ExitCode = $scanProcess.ExitCode
+        $result.Evidence = @($reportDir)
+        $scanSucceeded = $scanProcess.ExitCode -in @(0, 256, 257, 3010)
+        $toolState = if ($scanSucceeded) { "Ready" } elseif ($scanProcess.ExitCode -eq 4104) { "Blocked" } else { "Unknown" }
+        $toolMessage = if ($scanSucceeded) {
+            "HP Image Assistant completed an applicability scan for this model and operating system"
+        } elseif ($scanProcess.ExitCode -eq 4104) {
+            "HPIA reports that this model/OS lacks a supported reference image (exit 4104). Check HP's supported-platform list"
+        } else {
+            "HPIA scan exit $($scanProcess.ExitCode) did not verify support. Review $reportDir, repair HPIA, and rerun"
+        }
+        $readiness = Test-FirmwareReadiness -Requested:$IncludeBIOS -Provider "HP" -SystemInfo $sysInfo `
+            -ToolState $toolState -ToolMessage $toolMessage -Prerequisites $FirmwarePrerequisites
+        $result.FirmwareReadiness = $readiness
+        $result.Items += New-FirmwareReadinessItem -Readiness $readiness
+        $policy = Get-FirmwareUpdatePolicy -Readiness $readiness
+
+        if (-not $scanSucceeded) {
             $result.Failed = 1
+            $result.Message = "HPIA applicability scan failed with exit $($scanProcess.ExitCode); no updates were applied. $toolMessage"
             Write-Log $result.Message "ERROR"
             return $result
         }
-        $hpiaPath = Get-HPIAPath
-    }
 
-    if (-not $DryRun) {
-        # Kill existing HPIA processes
-        Get-Process -Name "HPImageAssistant*" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-    }
-
-    $reportDir = Join-Path $LogPath "HPIA_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
-    $softpaqDir = Join-Path $env:TEMP "HPSoftpaqs"
-    New-Item -ItemType Directory -Path $reportDir, $softpaqDir -Force | Out-Null
-
-    $categories = @("Drivers", "Firmware")
-    $bitlocker = Test-BitLockerEnabled
-    if ($IncludeBIOS -and -not $bitlocker.Enabled) { $categories += "BIOS" }
-
-    if ($DryRun) {
-        # Analyze only, do not install
-        $hpiaArgs = @(
-            "/Operation:Analyze", "/Action:List", "/Selection:All",
-            "/Category:$($categories -join ',')", "/Silent", "/Noninteractive",
-            "/ReportFolder:`"$reportDir`""
-        )
-
-        Write-Log "Scanning for available HP updates (dry run)..." "INFO"
-
-        if ($hpiaPath) {
-            $process = Start-Process -FilePath $hpiaPath -ArgumentList ($hpiaArgs -join " ") -Wait -NoNewWindow -PassThru
-            $result.Attempted = 1
-            $result.ExitCode = $process.ExitCode
-            $result.Success = ($process.ExitCode -in @(0, 256, 257, 3010))
-            if (-not $result.Success) { $result.Failed = 1 }
-            $result.Message = "HPIA scan completed (exit: $($process.ExitCode)) - no updates installed (dry run)"
-        } else {
-            $result.Success = $true
-            $result.Message = "HPIA not installed - would install and scan (dry run)"
+        if ($IncludeBIOS -and -not $readiness.Safe) {
+            $result.Skipped++
+            $result.Status = "Partial"
+            Write-Log $readiness.Message "WARNING"
         }
 
-        Write-Log $result.Message $(if ($result.Success) { "INFO" } else { "WARNING" })
-        $result.Evidence = @($reportDir)
+        if ($DryRun) {
+            $result.Success = $true
+            if ($result.Status -ne "Partial") { $result.Status = "Succeeded" }
+            $result.Message = "HPIA applicability scan completed (exit: $($scanProcess.ExitCode)); no updates installed. $($readiness.Message)"
+            Write-Log $result.Message $(if ($readiness.Safe -or -not $IncludeBIOS) { "INFO" } else { "WARNING" })
+            $script:OEMUpdateCount = $result.UpdateCount
+            return $result
+        }
+
+        if ($scanProcess.ExitCode -eq 256) {
+            $result.Success = $true
+            if ($result.Status -ne "Partial") { $result.Status = "Succeeded" }
+            $result.Message = "No applicable HP updates were found; $($readiness.Message)"
+            Write-Log $result.Message "SUCCESS"
+            return $result
+        }
+
+        $hpiaArgs = @(
+            "/Operation:Analyze", "/Action:Install", "/Selection:All",
+            "/Category:$($policy.HPCategories -join ',')", "/Silent", "/Noninteractive",
+            "/ReportFolder:`"$reportDir`"", "/SoftpaqDownloadFolder:`"$softpaqDir`""
+        )
+        Write-Log "Applying HP update categories: $($policy.HPCategories -join ', ')..." "INFO"
+        $process = Start-Process -FilePath $hpiaPath -ArgumentList ($hpiaArgs -join " ") `
+            -Wait -NoNewWindow -PassThru -ErrorAction Stop
+        $result.Attempted++
+        $result.ExitCode = $process.ExitCode
+
+        Get-Process -Name "HPImageAssistant*" -ErrorAction SilentlyContinue |
+            Stop-Process -Force -ErrorAction SilentlyContinue
+
+        switch ($process.ExitCode) {
+            0    { $result.Success = $true; $result.Message = "Updates applied" }
+            256  { $result.Success = $true; $result.Message = "No updates needed" }
+            257  { $result.Success = $true; $result.RebootRequired = $true; $result.Message = "Updates applied - reboot required" }
+            3010 { $result.Success = $true; $result.RebootRequired = $true; $result.Message = "Updates applied - reboot required" }
+            default { $result.Success = $false; $result.Message = "HPIA exit $($process.ExitCode); review $reportDir and rerun" }
+        }
+        if ($result.Success) {
+            if ($result.Status -ne "Partial") { $result.Status = "Succeeded" }
+            $result.Items += New-UpdateItemResult -Name "HP update application" -Status "Succeeded" `
+                -ProviderCode $result.ExitCode -RebootRequired $result.RebootRequired -Message $result.Message -Evidence @($reportDir)
+        } else {
+            $result.Status = "Failed"
+            $result.Failed = 1
+            $result.Items += New-UpdateItemResult -Name "HP update application" -Status "Failed" `
+                -ProviderCode $result.ExitCode -Message $result.Message -Evidence @($reportDir)
+        }
+
+        Write-Log $result.Message $(if ($result.Success) { "SUCCESS" } else { "WARNING" })
+        Remove-Item $softpaqDir -Recurse -Force -ErrorAction SilentlyContinue
         $script:OEMUpdateCount = $result.UpdateCount
         return $result
-    }
-
-    $hpiaArgs = @(
-        "/Operation:Analyze", "/Action:Install", "/Selection:All",
-        "/Category:$($categories -join ',')", "/Silent", "/Noninteractive",
-        "/ReportFolder:`"$reportDir`"", "/SoftpaqDownloadFolder:`"$softpaqDir`""
-    )
-
-    Write-Log "Applying HP updates..." "INFO"
-
-    $process = Start-Process -FilePath $hpiaPath -ArgumentList ($hpiaArgs -join " ") -Wait -NoNewWindow -PassThru
-    $result.Attempted = 1
-    $result.ExitCode = $process.ExitCode
-
-    Get-Process -Name "HPImageAssistant*" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-
-    switch ($process.ExitCode) {
-        0    { $result.Success = $true; $result.Message = "Updates applied" }
-        256  { $result.Success = $true; $result.Message = "No updates needed" }
-        257  { $result.Success = $true; $result.RebootRequired = $true; $result.Message = "Updates applied - reboot required" }
-        3010 { $result.Success = $true; $result.RebootRequired = $true; $result.Message = "Updates applied - reboot required" }
-        default { $result.Success = $false; $result.Message = "HPIA exit: $($process.ExitCode)" }
-    }
-    if (-not $result.Success) { $result.Failed = 1 }
-
-    Write-Log $result.Message $(if ($result.Success) { "SUCCESS" } else { "WARNING" })
-
-    Remove-Item $softpaqDir -Recurse -Force -ErrorAction SilentlyContinue
-    $result.Evidence = @($reportDir)
-    $script:OEMUpdateCount = $result.UpdateCount
-    return $result
     } catch {
         $result.Success = $false
+        $result.Status = "Failed"
         $result.Failed = [math]::Max(1, $result.Failed)
         $result.HResult = $_.Exception.HResult
         $result.Message = "HP update error: $($_.Exception.Message)"
+        if ($null -eq $result.FirmwareReadiness) {
+            $readiness = Test-FirmwareReadiness -Requested:$IncludeBIOS -Provider "HP" -SystemInfo $SystemInfo `
+                -ToolState "Unknown" -ToolMessage "HPIA failed before support could be verified: $($_.Exception.Message). Repair HPIA and rerun" `
+                -Prerequisites $FirmwarePrerequisites
+            $result.FirmwareReadiness = $readiness
+            $result.Items += New-FirmwareReadinessItem -Readiness $readiness
+        }
         Write-Log $result.Message "ERROR"
         return $result
     }
@@ -4413,9 +4942,18 @@ try {
         }
 
         $disk = Test-DiskSpace -MinGB $MinDiskSpaceGB
-        Write-Log "Free disk space: $($disk.FreeGB) GB (required: $($disk.RequiredGB) GB)" "DEBUG"
-        if (-not $disk.Sufficient) {
-            $message = "Insufficient disk space"
+        Write-Log $disk.Message "DEBUG"
+        if ($disk.Status -eq "Unknown") {
+            $message = "$($disk.Message); -Force cannot override an unknown disk-safety state"
+            Write-Log $message "ERROR"
+            [void]$preflightItems.Add((New-UpdateItemResult -Name "Disk space" -Status "Unknown" -ProviderCode 4 -Message $message))
+            [void](Add-StageResult (New-StageResult -Name "Preflight" -Status "Failed" `
+                -Attempted $preflightItems.Count -Failed 1 -ProviderCode 4 -Message $message `
+                -Items @($preflightItems) -StartedAt $preflightStart))
+            $script:ExitCode = 4
+            break run
+        } elseif ($disk.Status -eq "Blocked") {
+            $message = $disk.Message
             if (-not $Force) {
                 Write-Log $message "ERROR"
                 [void]$preflightItems.Add((New-UpdateItemResult -Name "Disk space" -Status "Blocked" -ProviderCode 4 -Message $message))
@@ -4425,10 +4963,11 @@ try {
                 $script:ExitCode = 4
                 break run
             }
-            Write-Log "$message overridden by -Force" "WARNING"
-            [void]$preflightItems.Add((New-UpdateItemResult -Name "Disk space" -Status "Warning" -Message "$message overridden"))
+            Write-Log "$message; overridden for non-firmware work by -Force" "WARNING"
+            [void]$preflightItems.Add((New-UpdateItemResult -Name "Disk space" -Status "Warning" `
+                -Message "$message; -Force permits non-firmware work only"))
         } else {
-            [void]$preflightItems.Add((New-UpdateItemResult -Name "Disk space" -Status "Succeeded" -Message "$($disk.FreeGB) GB free"))
+            [void]$preflightItems.Add((New-UpdateItemResult -Name "Disk space" -Status "Succeeded" -Message $disk.Message))
         }
 
         $reboot = Test-PendingReboot
@@ -4449,26 +4988,21 @@ try {
             [void]$preflightItems.Add((New-UpdateItemResult -Name "Pending reboot" -Status "Succeeded"))
         }
 
+        $battery = $null
         if ($IncludeBIOS) {
-            $battery = Test-BatteryPower
-            if ($battery.OnBattery) {
-                $message = "Cannot update BIOS on battery power"
-                if (-not $Force) {
-                    Write-Log $message "ERROR"
-                    [void]$preflightItems.Add((New-UpdateItemResult -Name "Firmware power" -Status "Blocked" -ProviderCode 7 -Message $message))
-                    [void](Add-StageResult (New-StageResult -Name "Preflight" -Status "Failed" `
-                        -Attempted $preflightItems.Count -Failed 1 -ProviderCode 7 -Message $message `
-                        -Items @($preflightItems) -StartedAt $preflightStart))
-                    $script:ExitCode = 7
-                    break run
-                }
-                Write-Log "$message overridden by -Force" "WARNING"
-                [void]$preflightItems.Add((New-UpdateItemResult -Name "Firmware power" -Status "Warning" -Message "$message overridden"))
+            $battery = Test-BatteryPower -MinimumChargePercent $MinFirmwareChargePercent
+            if ($battery.Status -eq "Ready") {
+                Write-Log $battery.Message "INFO"
+                [void]$preflightItems.Add((New-UpdateItemResult -Name "Firmware power" -Status "Succeeded" -Message $battery.Message))
             } else {
-                [void]$preflightItems.Add((New-UpdateItemResult -Name "Firmware power" -Status "Succeeded" -Message "AC power detected"))
+                $powerItemStatus = if ($battery.Status -eq "Blocked") { "Blocked" } else { "Unknown" }
+                Write-Log "$($battery.Message); firmware will be excluded and -Force cannot override this decision" "WARNING"
+                [void]$preflightItems.Add((New-UpdateItemResult -Name "Firmware power" -Status $powerItemStatus `
+                    -ProviderCode 7 -Message "$($battery.Message); firmware will not run"))
             }
         } else {
-            [void]$preflightItems.Add((New-UpdateItemResult -Name "Firmware power" -Status "Skipped" -Message "BIOS updates not requested"))
+            [void]$preflightItems.Add((New-UpdateItemResult -Name "Firmware power" -Status "Skipped" `
+                -Message "Firmware and BIOS updates not requested; use -IncludeBIOS after validating power safeguards"))
         }
 
         if (Test-MeteredConnection) {
@@ -4479,12 +5013,48 @@ try {
         }
 
         $bitlocker = Test-BitLockerEnabled
-        $bitlockerStatus = if ($bitlocker.Status -eq "Unknown") { "Warning" } else { "Succeeded" }
-        [void]$preflightItems.Add((New-UpdateItemResult -Name "BitLocker state" -Status $bitlockerStatus -Message $bitlocker.Status))
-        if ($bitlocker.Enabled) { Write-Log "BitLocker: Active" "INFO" }
+        $bitlockerItemStatus = if ($bitlocker.Status -eq "Unknown") {
+            $(if ($IncludeBIOS) { "Unknown" } else { "Warning" })
+        } else {
+            "Succeeded"
+        }
+        [void]$preflightItems.Add((New-UpdateItemResult -Name "BitLocker state" -Status $bitlockerItemStatus -Message $bitlocker.Message))
+        if ($bitlocker.ProtectionOn) { Write-Log "BitLocker protection: Active" "INFO" }
+        if ($IncludeBIOS -and $bitlocker.Status -eq "Unknown") {
+            Write-Log "$($bitlocker.Message); firmware will be excluded and -Force cannot override this decision" "WARNING"
+        }
 
-        [void](Add-StageResult (New-StageResult -Name "Preflight" -Status "Succeeded" `
-            -Attempted $preflightItems.Count -Message "Preflight checks completed" -Items @($preflightItems) `
+        $modelKnown = -not [string]::IsNullOrWhiteSpace([string]$sysInfo.Manufacturer) -and
+            -not [string]::IsNullOrWhiteSpace([string]$sysInfo.Model)
+        if ($IncludeBIOS) {
+            [void]$preflightItems.Add((New-UpdateItemResult -Name "Firmware model inventory" `
+                -Status $(if ($modelKnown) { "Succeeded" } else { "Unknown" }) `
+                -Message $(if ($modelKnown) {
+                    "Detected $($sysInfo.Manufacturer) $($sysInfo.Model); the OEM applicability scan must still verify support"
+                } else {
+                    "Manufacturer/model is unknown. Repair Win32_ComputerSystem CIM inventory before firmware installation"
+                })))
+        }
+
+        $script:FirmwarePrerequisites = [PSCustomObject][ordered]@{
+            Disk = $disk
+            Power = $battery
+            BitLocker = $bitlocker
+        }
+        $firmwarePreflightBlocked = $IncludeBIOS -and (
+            $disk.Status -ne "Ready" -or
+            $null -eq $battery -or $battery.Status -ne "Ready" -or
+            $bitlocker.Status -ne "Ready" -or
+            -not $modelKnown
+        )
+        $preflightStatus = if ($firmwarePreflightBlocked) { "Partial" } else { "Succeeded" }
+        $preflightMessage = if ($firmwarePreflightBlocked) {
+            "General preflight completed; firmware is blocked until every prerequisite is known-ready"
+        } else {
+            "Preflight checks completed"
+        }
+        [void](Add-StageResult (New-StageResult -Name "Preflight" -Status $preflightStatus `
+            -Attempted $preflightItems.Count -Message $preflightMessage -Items @($preflightItems) `
             -StartedAt $preflightStart -DurationSeconds ([int]((Get-Date) - $preflightStart).TotalSeconds)))
         Write-Host ""
 
@@ -4532,7 +5102,8 @@ try {
             $oemStart = Get-Date
             if ($SkipOEM) {
                 [void](Add-StageResult (New-StageResult -Name "OEM" -Provider "OEM" -Status "Skipped" `
-                    -Skipped 1 -Message "OEM updates skipped by run configuration" -StartedAt $oemStart))
+                    -Skipped 1 -Message "OEM updates skipped by -SkipOEM; remove -SkipOEM to request firmware or OEM drivers" `
+                    -StartedAt $oemStart))
             } else {
                 $manufacturer = [string]$sysInfo.Manufacturer
                 $provider = $manufacturer
@@ -4540,18 +5111,26 @@ try {
 
                 if ($manufacturer -match "DELL|ALIENWARE") {
                     $provider = "Dell Command Update"
-                    $oemResult = Invoke-DellUpdate -IncludeBIOS:$IncludeBIOS
+                    $oemResult = Invoke-DellUpdate -IncludeBIOS:$IncludeBIOS -SystemInfo $sysInfo `
+                        -FirmwarePrerequisites $script:FirmwarePrerequisites
                 } elseif ($manufacturer -match "LENOVO") {
                     $provider = "LSUClient"
-                    $oemResult = Invoke-LenovoUpdate -IncludeBIOS:$IncludeBIOS
+                    $oemResult = Invoke-LenovoUpdate -IncludeBIOS:$IncludeBIOS -SystemInfo $sysInfo `
+                        -FirmwarePrerequisites $script:FirmwarePrerequisites
                 } elseif ($manufacturer -match "HP|HEWLETT") {
                     $provider = "HP Image Assistant"
-                    $oemResult = Invoke-HPUpdate -IncludeBIOS:$IncludeBIOS
+                    $oemResult = Invoke-HPUpdate -IncludeBIOS:$IncludeBIOS -SystemInfo $sysInfo `
+                        -FirmwarePrerequisites $script:FirmwarePrerequisites
                 } else {
                     Write-Log "========== OEM UPDATES ==========" "HEADER"
-                    Write-Log "Manufacturer '$manufacturer' not supported" "INFO"
-                    [void](Add-StageResult (New-StageResult -Name "OEM" -Provider $manufacturer -Status "Skipped" `
-                        -Skipped 1 -Message "Manufacturer is not supported" -StartedAt $oemStart))
+                    $unsupportedMessage = "Manufacturer '$manufacturer' has no supported OEM adapter. Use -SkipOEM for a non-OEM run or add a verified adapter before requesting firmware"
+                    Write-Log $unsupportedMessage $(if ($IncludeBIOS) { "WARNING" } else { "INFO" })
+                    $unsupportedItem = New-UpdateItemResult -Name "OEM model support" `
+                        -Status $(if ($IncludeBIOS) { "Blocked" } else { "Skipped" }) -Message $unsupportedMessage
+                    [void](Add-StageResult (New-StageResult -Name "OEM" -Provider $manufacturer `
+                        -Status $(if ($IncludeBIOS) { "Partial" } else { "Skipped" }) `
+                        -Skipped 1 -Message $unsupportedMessage -Items @($unsupportedItem) -StartedAt $oemStart))
+                    if ($IncludeBIOS) { $script:ExitCode = 7 }
                 }
 
                 if ($oemResult) {
@@ -4559,6 +5138,11 @@ try {
                         -ItemNames @($script:OEMUpdates) -StartedAt $oemStart
                     [void](Add-StageResult $oemStage)
                     if ($oemStage.Status -in @("Failed", "Partial")) { $script:ExitCode = 2 }
+                    $firmwareReadiness = Get-ResultValue -Result $oemResult -Names @("FirmwareReadiness") -Default $null
+                    if ($IncludeBIOS -and $null -ne $firmwareReadiness -and $firmwareReadiness.Status -ne "Ready") {
+                        $script:ExitCode = 7
+                        Write-Log $firmwareReadiness.Message "WARNING"
+                    }
                 }
                 Write-Host ""
             }

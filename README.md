@@ -34,8 +34,8 @@ SystemUpdatePro is a fully automated, self-healing PowerShell script that handle
 ### Safety Features
 - **Lock File**: Prevents concurrent execution with stale lock detection
 - **Disk Space Check**: Blocks execution if insufficient space available
-- **Battery Protection**: Blocks BIOS updates when on battery power
-- **BitLocker Awareness**: Handles BitLocker suspension for BIOS updates (Dell auto-suspends; Lenovo/HP skip BIOS when encrypted)
+- **Fail-Closed Firmware Safety**: Requires a verified OEM/model scan, free space, AC power, at least 50% charge, and known BitLocker state
+- **BitLocker Awareness**: Dell uses its documented automatic suspension path; Lenovo/HP firmware waits until protection is already suspended or disabled
 - **Pending Reboot Detection**: Checks 5 different sources for pending reboots
 - **DryRun Mode**: Preview all available updates without installing anything
 - **Driver Backup**: Export current drivers before installing updates for rollback capability
@@ -148,8 +148,8 @@ cd SystemUpdatePro
 # Irreversibly remove superseded component versions (prevents update uninstall)
 .\SystemUpdatePro.ps1 -ResetComponentBase
 
-# Force run despite warnings (low disk, pending reboot, battery)
-.\SystemUpdatePro.ps1 -Force -IncludeBIOS
+# Force non-firmware work despite low disk or a pending reboot (firmware safeguards remain enforced)
+.\SystemUpdatePro.ps1 -Force -SkipOEM
 
 # Custom configuration
 .\SystemUpdatePro.ps1 -MaxRetries 5 -MaxUpdatePasses 5 -MinDiskSpaceGB 20 -LogRetentionDays 60
@@ -167,7 +167,7 @@ cd SystemUpdatePro
 | `-SkipOEM` | Switch | False | Skip OEM-specific driver/firmware updates |
 | `-SkipWindows` | Switch | False | Skip Windows Update |
 | `-SkipWinget` | Switch | False | Skip Winget upgrade all |
-| `-IncludeBIOS` | Switch | False | Include BIOS updates (requires AC power) |
+| `-IncludeBIOS` | Switch | False | Include BIOS/firmware only after OEM/model, tool, disk, power, charge, and BitLocker checks are known-ready |
 | `-BypassWSUS` | Switch | False | Bypass WSUS, connect directly to Microsoft |
 | `-RepairWindowsUpdate` | Switch | False | Repair Windows Update components before updating |
 | `-CleanupAfter` | Switch | False | Run standard DISM cleanup while retaining installed-update rollback |
@@ -181,12 +181,15 @@ cd SystemUpdatePro
 | `-MaxRetries` | Int | 3 | Maximum retry attempts for failed operations |
 | `-MaxUpdatePasses` | Int | 3 | Maximum Windows Update passes |
 | `-MinDiskSpaceGB` | Int | 10 | Minimum free disk space required (GB) |
+| `-MinFirmwareChargePercent` | Int | 50 | Minimum battery charge for firmware (10-100) |
 | `-LogPath` | String | C:\ProgramData\SystemUpdatePro\Logs | Log directory |
 | `-LogRetentionDays` | Int | 30 | Days to keep old logs |
 | `-Reboot` | Switch | False | Allow automatic reboot if required |
-| `-Force` | Switch | False | Continue despite warnings |
+| `-Force` | Switch | False | Continue non-firmware work despite low disk or pending reboot; never overrides unknown/blocked firmware safety |
 
 `-CleanupAfter` never uses `/ResetBase`. The separate `-ResetComponentBase` switch is intentionally high risk and also requests cleanup, so it does not need to be combined with `-CleanupAfter`. Use `-DryRun -ResetComponentBase` to preview the exact DISM command and rollback impact. Temporary Disk Cleanup `StateFlags0100` registry values are restored after each run, and restoration or `cleanmgr` failures are reported as partial cleanup.
+
+Firmware is excluded by default. With `-IncludeBIOS`, Dell Command Update, LSUClient, or HP Image Assistant must first complete an applicability scan for the detected model. Disk, AC, charge, or BitLocker query failures remain `Unknown` and block firmware even with `-Force`; non-firmware OEM updates may continue. Active BitLocker is accepted only for Dell's documented `-autoSuspendBitLocker=enable` path. Lenovo and HP require protection to be suspended beforehand.
 
 ---
 
@@ -201,7 +204,7 @@ cd SystemUpdatePro
 | 4 | Insufficient disk space |
 | 5 | Pending reboot blocked execution |
 | 6 | Already running (lock file exists) |
-| 7 | Battery power (BIOS update blocked) |
+| 7 | Firmware safety prerequisites blocked or unknown |
 
 ---
 
@@ -218,7 +221,7 @@ SystemUpdatePro writes to the Windows Application event log under source **"Syst
 | 1004 | Insufficient disk space |
 | 1005 | Pending reboot blocked |
 | 1006 | Already running |
-| 1007 | Battery power blocked |
+| 1007 | Firmware safety blocked |
 
 ### Query Events via PowerShell
 ```powershell
@@ -375,7 +378,7 @@ Register-ScheduledTask -TaskName "SystemUpdatePro Weekly" -Action $action -Trigg
 |     +-- Internet connectivity                               |
 |     +-- Disk space verification                              |
 |     +-- Pending reboot detection                             |
-|     +-- Battery status (for BIOS)                            |
+|     +-- OEM/model/tool + disk/power/charge/BitLocker gate    |
 |     +-- Metered connection warning                           |
 |                                                              |
 |  2. DRIVER BACKUP (if -BackupDrivers)                        |
@@ -443,10 +446,13 @@ Use the repair option:
 ```
 
 ### BIOS update blocked
-BIOS updates require:
-- AC power (not battery)
-- The `-IncludeBIOS` flag
-- For Lenovo/HP with BitLocker: Manual BitLocker suspension (Dell auto-suspends)
+BIOS and firmware updates require:
+
+- The `-IncludeBIOS` flag and a successful OEM applicability scan for the detected model
+- At least `-MinDiskSpaceGB` free, verified AC power, and at least `-MinFirmwareChargePercent` battery charge on portable devices
+- A known BitLocker state; Lenovo/HP require protection to be suspended or disabled, while Dell uses its documented automatic suspension option
+
+`Unknown` is intentionally blocking. Follow the actionable reason in the preflight/OEM result (for example, repair CIM/WMI, connect a recognized adapter, charge the battery, repair the OEM tool, or verify BitLocker), then rerun. `-Force` cannot bypass these firmware checks.
 
 ### View detailed logs
 ```powershell

@@ -37,6 +37,22 @@ BeforeAll {
         "Register-ContinuationTask",
         "Test-ContinuationTask",
         "Unregister-ContinuationTask",
+        "Get-SystemPowerStatus",
+        "Test-DiskSpace",
+        "Test-BatteryPower",
+        "Test-BitLockerEnabled",
+        "Test-OEMUpdateIsFirmware",
+        "Test-FirmwareReadiness",
+        "Get-FirmwareUpdatePolicy",
+        "New-FirmwareReadinessItem",
+        "Get-DCUPath",
+        "Install-DellCommandUpdate",
+        "Repair-DellServices",
+        "Invoke-DellUpdate",
+        "Invoke-LenovoUpdate",
+        "Get-HPIAPath",
+        "Install-HPIA",
+        "Invoke-HPUpdate",
         "Get-RegistryValueSnapshot",
         "Restore-RegistryValueSnapshot",
         "Invoke-ComponentCleanup",
@@ -63,6 +79,12 @@ BeforeAll {
         . ([scriptblock]::Create($functionAst.Extent.Text))
     }
 
+    function Get-LSUpdate {}
+    function Install-LSUpdate {
+        param([Parameter(ValueFromPipeline = $true)][object]$InputObject)
+        process { $InputObject }
+    }
+
     function Initialize-SystemUpdateProTestState {
         $script:DryRun = [switch]$false
         $script:WebhookUrl = ""
@@ -74,8 +96,10 @@ BeforeAll {
         $script:RebootRequired = $false
         $script:RunFinalized = $false
         $script:LastEvidenceDelivery = $null
+        $script:OEMUpdates = [System.Collections.ArrayList]::new()
         $script:WindowsUpdates = [System.Collections.ArrayList]::new()
-        $script:StateSchemaVersion = 2
+        $script:WingetUpdates = [System.Collections.ArrayList]::new()
+        $script:StateSchemaVersion = 3
         $script:MaxContinuationAttempts = 3
         $script:RunStartedAt = Get-Date
         $stateTestDirectory = Join-Path $TestDrive ([guid]::NewGuid().ToString("N"))
@@ -89,6 +113,7 @@ BeforeAll {
         $script:ContinuationRegistered = $false
         $script:ContinuationState = $null
         $script:ResumeStageCursor = ""
+        $script:FirmwarePrerequisites = $null
 
         $script:SkipOEM = [switch]$false
         $script:SkipWindows = [switch]$false
@@ -107,6 +132,7 @@ BeforeAll {
         $script:MaxRetries = 3
         $script:MaxUpdatePasses = 3
         $script:MinDiskSpaceGB = 10
+        $script:MinFirmwareChargePercent = 50
         $script:LogPath = $stateTestDirectory
         $script:LogRetentionDays = 30
         $script:EntryScriptPath = $script:SourceScriptPath
@@ -225,13 +251,14 @@ Describe "PowerShell 5.1 continuation state machine" {
         if (-not $secondSave) { throw "Second atomic save failed: $script:LastStateError" }
         $loaded = Get-State
 
-        $loaded.SchemaVersion | Should -Be 2
+        $loaded.SchemaVersion | Should -Be 3
         $loaded.Phase | Should -Be "AwaitingReboot"
         $loaded.RunId | Should -Be "11111111-1111-1111-1111-111111111111"
-        $loaded.Parameters.Count | Should -Be 21
+        $loaded.Parameters.Count | Should -Be 22
         $loaded.Parameters.SkipOEM | Should -BeTrue
         $loaded.Parameters.IncludeBIOS | Should -BeTrue
         $loaded.Parameters.WebhookUrl | Should -Be "https://example.invalid/private-hook"
+        $loaded.Parameters.MinFirmwareChargePercent | Should -Be 50
         $loaded.StageResults.Count | Should -Be 1
         (Test-ContinuationStateAccess -Path $script:StateFile).Valid | Should -BeTrue
         (Get-Acl -LiteralPath $script:StateFile).AreAccessRulesProtected | Should -BeTrue
@@ -254,6 +281,7 @@ Describe "PowerShell 5.1 continuation state machine" {
         $script:MaxRetries = 5
         $script:MaxUpdatePasses = 6
         $script:MinDiskSpaceGB = 20
+        $script:MinFirmwareChargePercent = 65
         $script:LogRetentionDays = 60
         [void]$script:StageResults.Add((New-StageResult -Name "WindowsUpdate" -Status "Succeeded" `
             -Attempted 1 -Installed 1 -RebootRequired $true))
@@ -283,6 +311,7 @@ Describe "PowerShell 5.1 continuation state machine" {
         $script:MaxRetries | Should -Be 5
         $script:MaxUpdatePasses | Should -Be 6
         $script:MinDiskSpaceGB | Should -Be 20
+        $script:MinFirmwareChargePercent | Should -Be 65
         $script:LogRetentionDays | Should -Be 60
         $script:StageResults[0].RebootRequired | Should -BeFalse
         $script:StageResults[0].RebootSatisfied | Should -BeTrue
@@ -375,6 +404,246 @@ Describe "PowerShell 5.1 continuation state machine" {
 
         Test-Path -LiteralPath $script:StateFile | Should -BeFalse
         Should -Invoke Unregister-ScheduledTask -Times 1 -Exactly
+    }
+}
+
+Describe "Fail-closed firmware safety" {
+    BeforeEach {
+        Initialize-SystemUpdateProTestState
+        $script:Force = [switch]$false
+        Mock Write-Log {}
+        $script:FirmwareSystemInfo = @{
+            Manufacturer = "Dell Inc."
+            Model = "Latitude 7450"
+        }
+        $script:ReadyFirmwarePrerequisites = @{
+            Disk = @{ Status = "Ready"; Sufficient = $true; FreeGB = 40; RequiredGB = 10; Message = "40 GB free" }
+            Power = @{
+                Status = "Ready"; HasBattery = $true; OnBattery = $false; OnACPower = $true
+                ChargePercent = 80; RequiredChargePercent = 50; Message = "AC online and battery 80%"
+            }
+            BitLocker = @{
+                Status = "Ready"; State = "Protected"; Enabled = $true; ProtectionOn = $true
+                Suspended = $false; CanSuspend = $true; Method = "XtsAes256"; Message = "BitLocker active"
+            }
+        }
+    }
+
+    It "reports an unqueryable system drive as Unknown instead of sufficient" {
+        Mock Get-CimInstance { throw "CIM unavailable" }
+
+        $disk = Test-DiskSpace -MinGB 10
+
+        $disk.Status | Should -Be "Unknown"
+        $disk.Sufficient | Should -BeFalse
+        $disk.FreeGB | Should -BeNullOrEmpty
+        $disk.Message | Should -Match "Repair CIM/WMI"
+    }
+
+    It "requires both AC power and the configured minimum battery charge" {
+        Mock Get-SystemPowerStatus {
+            [PSCustomObject]@{
+                PowerLineStatus = "Online"
+                BatteryStatus = "High, Charging"
+                BatteryLifePercent = 0.49
+            }
+        }
+
+        $power = Test-BatteryPower -MinimumChargePercent 50
+
+        $power.Status | Should -Be "Blocked"
+        $power.OnACPower | Should -BeTrue
+        $power.ChargePercent | Should -Be 49
+        $power.Message | Should -Match "at least 50%"
+    }
+
+    It "returns Unknown when Windows power telemetry fails" {
+        Mock Get-SystemPowerStatus { throw "GetSystemPowerStatus unavailable" }
+
+        $power = Test-BatteryPower -MinimumChargePercent 50
+
+        $power.Status | Should -Be "Unknown"
+        $power.OnACPower | Should -BeFalse
+        $power.Message | Should -Match "repair the power-status provider"
+    }
+
+    It "returns Unknown instead of disabled when BitLocker cannot be queried" {
+        Mock Get-Command { $null } -ParameterFilter { $Name -eq "Get-BitLockerVolume" }
+
+        $bitLocker = Test-BitLockerEnabled
+
+        $bitLocker.Status | Should -Be "Unknown"
+        $bitLocker.Enabled | Should -BeNullOrEmpty
+        $bitLocker.Message | Should -Match "Get-BitLockerVolume"
+    }
+
+    It "keeps an unknown power state distinct and unsafe even with Force" {
+        $script:Force = [switch]$true
+        $unknownPrerequisites = @{
+            Disk = $script:ReadyFirmwarePrerequisites.Disk
+            Power = @{
+                Status = "Unknown"; OnACPower = $false; ChargePercent = $null
+                Message = "AC power state is unknown. Connect AC and repair the provider"
+            }
+            BitLocker = $script:ReadyFirmwarePrerequisites.BitLocker
+        }
+
+        $readiness = Test-FirmwareReadiness -Requested -Provider "Dell" `
+            -SystemInfo $script:FirmwareSystemInfo -ToolState "Ready" `
+            -SupportsBitLockerAutoSuspend $true -Prerequisites $unknownPrerequisites
+        $item = New-FirmwareReadinessItem -Readiness $readiness
+
+        $readiness.Status | Should -Be "Unknown"
+        $readiness.Safe | Should -BeFalse
+        $readiness.Message | Should -Match "-Force cannot override"
+        $item.Status | Should -Be "Unknown"
+    }
+
+    It "allows protected BitLocker only for a provider with verified auto-suspension" {
+        $dell = Test-FirmwareReadiness -Requested -Provider "Dell" `
+            -SystemInfo $script:FirmwareSystemInfo -ToolState "Ready" `
+            -SupportsBitLockerAutoSuspend $true -Prerequisites $script:ReadyFirmwarePrerequisites
+        $hpInfo = @{ Manufacturer = "HP"; Model = "EliteBook 840 G11" }
+        $hp = Test-FirmwareReadiness -Requested -Provider "HP" `
+            -SystemInfo $hpInfo -ToolState "Ready" -Prerequisites $script:ReadyFirmwarePrerequisites
+
+        $dell.Status | Should -Be "Ready"
+        $dell.RequiresBitLockerSuspension | Should -BeTrue
+        $hp.Status | Should -Be "Blocked"
+        $hp.Message | Should -Match "Suspend protection"
+    }
+
+    It "uses one fail-closed update policy for Dell, Lenovo, and HP" {
+        $blockedReadiness = [PSCustomObject]@{
+            Requested = $true
+            Safe = $false
+            Status = "Blocked"
+            Provider = "Dell"
+            RequiresBitLockerSuspension = $false
+        }
+
+        $policy = Get-FirmwareUpdatePolicy -Readiness $blockedReadiness
+
+        $policy.IncludeFirmware | Should -BeFalse
+        @($policy.DellUpdateTypes) | Should -Not -Contain "bios"
+        @($policy.DellUpdateTypes) | Should -Not -Contain "firmware"
+        @($policy.HPCategories) | Should -Be @("Drivers")
+        $policy.LenovoExcludeFirmware | Should -BeTrue
+    }
+
+    It "adds firmware only after every readiness check succeeds" {
+        $readiness = Test-FirmwareReadiness -Requested -Provider "Dell" `
+            -SystemInfo $script:FirmwareSystemInfo -ToolState "Ready" `
+            -SupportsBitLockerAutoSuspend $true -Prerequisites $script:ReadyFirmwarePrerequisites
+
+        $policy = Get-FirmwareUpdatePolicy -Readiness $readiness
+
+        $policy.IncludeFirmware | Should -BeTrue
+        @($policy.DellUpdateTypes) | Should -Contain "bios"
+        @($policy.DellUpdateTypes) | Should -Contain "firmware"
+        $policy.DellAutoSuspendBitLocker | Should -BeTrue
+        @($policy.HPCategories) | Should -Contain "BIOS"
+        $policy.LenovoExcludeFirmware | Should -BeFalse
+    }
+
+    It "detects Lenovo BIOS, UEFI, and firmware items consistently" {
+        (Test-OEMUpdateIsFirmware -Update @{ Title = "ThinkPad BIOS Update"; Category = "Recommended"; Type = "Package" }) |
+            Should -BeTrue
+        (Test-OEMUpdateIsFirmware -Update @{ Title = "Dock"; Category = "Firmware"; Type = "Package" }) |
+            Should -BeTrue
+        (Test-OEMUpdateIsFirmware -Update @{ Title = "Intel display driver"; Category = "Driver"; Type = "Driver" }) |
+            Should -BeFalse
+    }
+
+    It "treats missing model inventory or an unverified tool as Unknown" {
+        $missingModel = Test-FirmwareReadiness -Requested -Provider "Dell" `
+            -SystemInfo @{ Manufacturer = "Dell"; Model = "" } -ToolState "Ready" `
+            -SupportsBitLockerAutoSuspend $true -Prerequisites $script:ReadyFirmwarePrerequisites
+        $unknownTool = Test-FirmwareReadiness -Requested -Provider "Dell" `
+            -SystemInfo $script:FirmwareSystemInfo -ToolState "Unknown" `
+            -SupportsBitLockerAutoSuspend $true -Prerequisites $script:ReadyFirmwarePrerequisites
+
+        $missingModel.Status | Should -Be "Unknown"
+        $missingModel.Message | Should -Match "Win32_ComputerSystem"
+        $unknownTool.Status | Should -Be "Unknown"
+        $unknownTool.Message | Should -Match "OEM tool"
+    }
+
+    It "removes Dell BIOS and firmware types when a prerequisite is unknown" {
+        $unknownPrerequisites = @{
+            Disk = $script:ReadyFirmwarePrerequisites.Disk
+            Power = @{ Status = "Unknown"; Message = "Power provider unavailable" }
+            BitLocker = $script:ReadyFirmwarePrerequisites.BitLocker
+        }
+        Mock Get-DCUPath { "C:\Program Files\Dell\CommandUpdate\dcu-cli.exe" }
+        Mock Repair-DellServices { $true }
+        Mock Get-Service { @() }
+        Mock Start-Process { [PSCustomObject]@{ ExitCode = 0 } }
+
+        $result = Invoke-DellUpdate -IncludeBIOS -SystemInfo $script:FirmwareSystemInfo `
+            -FirmwarePrerequisites $unknownPrerequisites
+
+        $result.Status | Should -Be "Partial" -Because $result.Message
+        $result.FirmwareReadiness.Status | Should -Be "Unknown"
+        Should -Invoke Start-Process -Times 1 -Exactly -ParameterFilter {
+            $ArgumentList -match "/applyUpdates" -and
+            $ArgumentList -match "-updateType=driver,application,others" -and
+            $ArgumentList -notmatch "-autoSuspendBitLocker"
+        }
+    }
+
+    It "filters Lenovo firmware items while preserving safe driver discovery" {
+        $script:DryRun = [switch]$true
+        $unknownPrerequisites = @{
+            Disk = $script:ReadyFirmwarePrerequisites.Disk
+            Power = @{ Status = "Unknown"; Message = "Power provider unavailable" }
+            BitLocker = $script:ReadyFirmwarePrerequisites.BitLocker
+        }
+        Mock Install-PSModuleWithRetry { $true }
+        Mock Get-Module { [PSCustomObject]@{ Name = "LSUClient"; Version = [Version]"1.8.1" } }
+        Mock Import-Module {}
+        Mock Remove-Item {}
+        Mock Get-LSUpdate {
+            @(
+                [PSCustomObject]@{
+                    ID = "bios-1"; Title = "ThinkPad UEFI BIOS"; Category = "BIOS"; Type = "BIOS"
+                    Installer = [PSCustomObject]@{ Unattended = $true }
+                },
+                [PSCustomObject]@{
+                    ID = "driver-1"; Title = "Intel Ethernet Driver"; Category = "Driver"; Type = "Driver"
+                    Installer = [PSCustomObject]@{ Unattended = $true }
+                }
+            )
+        }
+
+        $result = Invoke-LenovoUpdate -IncludeBIOS `
+            -SystemInfo @{ Manufacturer = "Lenovo"; Model = "ThinkPad T14 Gen 5"; SerialNumber = "TEST" } `
+            -FirmwarePrerequisites $unknownPrerequisites
+
+        $result.Status | Should -Be "Partial" -Because $result.Message
+        $result.Available | Should -Be 1
+        @($result.Items | Where-Object Name -eq "ThinkPad UEFI BIOS").Status | Should -Be "Unknown"
+        @($result.Items | Where-Object Name -eq "Intel Ethernet Driver").Status | Should -Be "Available"
+    }
+
+    It "limits HP application categories to drivers when BitLocker cannot be auto-suspended" {
+        $hpInfo = @{ Manufacturer = "HP"; Model = "EliteBook 840 G11"; SerialNumber = "TEST" }
+        Mock Get-HPIAPath { "C:\Program Files\HP\HPIA\HPImageAssistant.exe" }
+        Mock Get-Process { @() }
+        Mock New-Item {}
+        Mock Remove-Item {}
+        Mock Start-Process { [PSCustomObject]@{ ExitCode = 0 } }
+
+        $result = Invoke-HPUpdate -IncludeBIOS -SystemInfo $hpInfo `
+            -FirmwarePrerequisites $script:ReadyFirmwarePrerequisites
+
+        $result.Status | Should -Be "Partial"
+        $result.FirmwareReadiness.Status | Should -Be "Blocked"
+        Should -Invoke Start-Process -Times 1 -Exactly -ParameterFilter {
+            $ArgumentList -match "/Action:Install" -and
+            $ArgumentList -match "/Category:Drivers" -and
+            $ArgumentList -notmatch "/Category:[^ ]*(Firmware|BIOS)"
+        }
     }
 }
 
