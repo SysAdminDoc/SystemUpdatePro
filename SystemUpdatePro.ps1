@@ -19,7 +19,7 @@
     - Comprehensive retry logic with exponential backoff
     - DryRun mode for safe preview of available updates
     - HTML summary report generation
-    - Webhook notifications (Slack, Teams, generic)
+    - Versioned, retryable webhook notifications (Slack, Teams Workflows, generic)
     - Driver backup before OEM updates
     - Update history tracking with JSON log
     - Bounded, redacted diagnostic and recovery archives
@@ -58,7 +58,7 @@
 .PARAMETER HistoryCount
     Number of history entries to display with -ShowHistory (default: 10)
 .PARAMETER MaxRetries
-    Maximum retry attempts for failed operations (default: 3)
+    Maximum attempts for retryable operations and webhook delivery (default: 3)
 .PARAMETER MaxUpdatePasses
     Maximum Windows Update passes (default: 3)
 .PARAMETER MinDiskSpaceGB
@@ -203,6 +203,7 @@ $script:Version = "4.1.0"
 $script:ProductName = "SystemUpdatePro"
 $script:WebhookSecretReference = [string]$WebhookSecretReference
 $script:WebhookUrl = ""
+$script:MaxRetries = [int]$MaxRetries
 $script:EvidenceMaxSizeMB = [int]$EvidenceMaxSizeMB
 $script:RedactionMode = [string]$RedactionMode
 $script:EventLogSource = "SystemUpdatePro"
@@ -212,6 +213,8 @@ $script:CapabilitySchemaVersion = 1
 $script:HistorySchemaVersion = 2
 $script:LockSchemaVersion = 1
 $script:DiagnosticBundleSchemaVersion = 1
+$script:WebhookPayloadSchemaVersion = 2
+$script:WebhookDeliverySchemaVersion = 1
 $script:MaxContinuationAttempts = 3
 $script:RunId = [guid]::NewGuid().ToString()
 $script:RunStartedAt = Get-Date
@@ -223,6 +226,7 @@ $script:HistoryFile = "C:\ProgramData\SystemUpdatePro\update_history.json"
 $script:TaskName = "SystemUpdatePro_Continue"
 $script:MutationJournalSchemaVersion = 1
 $script:MutationJournalDirectory = "C:\ProgramData\SystemUpdatePro\Journals"
+$script:WebhookDeliveryDirectory = "C:\ProgramData\SystemUpdatePro\WebhookDeliveries"
 $script:MutationJournal = $null
 $script:MutationEvidence = [System.Collections.ArrayList]::new()
 $script:WindowsRoot = [string]$env:SystemRoot
@@ -1129,6 +1133,7 @@ function Initialize-RunEnvironment {
         foreach ($path in @(
             $script:DataPath,
             $script:MutationJournalDirectory,
+            $script:WebhookDeliveryDirectory,
             $LogPath,
             (Join-Path $script:DataPath "DriverBackups")
         )) {
@@ -2502,6 +2507,22 @@ function Get-EvidenceRetentionCandidate {
                 Bytes = [long]$file.Length
                 Files = 1
                 Category = "DiagnosticBundle"
+            })
+        }
+    }
+
+    if (Test-Path -LiteralPath $script:WebhookDeliveryDirectory -PathType Container) {
+        foreach ($file in @(Get-ChildItem -LiteralPath $script:WebhookDeliveryDirectory `
+            -File -Force -ErrorAction SilentlyContinue | Where-Object {
+                $_.Name -match "^[A-Za-z0-9._-]+\.json(?:\.previous)?$"
+            })) {
+            [void]$candidates.Add([PSCustomObject]@{
+                Path = $file.FullName
+                Kind = "File"
+                LastWriteTime = $file.LastWriteTime
+                Bytes = [long]$file.Length
+                Files = 1
+                Category = "WebhookDelivery"
             })
         }
     }
@@ -8380,108 +8401,518 @@ function New-HTMLReport {
 # WEBHOOK NOTIFICATIONS
 # ============================================================================
 
-function Send-WebhookNotification {
+function Get-WebhookIdempotencyKey {
     param(
-        [string]$Url,
+        [Parameter(Mandatory = $true)]
+        [string]$RunId
+    )
+
+    $hashAlgorithm = [Security.Cryptography.SHA256]::Create()
+    try {
+        $contractKey = "{0}|webhook-v{1}|{2}|terminal" -f @(
+            $script:ProductName,
+            $script:WebhookPayloadSchemaVersion,
+            $RunId
+        )
+        $digest = $hashAlgorithm.ComputeHash(
+            [Text.Encoding]::UTF8.GetBytes($contractKey)
+        )
+        return ([BitConverter]::ToString($digest) -replace "-", "").ToLowerInvariant()
+    } finally {
+        $hashAlgorithm.Dispose()
+    }
+}
+
+function Get-WebhookEvidenceUri {
+    param(
+        [Parameter(Mandatory = $true)]
         [hashtable]$RunData
     )
 
-    if (-not $Url) { return $false }
-    $endpointValidation = Test-HttpsWebhookEndpoint -Endpoint $Url
-    if (-not $endpointValidation.Valid) {
-        Write-Log "Webhook notification rejected: $($endpointValidation.Reason)" "WARNING"
-        return $false
+    $delivery = Get-ResultValue -Result $RunData -Names @("EvidenceDelivery") -Default $null
+    $report = if ($null -ne $delivery) {
+        Get-ResultValue -Result $delivery -Names @("Report") -Default $null
+    } else {
+        $null
     }
-    Add-SensitiveEvidenceValue -Value $Url
+    $detail = if ($null -ne $report) {
+        [string](Get-ResultValue -Result $report -Names @("Detail") -Default "")
+    } else {
+        ""
+    }
+    if ([string]::IsNullOrWhiteSpace($detail)) { return "" }
+    try {
+        if ([IO.Path]::IsPathRooted($detail)) {
+            return (New-Object Uri([IO.Path]::GetFullPath($detail))).AbsoluteUri
+        }
+        $uri = $null
+        if ([uri]::TryCreate($detail, [UriKind]::Absolute, [ref]$uri)) {
+            return $uri.AbsoluteUri
+        }
+    } catch {
+        return ""
+    }
+    return ""
+}
 
-    Write-Log "Sending webhook notification..." "DEBUG"
+function New-WebhookPayload {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSUseShouldProcessForStateChangingFunctions", "", Justification = "Creates an in-memory webhook contract only.")]
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$RunData
+    )
 
-    $overallStatus = switch ($RunData.ExitCode) {
+    $runId = [string](Get-ResultValue -Result $RunData -Names @("RunId", "run_id") -Default "")
+    $idempotencyKey = Get-WebhookIdempotencyKey -RunId $runId
+    $overallStatus = switch ([int]$RunData.ExitCode) {
         0 { "success" }
         1 { "success" }
         2 { "partial" }
         default { "failed" }
     }
+    $stageSummary = @($RunData.Stages | ForEach-Object {
+        [ordered]@{
+            name = [string](Get-ResultValue -Result $_ -Names @("Name") -Default "")
+            provider = [string](Get-ResultValue -Result $_ -Names @("Provider") -Default "")
+            status = [string](Get-ResultValue -Result $_ -Names @("Status") -Default "")
+            attempted = [int](Get-ResultValue -Result $_ -Names @("Attempted") -Default 0)
+            available = [int](Get-ResultValue -Result $_ -Names @("Available") -Default 0)
+            installed = [int](Get-ResultValue -Result $_ -Names @("Installed") -Default 0)
+            failed = [int](Get-ResultValue -Result $_ -Names @("Failed") -Default 0)
+            skipped = [int](Get-ResultValue -Result $_ -Names @("Skipped") -Default 0)
+            reboot_required = [bool](Get-ResultValue -Result $_ -Names @("RebootRequired") -Default $false)
+            provider_exit_code = [int](Get-ResultValue -Result $_ -Names @("ProviderExitCode") -Default 0)
+        }
+    })
 
-    # Generic payload
-    $payload = @{
-        schema_version  = $RunData.SchemaVersion
-        run_id          = $RunData.RunId
-        started_at      = $RunData.StartedAt
-        completed_at    = $RunData.CompletedAt
-        hostname        = $env:COMPUTERNAME
-        status          = $overallStatus
-        oem_updates     = $RunData.OEMUpdates
-        windows_updates = $RunData.WindowsUpdates
-        winget_updates  = $RunData.WingetUpdates
-        total_installed = $RunData.TotalInstalled
-        total_available = $RunData.TotalAvailable
-        total_failed    = $RunData.TotalFailed
-        reboot_required = $RunData.RebootRequired
-        exit_code       = $RunData.ExitCode
-        errors          = @($RunData.Errors)
-        warnings        = @($RunData.Warnings)
-        stages          = @($RunData.Stages)
-        dependencies    = @($RunData.Dependencies)
+    return Protect-EvidenceObject -InputObject ([ordered]@{
+        schema_version = $script:WebhookPayloadSchemaVersion
+        event_type = "system_update.completed"
+        run_id = $runId
+        idempotency_key = $idempotencyKey
+        started_at = [string](Get-ResultValue -Result $RunData -Names @("StartedAt") -Default "")
+        completed_at = [string](Get-ResultValue -Result $RunData -Names @("CompletedAt") -Default "")
+        hostname = $env:COMPUTERNAME
+        status = $overallStatus
+        dry_run = $DryRun.IsPresent
+        evidence_uri = Get-WebhookEvidenceUri -RunData $RunData
+        oem_updates = [int]$RunData.OEMUpdates
+        windows_updates = [int]$RunData.WindowsUpdates
+        winget_updates = [int]$RunData.WingetUpdates
+        total_installed = [int]$RunData.TotalInstalled
+        total_available = [int]$RunData.TotalAvailable
+        total_failed = [int]$RunData.TotalFailed
+        reboot_required = [bool]$RunData.RebootRequired
+        exit_code = [int]$RunData.ExitCode
+        runtime_seconds = [int]$RunData.DurationSeconds
+        stage_summary = $stageSummary
+        errors = @($RunData.Errors)
+        warnings = @($RunData.Warnings)
+        dependencies = @($RunData.Dependencies)
         mutation_recovery = @($RunData.MutationRecovery)
-        capabilities    = $RunData.Capabilities
-        retention       = $RunData.Retention
-        runtime_seconds = $RunData.DurationSeconds
-    }
-    $payload = Protect-EvidenceObject -InputObject $payload
+        capabilities = $RunData.Capabilities
+        retention = $RunData.Retention
+    })
+}
+
+function Get-WebhookChannel {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Url
+    )
 
     try {
-        # Detect webhook type and format accordingly
-        if ($Url -match 'hooks\.slack\.com') {
-            # Slack format
-            $statusIcon = switch ($overallStatus) {
-                "success" { "OK" }
-                "partial" { "WARN" }
-                "failed"  { "FAIL" }
-            }
-            $dryLabel = if ($DryRun) { " [DRY RUN]" } else { "" }
-            $slackPayload = @{
-                text = "SystemUpdatePro$dryLabel - $($env:COMPUTERNAME)`nStatus: $statusIcon $overallStatus | OEM: $($RunData.OEMUpdates) | WinUpd: $($RunData.WindowsUpdates) | Winget: $($RunData.WingetUpdates) | Runtime: $($RunData.DurationSeconds)s"
-            }
-            $body = $slackPayload | ConvertTo-Json -Depth 3
+        $uri = [uri]$Url
+        $hostName = $uri.DnsSafeHost.ToLowerInvariant()
+        if ($hostName -eq "hooks.slack.com") { return "Slack" }
+        if ($hostName.EndsWith(".logic.azure.com") -and
+            $uri.AbsolutePath -match "(?i)/workflows/") {
+            return "TeamsWorkflow"
         }
-        elseif ($Url -match 'webhook\.office\.com' -or $Url -match 'workflows.*\.logic\.azure\.com') {
-            # Microsoft Teams format
-            $dryLabel = if ($DryRun) { " [DRY RUN]" } else { "" }
-            $teamsPayload = @{
-                "@type"    = "MessageCard"
-                "@context" = "http://schema.org/extensions"
-                summary    = "SystemUpdatePro Report"
-                title      = "SystemUpdatePro$dryLabel - $($env:COMPUTERNAME)"
-                themeColor = switch ($overallStatus) { "success" { "00FF00" }; "partial" { "FFFF00" }; "failed" { "FF0000" } }
-                sections   = @(
-                    @{
-                        facts = @(
-                            @{ name = "Status"; value = $overallStatus.ToUpper() },
-                            @{ name = "OEM Updates"; value = "$($RunData.OEMUpdates)" },
-                            @{ name = "Windows Updates"; value = "$($RunData.WindowsUpdates)" },
-                            @{ name = "Winget Updates"; value = "$($RunData.WingetUpdates)" },
-                            @{ name = "Runtime"; value = "$($RunData.DurationSeconds) seconds" },
-                            @{ name = "Errors"; value = "$($RunData.Errors.Count)" }
+        if ($hostName -match "(?i)(^|\.)webhook\.office\.com$" -or
+            $hostName -match "(?i)(^|\.)outlook\.office\.com$") {
+            return "TeamsConnector"
+        }
+    } catch {
+        return "Generic"
+    }
+    return "Generic"
+}
+
+function ConvertTo-WebhookRequest {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary]$Payload,
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("Slack", "TeamsWorkflow", "TeamsConnector", "Generic")]
+        [string]$Channel
+    )
+
+    $statusLabel = ([string]$Payload.status).ToUpperInvariant()
+    $modeLabel = if ($Payload.dry_run) { " [DRY RUN]" } else { "" }
+    if ($Channel -eq "Slack") {
+        $bodyObject = [ordered]@{
+            text = (
+                "SystemUpdatePro$modeLabel - $($Payload.hostname)`n" +
+                "Status: $statusLabel | Installed: $($Payload.total_installed) | " +
+                "Failed: $($Payload.total_failed) | Reboot: $($Payload.reboot_required)`n" +
+                "Run: $($Payload.run_id) | Evidence: $($Payload.evidence_uri)"
+            )
+        }
+    } elseif ($Channel -eq "TeamsWorkflow") {
+        $cardColor = switch ([string]$Payload.status) {
+            "success" { "Good" }
+            "partial" { "Warning" }
+            default { "Attention" }
+        }
+        $bodyObject = [ordered]@{
+            type = "message"
+            attachments = @(
+                [ordered]@{
+                    contentType = "application/vnd.microsoft.card.adaptive"
+                    contentUrl = $null
+                    content = [ordered]@{
+                        '$schema' = "http://adaptivecards.io/schemas/adaptive-card.json"
+                        type = "AdaptiveCard"
+                        version = "1.4"
+                        body = @(
+                            [ordered]@{
+                                type = "TextBlock"
+                                text = "SystemUpdatePro$modeLabel · $statusLabel"
+                                size = "Large"
+                                weight = "Bolder"
+                                color = $cardColor
+                                wrap = $true
+                            },
+                            [ordered]@{
+                                type = "FactSet"
+                                facts = @(
+                                    @{ title = "Endpoint"; value = [string]$Payload.hostname },
+                                    @{ title = "Installed"; value = [string]$Payload.total_installed },
+                                    @{ title = "Failed"; value = [string]$Payload.total_failed },
+                                    @{ title = "Reboot"; value = [string]$Payload.reboot_required },
+                                    @{ title = "Run ID"; value = [string]$Payload.run_id },
+                                    @{ title = "Evidence"; value = [string]$Payload.evidence_uri }
+                                )
+                            },
+                            [ordered]@{
+                                type = "TextBlock"
+                                text = "Idempotency: $($Payload.idempotency_key)"
+                                isSubtle = $true
+                                spacing = "Small"
+                                wrap = $true
+                            }
                         )
                     }
-                )
+                }
+            )
+        }
+    } elseif ($Channel -eq "TeamsConnector") {
+        $bodyObject = [ordered]@{
+            "@type" = "MessageCard"
+            "@context" = "http://schema.org/extensions"
+            summary = "SystemUpdatePro $statusLabel"
+            title = "SystemUpdatePro$modeLabel - $($Payload.hostname)"
+            themeColor = switch ([string]$Payload.status) {
+                "success" { "00A36C" }
+                "partial" { "E0A800" }
+                default { "C62828" }
             }
-            $body = $teamsPayload | ConvertTo-Json -Depth 5
+            sections = @(
+                @{
+                    facts = @(
+                        @{ name = "Status"; value = $statusLabel },
+                        @{ name = "Installed"; value = [string]$Payload.total_installed },
+                        @{ name = "Failed"; value = [string]$Payload.total_failed },
+                        @{ name = "Run ID"; value = [string]$Payload.run_id },
+                        @{ name = "Evidence"; value = [string]$Payload.evidence_uri },
+                        @{ name = "Idempotency"; value = [string]$Payload.idempotency_key }
+                    )
+                }
+            )
         }
-        else {
-            # Generic webhook
-            $body = $payload | ConvertTo-Json -Depth 12
-        }
-
-        Invoke-RestMethod -Uri $Url -Method Post -Body $body -ContentType "application/json" -TimeoutSec 30 -ErrorAction Stop | Out-Null
-        Write-Log "Webhook notification sent" "SUCCESS"
-        return $true
+    } else {
+        $bodyObject = $Payload
     }
-    catch {
-        Write-Log "Webhook notification failed: $($_.Exception.Message)" "WARNING"
+    return [PSCustomObject]@{
+        Channel = $Channel
+        ContentType = "application/json"
+        Body = ($bodyObject | ConvertTo-Json -Depth 24 -Compress)
+    }
+}
+
+function Get-WebhookRetryDelay {
+    param(
+        [AllowNull()][object]$Headers
+    )
+
+    if ($null -eq $Headers) { return $null }
+    $value = $null
+    try {
+        $value = $Headers["Retry-After"]
+    } catch {
+        $property = $Headers.PSObject.Properties["Retry-After"]
+        if ($null -ne $property) { $value = $property.Value }
+    }
+    if ($value -is [System.Collections.IEnumerable] -and $value -isnot [string]) {
+        $value = @($value | Select-Object -First 1)
+        if ($value.Count -gt 0) { $value = $value[0] }
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$value)) { return $null }
+
+    $seconds = 0
+    if ([int]::TryParse([string]$value, [ref]$seconds)) {
+        return [math]::Max(0, $seconds)
+    }
+    $retryAt = [DateTimeOffset]::MinValue
+    if ([DateTimeOffset]::TryParse([string]$value, [ref]$retryAt)) {
+        return [math]::Max(
+            0,
+            [int][math]::Ceiling(($retryAt - [DateTimeOffset]::UtcNow).TotalSeconds)
+        )
+    }
+    return $null
+}
+
+function Invoke-WebhookRequest {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSUseShouldProcessForStateChangingFunctions", "", Justification = "Sends an explicitly configured HTTPS webhook request and returns transport evidence.")]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Url,
+        [Parameter(Mandatory = $true)]
+        [string]$Body,
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary]$Headers,
+        [string]$ContentType = "application/json",
+        [ValidateRange(1, 120)]
+        [int]$TimeoutSeconds = 30
+    )
+
+    $statusCode = 0
+    $responseHeaders = $null
+    try {
+        $response = Invoke-WebRequest -Uri $Url -Method Post -Body $Body `
+            -ContentType $ContentType -Headers $Headers -TimeoutSec $TimeoutSeconds `
+            -MaximumRedirection 0 -UseBasicParsing -ErrorAction Stop
+        $statusCode = [int]$response.StatusCode
+        $responseHeaders = $response.Headers
+        return [PSCustomObject]@{
+            Success = ($statusCode -ge 200 -and $statusCode -lt 300)
+            StatusCode = $statusCode
+            RetryAfterSeconds = Get-WebhookRetryDelay -Headers $responseHeaders
+            Error = ""
+        }
+    } catch {
+        try {
+            if ($null -ne $_.Exception.Response) {
+                $statusCode = [int]$_.Exception.Response.StatusCode
+                $responseHeaders = $_.Exception.Response.Headers
+            }
+        } catch {
+            $statusCode = 0
+        }
+        return [PSCustomObject]@{
+            Success = $false
+            StatusCode = $statusCode
+            RetryAfterSeconds = Get-WebhookRetryDelay -Headers $responseHeaders
+            Error = Protect-EvidenceText -Text $_.Exception.Message
+        }
+    }
+}
+
+function Get-WebhookDeliveryPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RunId
+    )
+
+    $safeRunId = [regex]::Replace($RunId, "[^A-Za-z0-9._-]", "_")
+    if ([string]::IsNullOrWhiteSpace($safeRunId)) {
+        $safeRunId = Get-WebhookIdempotencyKey -RunId $RunId
+    }
+    if ($safeRunId.Length -gt 128) { $safeRunId = $safeRunId.Substring(0, 128) }
+    return Join-Path $script:WebhookDeliveryDirectory "$safeRunId.json"
+}
+
+function Test-WebhookDeliveryResult {
+    param(
+        [AllowNull()][object]$Delivery
+    )
+
+    if ($Delivery -isnot [System.Collections.IDictionary] -or
+        [int]$Delivery.SchemaVersion -ne $script:WebhookDeliverySchemaVersion) {
+        return [PSCustomObject]@{ Valid = $false; Reason = "Webhook delivery schema is invalid" }
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$Delivery.RunId) -or
+        [string]::IsNullOrWhiteSpace([string]$Delivery.IdempotencyKey)) {
+        return [PSCustomObject]@{ Valid = $false; Reason = "Webhook delivery correlation is missing" }
+    }
+    if ([string]$Delivery.TerminalStatus -notin @(
+        "Pending", "Retrying", "Succeeded", "Failed", "Rejected"
+    )) {
+        return [PSCustomObject]@{ Valid = $false; Reason = "Webhook terminal status is invalid" }
+    }
+    if ([int]$Delivery.AttemptCount -ne @($Delivery.Attempts).Count) {
+        return [PSCustomObject]@{ Valid = $false; Reason = "Webhook attempt count is inconsistent" }
+    }
+    if ([int]$Delivery.MaximumAttempts -lt 1 -or [int]$Delivery.MaximumAttempts -gt 10) {
+        return [PSCustomObject]@{ Valid = $false; Reason = "Webhook attempt bound is invalid" }
+    }
+    return [PSCustomObject]@{ Valid = $true; Reason = "" }
+}
+
+function Save-WebhookDeliveryResult {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary]$Delivery
+    )
+
+    try {
+        if (-not (New-ProtectedDirectory -Path $script:WebhookDeliveryDirectory)) {
+            throw "Webhook delivery directory could not be protected"
+        }
+        $Delivery["LastUpdatedAt"] = (Get-Date).ToUniversalTime().ToString("o")
+        $Delivery["LocalRecordPath"] = Get-WebhookDeliveryPath -RunId ([string]$Delivery.RunId)
+        $Delivery["LocalRecordStatus"] = "Succeeded"
+        if (-not (Write-ProtectedAtomicJson -Path $Delivery.LocalRecordPath `
+            -Data $Delivery -Depth 24 `
+            -DataValidationScript ${function:Test-WebhookDeliveryResult})) {
+            throw $script:LastEvidenceWriteError
+        }
+        return $true
+    } catch {
+        $Delivery["LocalRecordStatus"] = "Failed"
+        $Delivery["LocalRecordError"] = Protect-EvidenceText -Text $_.Exception.Message
+        $script:LastWebhookDeliveryError = $_.Exception.Message
         return $false
     }
+}
+
+function Send-WebhookNotification {
+    param(
+        [string]$Url,
+        [hashtable]$RunData,
+        [ValidateRange(1, 10)]
+        [int]$MaximumAttempts = 3
+    )
+
+    $runId = [string](Get-ResultValue -Result $RunData -Names @("RunId", "run_id") -Default "")
+    $idempotencyKey = Get-WebhookIdempotencyKey -RunId $runId
+    $delivery = [ordered]@{
+        SchemaVersion = $script:WebhookDeliverySchemaVersion
+        RunId = $runId
+        PayloadSchemaVersion = $script:WebhookPayloadSchemaVersion
+        IdempotencyKey = $idempotencyKey
+        Channel = "Unknown"
+        EvidenceUri = ""
+        StartedAt = (Get-Date).ToUniversalTime().ToString("o")
+        LastUpdatedAt = ""
+        CompletedAt = ""
+        MaximumAttempts = $MaximumAttempts
+        AttemptCount = 0
+        Attempts = @()
+        TerminalStatus = "Pending"
+        LocalRecordStatus = "Pending"
+        LocalRecordPath = ""
+        LocalRecordError = ""
+        Error = ""
+    }
+    Add-SensitiveEvidenceValue -Value $Url
+    $endpointValidation = Test-HttpsWebhookEndpoint -Endpoint $Url
+    if (-not $endpointValidation.Valid) {
+        $delivery["TerminalStatus"] = "Rejected"
+        $delivery["CompletedAt"] = (Get-Date).ToUniversalTime().ToString("o")
+        $delivery["Error"] = $endpointValidation.Reason
+        [void](Save-WebhookDeliveryResult -Delivery $delivery)
+        Write-Log "Webhook notification rejected: $($endpointValidation.Reason)" "WARNING"
+        return [PSCustomObject]$delivery
+    }
+
+    try {
+        $payload = New-WebhookPayload -RunData $RunData
+        $channel = Get-WebhookChannel -Url $Url
+        $request = ConvertTo-WebhookRequest -Payload $payload -Channel $channel
+        $delivery["Channel"] = $channel
+        $delivery["EvidenceUri"] = [string]$payload.evidence_uri
+    } catch {
+        $delivery["TerminalStatus"] = "Failed"
+        $delivery["CompletedAt"] = (Get-Date).ToUniversalTime().ToString("o")
+        $delivery["Error"] = Protect-EvidenceText -Text $_.Exception.Message
+        [void](Save-WebhookDeliveryResult -Delivery $delivery)
+        Write-Log "Webhook payload construction failed: $($delivery.Error)" "WARNING"
+        return [PSCustomObject]$delivery
+    }
+    $requestHeaders = [ordered]@{
+        "Idempotency-Key" = $idempotencyKey
+        "X-SystemUpdatePro-Run-Id" = $runId
+    }
+    Write-Log "Sending $channel webhook notification..." "DEBUG"
+
+    for ($attemptNumber = 1; $attemptNumber -le $MaximumAttempts; $attemptNumber++) {
+        $attemptStartedAt = Get-Date
+        $response = Invoke-WebhookRequest -Url $Url -Body $request.Body `
+            -ContentType $request.ContentType -Headers $requestHeaders
+        $attemptRecord = [ordered]@{
+            Attempt = $attemptNumber
+            StartedAt = $attemptStartedAt.ToUniversalTime().ToString("o")
+            CompletedAt = (Get-Date).ToUniversalTime().ToString("o")
+            StatusCode = [int]$response.StatusCode
+            Outcome = $(if ($response.Success) { "Succeeded" } else { "Failed" })
+            RetryAfterSeconds = $response.RetryAfterSeconds
+            DelayBeforeNextSeconds = 0
+            Error = Protect-EvidenceText -Text $response.Error
+        }
+
+        if ($response.Success) {
+            $delivery["Attempts"] = @($delivery.Attempts) + @($attemptRecord)
+            $delivery["AttemptCount"] = @($delivery.Attempts).Count
+            $delivery["TerminalStatus"] = "Succeeded"
+            $delivery["CompletedAt"] = (Get-Date).ToUniversalTime().ToString("o")
+            $delivery["Error"] = ""
+            [void](Save-WebhookDeliveryResult -Delivery $delivery)
+            Write-Log "Webhook notification sent on attempt $attemptNumber" "SUCCESS"
+            return [PSCustomObject]$delivery
+        }
+
+        $responseStatusCode = [int]$response.StatusCode
+        $transientStatus = (
+            $responseStatusCode -in @(0, 408, 425, 429) -or
+            ($responseStatusCode -ge 500 -and $responseStatusCode -le 599)
+        )
+        $canRetry = ($transientStatus -and $attemptNumber -lt $MaximumAttempts)
+        if ($canRetry) {
+            $delaySeconds = if ($null -ne $response.RetryAfterSeconds) {
+                [int]$response.RetryAfterSeconds
+            } else {
+                [int][math]::Pow(2, $attemptNumber)
+            }
+            $delaySeconds = [math]::Min(60, [math]::Max(0, $delaySeconds))
+            $attemptRecord["Outcome"] = "Retrying"
+            $attemptRecord["DelayBeforeNextSeconds"] = $delaySeconds
+        }
+        $delivery["Attempts"] = @($delivery.Attempts) + @($attemptRecord)
+        $delivery["AttemptCount"] = @($delivery.Attempts).Count
+
+        if (-not $canRetry) {
+            $delivery["TerminalStatus"] = "Failed"
+            $delivery["CompletedAt"] = (Get-Date).ToUniversalTime().ToString("o")
+            $delivery["Error"] = if (-not [string]::IsNullOrWhiteSpace($response.Error)) {
+                Protect-EvidenceText -Text $response.Error
+            } else {
+                "Webhook returned HTTP status $($response.StatusCode)"
+            }
+            [void](Save-WebhookDeliveryResult -Delivery $delivery)
+            Write-Log "Webhook notification failed after $attemptNumber attempt(s): $($delivery.Error)" "WARNING"
+            return [PSCustomObject]$delivery
+        }
+
+        $delivery["TerminalStatus"] = "Retrying"
+        [void](Save-WebhookDeliveryResult -Delivery $delivery)
+        if ($attemptRecord.DelayBeforeNextSeconds -gt 0) {
+            Start-Sleep -Seconds $attemptRecord.DelayBeforeNextSeconds
+        }
+    }
+    return [PSCustomObject]$delivery
 }
 
 function Invoke-TerminalEvidence {
@@ -8551,11 +8982,24 @@ Duration: $($RunData.DurationSeconds) seconds
 
     if ($WebhookEndpoint) {
         try {
-            if (Send-WebhookNotification -Url $WebhookEndpoint -RunData $RunData) {
+            $webhookResult = Send-WebhookNotification -Url $WebhookEndpoint `
+                -RunData $RunData -MaximumAttempts $script:MaxRetries
+            $delivery.Webhook["SchemaVersion"] = $webhookResult.SchemaVersion
+            $delivery.Webhook["PayloadSchemaVersion"] = $webhookResult.PayloadSchemaVersion
+            $delivery.Webhook["Channel"] = $webhookResult.Channel
+            $delivery.Webhook["IdempotencyKey"] = $webhookResult.IdempotencyKey
+            $delivery.Webhook["EvidenceUri"] = $webhookResult.EvidenceUri
+            $delivery.Webhook["MaximumAttempts"] = $webhookResult.MaximumAttempts
+            $delivery.Webhook["AttemptCount"] = $webhookResult.AttemptCount
+            $delivery.Webhook["Attempts"] = @($webhookResult.Attempts)
+            $delivery.Webhook["TerminalStatus"] = $webhookResult.TerminalStatus
+            $delivery.Webhook["LocalRecordStatus"] = $webhookResult.LocalRecordStatus
+            $delivery.Webhook["LocalRecordPath"] = $webhookResult.LocalRecordPath
+            if ($webhookResult.TerminalStatus -eq "Succeeded") {
                 $delivery.Webhook.Status = "Succeeded"
             } else {
                 $delivery.Webhook.Status = "Failed"
-                $delivery.Webhook.Detail = "Webhook delivery failed"
+                $delivery.Webhook.Detail = [string]$webhookResult.Error
             }
         } catch {
             $delivery.Webhook.Status = "Failed"
@@ -9037,7 +9481,19 @@ function Get-DiagnosticEvidenceFile {
             }
         }
     }
-    return @($items | Select-Object -First 24)
+    if (Test-Path -LiteralPath $script:WebhookDeliveryDirectory -PathType Container) {
+        foreach ($file in @(Get-ChildItem -LiteralPath $script:WebhookDeliveryDirectory `
+            -File -Force -Filter "*.json" -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 3)) {
+            [void]$items.Add([PSCustomObject]@{
+                Path = $file.FullName
+                RelativePath = "evidence/webhook/$($file.Name)"
+                Category = "WebhookDelivery"
+                MaximumBytes = 1048576
+            })
+        }
+    }
+    return @($items | Select-Object -First 30)
 }
 
 function Get-DiagnosticWindowsEvidence {

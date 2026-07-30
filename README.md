@@ -53,7 +53,7 @@ SystemUpdatePro is a fully automated, self-healing PowerShell script that handle
 - **Post-Reboot Continuation**: Versioned, bounded state machine resumes update stages with the original run settings
 - **Evidence Retention**: Applies age and total-size limits across logs, transcripts, reports, OEM output, quarantine files, and driver backups
 - **HTML Reports**: Responsive operations-dashboard report with update channels, dependency provenance, retention evidence, device profile, exceptions, and print styles
-- **Webhook Notifications**: Send completion status to Slack, Teams, or any generic webhook
+- **Webhook Notifications**: Send a versioned, idempotent completion contract to Slack, Teams Workflows/Adaptive Cards, legacy Teams connectors, or a generic HTTPS endpoint with durable retry evidence
 - **Update History**: Schema-versioned JSON history with stage/item outcomes, provider codes, platform/provider capabilities, dependency provenance, and evidence-delivery status
 
 ---
@@ -217,7 +217,7 @@ The standalone command requires administrator privileges, prints the completed a
 | `-ShowHistory` | Switch | False | Display previous update run history |
 | `-WebhookSecretReference` | String | (none) | `env:VARIABLE_NAME` or `file:C:\path\config.json`; the resolved value must be HTTPS |
 | `-HistoryCount` | Int | 10 | Number of history entries to show (1-100) |
-| `-MaxRetries` | Int | 3 | Maximum retry attempts for failed operations (1-10) |
+| `-MaxRetries` | Int | 3 | Maximum attempts for retryable operations and webhook delivery (1-10) |
 | `-MaxUpdatePasses` | Int | 3 | Maximum Windows Update passes (1-10) |
 | `-MinDiskSpaceGB` | Int | 10 | Minimum free disk space required (1-1024 GB) |
 | `-MinFirmwareChargePercent` | Int | 50 | Minimum battery charge for firmware (10-100) |
@@ -288,6 +288,7 @@ Get-EventLog -LogName Application -Source "SystemUpdatePro" -Newest 10
 | `C:\ProgramData\SystemUpdatePro\update_history.json` | Update history log (last 100 runs) |
 | `C:\ProgramData\SystemUpdatePro\DriverBackups\` | Driver backup snapshots (last 3 kept) |
 | `C:\ProgramData\SystemUpdatePro\Bundles\` | Protected diagnostic/recovery ZIP archives |
+| `C:\ProgramData\SystemUpdatePro\WebhookDeliveries\` | Atomic per-run webhook attempt and terminal-status records |
 | `C:\ProgramData\SystemUpdatePro\webhook.json` | Optional operator-provisioned webhook config (SYSTEM/Administrators ACL required) |
 | `C:\ProgramData\SystemUpdatePro\HPIA\` | HP Image Assistant installation |
 
@@ -297,7 +298,7 @@ Privileged mutations use a separate atomic journal with the same protected acces
 
 All script-owned local evidence uses write-through temporary files and atomic replacement where the format permits it. Structured files are parsed and schema-validated before promotion; a protected `.previous` copy is restored when the primary is corrupt, and invalid inputs are moved to timestamped quarantine files. Legacy history arrays migrate to the v2 history envelope. Operator-facing evidence always redacts secret-bearing URL/query/header values, and device serials are also redacted by default; use `-RedactionMode Secrets` only when serial retention is operationally required. Active continuation state retains the original webhook endpoint under its private ACL so delivery can resume, then terminal cleanup removes it.
 
-Retention runs at startup and after driver export. It removes only recognized SystemUpdatePro artifacts older than `-LogRetentionDays`, including diagnostic bundles, then removes the oldest remaining artifacts until their combined size is at most `-EvidenceMaxSizeMB`; active run files and live state/history recovery copies are excluded. Driver backups remain additionally capped at three. Reports and machine-readable results record exact file/directory counts, bytes freed, remaining bytes, and cleanup errors.
+Retention runs at startup and after driver export. It removes only recognized SystemUpdatePro artifacts older than `-LogRetentionDays`, including diagnostic bundles and webhook-delivery records, then removes the oldest remaining artifacts until their combined size is at most `-EvidenceMaxSizeMB`; active run files and live state/history recovery copies are excluded. Driver backups remain additionally capped at three. Reports and machine-readable results record exact file/directory counts, bytes freed, remaining bytes, and cleanup errors.
 
 ---
 
@@ -308,7 +309,7 @@ Retention runs at startup and after driver export. It removes only recognized Sy
 - Schema-versioned `manifest.json` with SHA-256, included/original byte counts, truncation flags, omissions, and collector errors
 - Latest validated run result, effective policy, and any active continuation state
 - Current OS/PowerShell/provider versions, capability assessment, and dependency provenance
-- Recent protected run logs, transcripts, HTML report, Dell logs, and HP Image Assistant output
+- Recent protected run logs, transcripts, HTML report, webhook delivery records, Dell logs, and HP Image Assistant output
 - Seven days of bounded Windows Update Client, Update Orchestrator, and System events; reconstructed Windows Update output; and bounded CBS, DISM, and reporting-log tails when available
 - Mutation-journal status plus the latest verified recovery actions
 
@@ -338,12 +339,16 @@ When using `-WebhookSecretReference`, the resolved endpoint receives the followi
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
+  "event_type": "system_update.completed",
   "run_id": "c59c67f1-2f28-45a2-b8de-14872cc4973e",
+  "idempotency_key": "b2b8e9558efee1a3e5e362be2f28cb7880d940462774009c4618c5f91b2bb0d6",
   "started_at": "2026-07-29T19:00:00.0000000-04:00",
   "completed_at": "2026-07-29T19:03:00.0000000-04:00",
   "hostname": "PCNAME",
   "status": "success|partial|failed",
+  "dry_run": false,
+  "evidence_uri": "file:///C:/ProgramData/SystemUpdatePro/Logs/SystemUpdatePro_Report_20260729_190300.html",
   "oem_updates": 3,
   "windows_updates": 5,
   "winget_updates": 12,
@@ -355,29 +360,28 @@ When using `-WebhookSecretReference`, the resolved endpoint receives the followi
   "errors": [],
   "warnings": [],
   "runtime_seconds": 180,
-  "stages": [
+  "stage_summary": [
     {
-      "Name": "WindowsUpdate",
-      "Provider": "Windows Update",
-      "Status": "Succeeded",
-      "Attempted": 5,
-      "Available": 5,
-      "Installed": 5,
-      "Failed": 0,
-      "Skipped": 0,
-      "ProviderExitCode": 2,
-      "HResult": 0,
-      "RebootRequired": true,
-      "DurationSeconds": 94,
-      "Items": [],
-      "Evidence": []
+      "name": "WindowsUpdate",
+      "provider": "Windows Update",
+      "status": "Succeeded",
+      "attempted": 5,
+      "available": 5,
+      "installed": 5,
+      "failed": 0,
+      "skipped": 0,
+      "provider_exit_code": 2,
+      "reboot_required": true
     }
   ]
 }
 ```
 
-Slack and Teams webhooks are auto-detected by URL pattern and formatted appropriately.
-The JSON history entry uses the same stage schema and additionally records evidence-retention results and whether report, Event Log, webhook, and history delivery were attempted and succeeded.
+Generic endpoints receive the full v2 JSON contract. Slack receives a compact correlated message. A `*.logic.azure.com/workflows/...` endpoint receives a Teams Workflow Adaptive Card generated from the same contract; legacy `webhook.office.com` and `outlook.office.com` connectors retain MessageCard compatibility for migration only.
+
+Every request carries `Idempotency-Key` and `X-SystemUpdatePro-Run-Id` headers. HTTP 408/425/429/5xx and transport failures retry up to `-MaxRetries` total attempts. The default exponential delays are 2, 4, 8… seconds; a valid `Retry-After` delta or date takes precedence, with every delay capped at 60 seconds. Redirects are refused so a credential-bearing endpoint cannot be forwarded to another origin.
+
+Each attempt is atomically saved to `WebhookDeliveries\<run-id>.json` before a retry delay, and the final record contains `Succeeded`, `Failed`, or `Rejected` terminal status. The same attempt array, idempotency key, channel, evidence URI, and local-record status are embedded in update history and diagnostic bundles.
 
 ---
 

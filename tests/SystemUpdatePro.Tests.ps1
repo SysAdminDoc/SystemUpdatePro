@@ -151,6 +151,16 @@ BeforeAll {
         "New-HTMLReport",
         "Initialize-EventLog",
         "Write-EventLogEntry",
+        "Get-WebhookIdempotencyKey",
+        "Get-WebhookEvidenceUri",
+        "New-WebhookPayload",
+        "Get-WebhookChannel",
+        "ConvertTo-WebhookRequest",
+        "Get-WebhookRetryDelay",
+        "Invoke-WebhookRequest",
+        "Get-WebhookDeliveryPath",
+        "Test-WebhookDeliveryResult",
+        "Save-WebhookDeliveryResult",
         "Send-WebhookNotification",
         "Save-UpdateHistory",
         "Invoke-TerminalEvidence",
@@ -199,6 +209,8 @@ BeforeAll {
         $script:HistorySchemaVersion = 2
         $script:LockSchemaVersion = 1
         $script:DiagnosticBundleSchemaVersion = 1
+        $script:WebhookPayloadSchemaVersion = 2
+        $script:WebhookDeliverySchemaVersion = 1
         $script:RunId = "11111111-1111-1111-1111-111111111111"
         $script:StageResults = [System.Collections.ArrayList]::new()
         $script:Errors = [System.Collections.ArrayList]::new()
@@ -235,6 +247,7 @@ BeforeAll {
         New-Item -ItemType Directory -Path $script:MutationJournalDirectory -Force | Out-Null
         $script:MutationJournal = $null
         $script:MutationEvidence = [System.Collections.ArrayList]::new()
+        $script:WebhookDeliveryDirectory = Join-Path $stateTestDirectory "WebhookDeliveries"
         $script:RetentionResult = $null
         $script:SensitiveEvidenceValues = [System.Collections.ArrayList]::new()
         $script:ProtectedEvidenceDirectories = @{}
@@ -908,22 +921,35 @@ Describe "Protected local evidence store" {
         $oldBundle = Join-Path $bundleDirectory `
             "SystemUpdatePro_Diagnostic_20000101_000000_00000000.zip"
         [void](Write-ProtectedAtomicFile -Path $oldBundle -Content "123456")
+        [void](New-ProtectedDirectory -Path $script:WebhookDeliveryDirectory)
+        $oldDelivery = Join-Path $script:WebhookDeliveryDirectory "old-run.json"
+        [void](Write-ProtectedAtomicFile -Path $oldDelivery -Content "123")
+        [void](Write-ProtectedAtomicFile -Path $oldDelivery -Content "1234")
         $unowned = Join-Path $script:LogPath "operator-notes.log"
         [IO.File]::WriteAllText($unowned, "keep")
 
-        foreach ($path in @($oldLog, $oldReport, $vendorDirectory, $oldBundle)) {
+        foreach ($path in @(
+            $oldLog,
+            $oldReport,
+            $vendorDirectory,
+            $oldBundle,
+            $oldDelivery,
+            "$oldDelivery.previous"
+        )) {
             (Get-Item -LiteralPath $path).LastWriteTime = (Get-Date).AddDays(-60)
         }
         $result = Invoke-EvidenceRetention -RetentionDays 30 -MaximumSizeMB 512
 
-        $result.DeletedFiles | Should -Be 5
+        $result.DeletedFiles | Should -Be 7
         $result.DeletedDirectories | Should -Be 1
-        $result.BytesFreed | Should -Be 25
+        $result.BytesFreed | Should -Be 32
         $result.Errors.Count | Should -Be 0
         Test-Path -LiteralPath $unowned | Should -BeTrue
         Test-Path -LiteralPath $oldLog | Should -BeFalse
         Test-Path -LiteralPath $vendorDirectory | Should -BeFalse
         Test-Path -LiteralPath $oldBundle | Should -BeFalse
+        Test-Path -LiteralPath $oldDelivery | Should -BeFalse
+        Test-Path -LiteralPath "$oldDelivery.previous" | Should -BeFalse
     }
 
     It "enforces the configured evidence size ceiling by deleting oldest owned artifacts first" {
@@ -2157,6 +2183,189 @@ Describe "Explicit component cleanup safety" {
     }
 }
 
+Describe "Versioned retryable webhook delivery" {
+    BeforeEach {
+        Initialize-SystemUpdateProTestState
+        Mock Write-Log {}
+    }
+
+    BeforeAll {
+        function New-WebhookTestRun {
+            param([string]$ReportPath = "")
+
+            return @{
+                SchemaVersion = 1
+                RunId = "22222222-2222-2222-2222-222222222222"
+                StartedAt = "2026-07-29T20:00:00.0000000Z"
+                CompletedAt = "2026-07-29T20:05:00.0000000Z"
+                Status = "Partial"
+                OEMUpdates = 1
+                WindowsUpdates = 2
+                WingetUpdates = 3
+                TotalInstalled = 6
+                TotalAvailable = 7
+                TotalFailed = 1
+                RebootRequired = $true
+                ExitCode = 2
+                DurationSeconds = 300
+                Errors = @("One update failed")
+                Warnings = @()
+                Stages = @(
+                    [ordered]@{
+                        Name = "WindowsUpdate"
+                        Provider = "Windows Update"
+                        Status = "Partial"
+                        Attempted = 3
+                        Available = 3
+                        Installed = 2
+                        Failed = 1
+                        Skipped = 0
+                        RebootRequired = $true
+                        ProviderExitCode = 2
+                    }
+                )
+                Dependencies = @()
+                MutationRecovery = @()
+                Capabilities = $null
+                Retention = $null
+                EvidenceDelivery = @{
+                    Report = @{
+                        Status = $(if ($ReportPath) { "Succeeded" } else { "Failed" })
+                        Detail = $ReportPath
+                    }
+                }
+            }
+        }
+    }
+
+    It "builds a correlated v2 contract and Teams Workflow Adaptive Card" {
+        $reportPath = Join-Path $TestDrive "SystemUpdatePro_Report.html"
+        [IO.File]::WriteAllText($reportPath, "<html></html>")
+        $run = New-WebhookTestRun -ReportPath $reportPath
+
+        $payload = New-WebhookPayload -RunData $run
+        $channel = Get-WebhookChannel -Url (
+            "https://prod-00.westus.logic.azure.com:443/workflows/abc/" +
+            "triggers/manual/paths/invoke?api-version=2016-10-01&sig=test"
+        )
+        $request = ConvertTo-WebhookRequest -Payload $payload -Channel $channel
+        $card = $request.Body | ConvertFrom-Json
+
+        $payload.schema_version | Should -Be 2
+        $payload.run_id | Should -Be $run.RunId
+        $payload.idempotency_key | Should -Match "^[a-f0-9]{64}$"
+        $payload.started_at | Should -Be $run.StartedAt
+        $payload.completed_at | Should -Be $run.CompletedAt
+        $payload.evidence_uri | Should -Match "^file:/"
+        $payload.stage_summary.Count | Should -Be 1
+        $payload.stage_summary[0].failed | Should -Be 1
+        $channel | Should -Be "TeamsWorkflow"
+        $card.type | Should -Be "message"
+        $card.attachments[0].contentType |
+            Should -Be "application/vnd.microsoft.card.adaptive"
+        $card.attachments[0].content.type | Should -Be "AdaptiveCard"
+        $request.Body | Should -Match $run.RunId
+        $request.Body | Should -Match $payload.idempotency_key
+        $request.Body | Should -Match "file:"
+    }
+
+    It "honors Retry-After for 429 and persists every attempt with terminal success" {
+        $script:WebhookResponses = [System.Collections.Queue]::new()
+        $script:WebhookResponses.Enqueue([PSCustomObject]@{
+            Success = $false
+            StatusCode = 429
+            RetryAfterSeconds = 7
+            Error = "rate limited"
+        })
+        $script:WebhookResponses.Enqueue([PSCustomObject]@{
+            Success = $true
+            StatusCode = 202
+            RetryAfterSeconds = $null
+            Error = ""
+        })
+        Mock Invoke-WebhookRequest { $script:WebhookResponses.Dequeue() }
+        Mock Start-Sleep {}
+        $run = New-WebhookTestRun
+
+        $result = Send-WebhookNotification -Url "https://example.test/webhook?sig=SECRET" `
+            -RunData $run -MaximumAttempts 3
+
+        $result.TerminalStatus | Should -Be "Succeeded"
+        $result.AttemptCount | Should -Be 2
+        $result.Attempts[0].StatusCode | Should -Be 429
+        $result.Attempts[0].Outcome | Should -Be "Retrying"
+        $result.Attempts[0].DelayBeforeNextSeconds | Should -Be 7
+        $result.Attempts[1].StatusCode | Should -Be 202
+        $result.LocalRecordStatus | Should -Be "Succeeded"
+        Should -Invoke Invoke-WebhookRequest -Times 2 -Exactly -ParameterFilter {
+            $Headers["Idempotency-Key"] -eq $result.IdempotencyKey -and
+            $Headers["X-SystemUpdatePro-Run-Id"] -eq $run.RunId -and
+            $Body -match '"schema_version":2'
+        }
+        Should -Invoke Start-Sleep -Times 1 -Exactly -ParameterFilter {
+            $Seconds -eq 7
+        }
+
+        $record = Get-Content -LiteralPath $result.LocalRecordPath -Raw |
+            ConvertFrom-Json
+        $record.TerminalStatus | Should -Be "Succeeded"
+        $record.AttemptCount | Should -Be 2
+        $record.Attempts[0].StatusCode | Should -Be 429
+        (Get-Content -LiteralPath $result.LocalRecordPath -Raw) |
+            Should -Not -Match "SECRET"
+        (Test-EvidencePathAccess -Path $result.LocalRecordPath).Valid |
+            Should -BeTrue
+        Test-Path -LiteralPath "$($result.LocalRecordPath).previous" |
+            Should -BeTrue
+        (Test-EvidencePathAccess -Path "$($result.LocalRecordPath).previous").Valid |
+            Should -BeTrue
+    }
+
+    It "uses bounded exponential delays and stops after the configured attempts" {
+        Mock Invoke-WebhookRequest {
+            [PSCustomObject]@{
+                Success = $false
+                StatusCode = 503
+                RetryAfterSeconds = $null
+                Error = "temporarily unavailable"
+            }
+        }
+        Mock Start-Sleep {}
+        $run = New-WebhookTestRun
+
+        $result = Send-WebhookNotification -Url "https://example.test/webhook" `
+            -RunData $run -MaximumAttempts 3
+
+        $result.TerminalStatus | Should -Be "Failed"
+        $result.AttemptCount | Should -Be 3
+        $result.Attempts[0].DelayBeforeNextSeconds | Should -Be 2
+        $result.Attempts[1].DelayBeforeNextSeconds | Should -Be 4
+        $result.Attempts[2].DelayBeforeNextSeconds | Should -Be 0
+        Should -Invoke Invoke-WebhookRequest -Times 3 -Exactly
+        Should -Invoke Start-Sleep -Times 2 -Exactly
+    }
+
+    It "does not retry a non-transient client rejection" {
+        Mock Invoke-WebhookRequest {
+            [PSCustomObject]@{
+                Success = $false
+                StatusCode = 400
+                RetryAfterSeconds = $null
+                Error = "bad request"
+            }
+        }
+        Mock Start-Sleep {}
+
+        $result = Send-WebhookNotification -Url "https://example.test/webhook" `
+            -RunData (New-WebhookTestRun) -MaximumAttempts 5
+
+        $result.TerminalStatus | Should -Be "Failed"
+        $result.AttemptCount | Should -Be 1
+        Should -Invoke Invoke-WebhookRequest -Times 1 -Exactly
+        Should -Invoke Start-Sleep -Times 0 -Exactly
+    }
+}
+
 Describe "Provider and terminal failure handling" {
     BeforeEach {
         Initialize-SystemUpdateProTestState
@@ -2190,7 +2399,22 @@ Describe "Provider and terminal failure handling" {
         Mock New-HTMLReport { $reportPath }
         Mock Initialize-EventLog { $true }
         Mock Write-EventLogEntry { $true }
-        Mock Send-WebhookNotification { $true }
+        Mock Send-WebhookNotification {
+            [PSCustomObject]@{
+                SchemaVersion = 1
+                PayloadSchemaVersion = 2
+                Channel = "Generic"
+                IdempotencyKey = "idempotency"
+                EvidenceUri = "file:///report.html"
+                MaximumAttempts = 3
+                AttemptCount = 1
+                Attempts = @(@{ Attempt = 1; StatusCode = 200; Outcome = "Succeeded" })
+                TerminalStatus = "Succeeded"
+                LocalRecordStatus = "Succeeded"
+                LocalRecordPath = "delivery.json"
+                Error = ""
+            }
+        }
         Mock Save-UpdateHistory { $true }
 
         $run = @{
@@ -2207,6 +2431,9 @@ Describe "Provider and terminal failure handling" {
         foreach ($sink in @("Report", "Event", "Webhook", "History")) {
             $second.EvidenceDelivery[$sink].Status | Should -Be "Succeeded"
         }
+        $second.EvidenceDelivery.Webhook.PayloadSchemaVersion | Should -Be 2
+        $second.EvidenceDelivery.Webhook.TerminalStatus | Should -Be "Succeeded"
+        $second.EvidenceDelivery.Webhook.AttemptCount | Should -Be 1
         Should -Invoke New-HTMLReport -Times 1 -Exactly
         Should -Invoke Write-EventLogEntry -Times 1 -Exactly
         Should -Invoke Send-WebhookNotification -Times 1 -Exactly
@@ -2219,7 +2446,22 @@ Describe "Provider and terminal failure handling" {
         Mock New-HTMLReport { throw "report fault" }
         Mock Initialize-EventLog { $true }
         Mock Write-EventLogEntry { $false }
-        Mock Send-WebhookNotification { $false }
+        Mock Send-WebhookNotification {
+            [PSCustomObject]@{
+                SchemaVersion = 1
+                PayloadSchemaVersion = 2
+                Channel = "Generic"
+                IdempotencyKey = "idempotency"
+                EvidenceUri = ""
+                MaximumAttempts = 3
+                AttemptCount = 1
+                Attempts = @(@{ Attempt = 1; StatusCode = 500; Outcome = "Failed" })
+                TerminalStatus = "Failed"
+                LocalRecordStatus = "Succeeded"
+                LocalRecordPath = "delivery.json"
+                Error = "Webhook returned HTTP status 500"
+            }
+        }
         Mock Save-UpdateHistory { $true }
 
         $run = @{
@@ -2235,6 +2477,8 @@ Describe "Provider and terminal failure handling" {
         $result.EvidenceDelivery.Report.Status | Should -Be "Failed"
         $result.EvidenceDelivery.Event.Status | Should -Be "Failed"
         $result.EvidenceDelivery.Webhook.Status | Should -Be "Failed"
+        $result.EvidenceDelivery.Webhook.TerminalStatus | Should -Be "Failed"
+        $result.EvidenceDelivery.Webhook.AttemptCount | Should -Be 1
         $result.EvidenceDelivery.History.Status | Should -Be "Succeeded"
         Should -Invoke Save-UpdateHistory -Times 1 -Exactly
     }
