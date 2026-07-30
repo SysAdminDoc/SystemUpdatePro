@@ -158,6 +158,11 @@ $script:LockFile = "C:\ProgramData\SystemUpdatePro\update.lock"
 $script:StateFile = "C:\ProgramData\SystemUpdatePro\state.json"
 $script:HistoryFile = "C:\ProgramData\SystemUpdatePro\update_history.json"
 $script:TaskName = "SystemUpdatePro_Continue"
+$script:MutationJournalSchemaVersion = 1
+$script:MutationJournalDirectory = "C:\ProgramData\SystemUpdatePro\Journals"
+$script:MutationJournal = $null
+$script:MutationEvidence = [System.Collections.ArrayList]::new()
+$script:WindowsRoot = [string]$env:SystemRoot
 
 $script:ExitCode = 0
 $script:RebootRequired = $false
@@ -309,7 +314,7 @@ function Test-Administrator {
 
 function Initialize-RunEnvironment {
     try {
-        foreach ($path in @($script:DataPath, $LogPath)) {
+        foreach ($path in @($script:DataPath, $script:MutationJournalDirectory, $LogPath)) {
             if (-not (Test-Path -LiteralPath $path)) {
                 New-Item -ItemType Directory -Path $path -Force -ErrorAction Stop | Out-Null
             }
@@ -598,6 +603,7 @@ function New-RunData {
         DurationSeconds  = [math]::Max(0, [int]($CompletedAt - $StartedAt).TotalSeconds)
         Stages           = $stages
         Dependencies     = @($script:AcquisitionProvenance)
+        MutationRecovery = @($script:MutationEvidence)
         EvidenceDelivery = @{}
     }
 }
@@ -946,6 +952,7 @@ function New-ContinuationState {
         Parameters     = Get-EffectiveRunParameter
         StageResults   = @($script:StageResults)
         AcquisitionProvenance = @($script:AcquisitionProvenance)
+        MutationEvidence = @($script:MutationEvidence)
         Errors         = @($script:Errors)
         Warnings       = @($script:Warnings)
     }
@@ -1006,6 +1013,10 @@ function Import-ContinuationState {
     foreach ($dependency in @($State.AcquisitionProvenance)) {
         [void]$script:AcquisitionProvenance.Add([PSCustomObject]$dependency)
     }
+    $script:MutationEvidence = [System.Collections.ArrayList]::new()
+    foreach ($mutation in @($State.MutationEvidence)) {
+        [void]$script:MutationEvidence.Add([PSCustomObject]$mutation)
+    }
 
     $script:LogFile = Join-Path $LogPath "$($script:ProductName)_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
     $script:TranscriptFile = Join-Path $LogPath "$($script:ProductName)_Transcript_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
@@ -1031,6 +1042,7 @@ function Set-ContinuationCursor {
     $script:ContinuationState.StageCursor = $StageCursor
     $script:ContinuationState.StageResults = @($script:StageResults)
     $script:ContinuationState.AcquisitionProvenance = @($script:AcquisitionProvenance)
+    $script:ContinuationState.MutationEvidence = @($script:MutationEvidence)
     $script:ContinuationState.Errors = @($script:Errors)
     $script:ContinuationState.Warnings = @($script:Warnings)
     $script:ContinuationState.Parameters = Get-EffectiveRunParameter
@@ -1048,6 +1060,576 @@ function Test-ShouldRunContinuationStage {
     $cursorIndex = [array]::IndexOf($order, $script:ResumeStageCursor)
     $stageIndex = [array]::IndexOf($order, $Stage)
     return ($stageIndex -ge $cursorIndex)
+}
+
+# ============================================================================
+# PRIVILEGED MUTATION JOURNAL
+# ============================================================================
+
+function Get-MutationJournalPath {
+    param([string]$RunId = $script:RunId)
+
+    $parsedRunId = [guid]::Empty
+    if (-not [guid]::TryParse($RunId, [ref]$parsedRunId)) {
+        throw "Mutation journal run ID is invalid"
+    }
+    return Join-Path $script:MutationJournalDirectory "$($parsedRunId.ToString()).json"
+}
+
+function New-MutationJournal {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSUseShouldProcessForStateChangingFunctions", "", Justification = "Creates an in-memory recovery journal only.")]
+    param([string]$RunId = $script:RunId)
+
+    return [ordered]@{
+        SchemaVersion = $script:MutationJournalSchemaVersion
+        RunId          = $RunId
+        Status         = "Open"
+        CreatedAt      = (Get-Date).ToUniversalTime().ToString("o")
+        LastUpdatedAt  = (Get-Date).ToUniversalTime().ToString("o")
+        Entries        = @()
+    }
+}
+
+function Test-MutationJournal {
+    param([AllowNull()][object]$Journal)
+
+    if ($Journal -isnot [System.Collections.IDictionary]) {
+        return [PSCustomObject]@{ Valid = $false; Reason = "Journal root is not an object" }
+    }
+    if ([int]$Journal.SchemaVersion -ne $script:MutationJournalSchemaVersion) {
+        return [PSCustomObject]@{ Valid = $false; Reason = "Unsupported mutation journal schema" }
+    }
+    $parsedRunId = [guid]::Empty
+    if (-not [guid]::TryParse([string]$Journal.RunId, [ref]$parsedRunId)) {
+        return [PSCustomObject]@{ Valid = $false; Reason = "Mutation journal run ID is invalid" }
+    }
+    if ([string]$Journal.Status -notin @("Open", "AwaitingContinuation", "Restoring", "RecoveryFailed")) {
+        return [PSCustomObject]@{ Valid = $false; Reason = "Mutation journal status is invalid" }
+    }
+    foreach ($entry in @($Journal.Entries)) {
+        if ($entry -isnot [System.Collections.IDictionary]) {
+            return [PSCustomObject]@{ Valid = $false; Reason = "Mutation journal entry is not an object" }
+        }
+        $parsedEntryId = [guid]::Empty
+        if (-not [guid]::TryParse([string]$entry.Id, [ref]$parsedEntryId)) {
+            return [PSCustomObject]@{ Valid = $false; Reason = "Mutation journal entry ID is invalid" }
+        }
+        if ([string]$entry.Type -notin @("RegistryValue", "Service", "DirectoryRename", "ScheduledTask")) {
+            return [PSCustomObject]@{ Valid = $false; Reason = "Mutation journal entry type is invalid" }
+        }
+        if ([string]$entry.State -notin @("Planned", "Applied", "Committing", "Restored", "Committed", "RecoveryFailed")) {
+            return [PSCustomObject]@{ Valid = $false; Reason = "Mutation journal entry state is invalid" }
+        }
+        if ([int]$entry.Sequence -lt 1 -or [string]::IsNullOrWhiteSpace([string]$entry.Target) -or
+            [string]::IsNullOrWhiteSpace([string]$entry.Scope) -or
+            $entry.Before -isnot [System.Collections.IDictionary]) {
+            return [PSCustomObject]@{ Valid = $false; Reason = "Mutation journal entry contract is incomplete" }
+        }
+    }
+    return [PSCustomObject]@{ Valid = $true; Reason = "" }
+}
+
+function Save-MutationJournal {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary]$Journal
+    )
+
+    $journalPath = Get-MutationJournalPath -RunId ([string]$Journal.RunId)
+    $temporaryPath = "$journalPath.tmp.$PID.$([guid]::NewGuid().ToString('N'))"
+    $backupPath = "$journalPath.previous"
+
+    try {
+        if (-not (Test-Path -LiteralPath $script:MutationJournalDirectory)) {
+            New-Item -ItemType Directory -Path $script:MutationJournalDirectory -Force -ErrorAction Stop | Out-Null
+        }
+        $Journal["LastUpdatedAt"] = (Get-Date).ToUniversalTime().ToString("o")
+        $validation = Test-MutationJournal -Journal $Journal
+        if (-not $validation.Valid) { throw $validation.Reason }
+
+        $json = $Journal | ConvertTo-Json -Depth 24
+        $utf8 = New-Object System.Text.UTF8Encoding($false)
+        [IO.File]::WriteAllText($temporaryPath, $json, $utf8)
+        $roundTrip = ConvertTo-Hashtable -InputObject (
+            [IO.File]::ReadAllText($temporaryPath) | ConvertFrom-Json -ErrorAction Stop
+        )
+        $roundTripValidation = Test-MutationJournal -Journal $roundTrip
+        if (-not $roundTripValidation.Valid) {
+            throw "Mutation journal round-trip failed: $($roundTripValidation.Reason)"
+        }
+
+        if (Test-Path -LiteralPath $journalPath) {
+            [IO.File]::Replace($temporaryPath, $journalPath, $backupPath, $true)
+            Remove-Item -LiteralPath $backupPath -Force -ErrorAction SilentlyContinue
+        } else {
+            [IO.File]::Move($temporaryPath, $journalPath)
+        }
+        if (-not (Set-ContinuationStateAccess -Path $journalPath)) {
+            throw "Mutation journal access controls could not be hardened"
+        }
+        return $true
+    } catch {
+        Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
+        $script:LastMutationJournalError = $_.Exception.Message
+        return $false
+    }
+}
+
+function Get-MutationJournal {
+    param([string]$RunId = $script:RunId)
+
+    $journalPath = Get-MutationJournalPath -RunId $RunId
+    if (-not (Test-Path -LiteralPath $journalPath -PathType Leaf)) { return $null }
+
+    try {
+        $access = Test-ContinuationStateAccess -Path $journalPath
+        if (-not $access.Valid) { throw $access.Reason }
+        $journal = ConvertTo-Hashtable -InputObject (
+            Get-Content -LiteralPath $journalPath -Raw -ErrorAction Stop |
+                ConvertFrom-Json -ErrorAction Stop
+        )
+        $validation = Test-MutationJournal -Journal $journal
+        if (-not $validation.Valid) { throw $validation.Reason }
+        return $journal
+    } catch {
+        $script:LastMutationJournalError = $_.Exception.Message
+        return $null
+    }
+}
+
+function Get-OrCreateMutationJournal {
+    if ($null -ne $script:MutationJournal -and
+        [string]$script:MutationJournal.RunId -eq [string]$script:RunId) {
+        return $script:MutationJournal
+    }
+
+    $script:MutationJournal = Get-MutationJournal -RunId $script:RunId
+    if ($null -eq $script:MutationJournal) {
+        $journalPath = Get-MutationJournalPath -RunId $script:RunId
+        if (Test-Path -LiteralPath $journalPath) {
+            throw "Existing mutation journal could not be validated: $($script:LastMutationJournalError)"
+        }
+        $script:MutationJournal = New-MutationJournal -RunId $script:RunId
+        if (-not (Save-MutationJournal -Journal $script:MutationJournal)) {
+            throw "Mutation journal could not be created: $($script:LastMutationJournalError)"
+        }
+    }
+    return $script:MutationJournal
+}
+
+function Add-MutationJournalEntry {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSUseShouldProcessForStateChangingFunctions", "", Justification = "Persists a before-image before an authorized privileged mutation.")]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("RegistryValue", "Service", "DirectoryRename", "ScheduledTask")]
+        [string]$Type,
+        [Parameter(Mandatory = $true)]
+        [string]$Target,
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary]$Before,
+        [Parameter(Mandatory = $true)]
+        [string]$RecoveryAction,
+        [string]$Scope = "Run",
+        [bool]$RestoreOnFinalize = $true,
+        [AllowNull()][System.Collections.IDictionary]$Metadata = $null
+    )
+
+    $journal = Get-OrCreateMutationJournal
+    foreach ($existing in @($journal.Entries)) {
+        if ([string]$existing.Type -eq $Type -and [string]$existing.Target -eq $Target -and
+            [string]$existing.Scope -eq $Scope -and
+            [string]$existing.State -notin @("Restored", "Committed")) {
+            return [string]$existing.Id
+        }
+    }
+
+    $entry = [ordered]@{
+        Id                = [guid]::NewGuid().ToString()
+        Sequence          = @($journal.Entries).Count + 1
+        Type              = $Type
+        Target            = $Target
+        Scope             = $Scope
+        State             = "Planned"
+        RestoreOnFinalize = $RestoreOnFinalize
+        RecoveryAction    = $RecoveryAction
+        Before            = $Before
+        Metadata          = $(if ($null -eq $Metadata) { [ordered]@{} } else { $Metadata })
+        CreatedAt         = (Get-Date).ToUniversalTime().ToString("o")
+        AppliedAt         = ""
+        CommitStartedAt   = ""
+        RecoveredAt       = ""
+        Error             = ""
+    }
+    $journal.Entries = @($journal.Entries) + @($entry)
+    if (-not (Save-MutationJournal -Journal $journal)) {
+        $journal.Entries = @($journal.Entries | Where-Object { [string]$_.Id -ne [string]$entry.Id })
+        throw "Before-image for '$Target' could not be journaled: $($script:LastMutationJournalError)"
+    }
+
+    [void]$script:MutationEvidence.Add([PSCustomObject][ordered]@{
+        EntryId = $entry.Id; Scope = $Scope; Target = $Target; Action = "Journaled"
+        Timestamp = (Get-Date).ToUniversalTime().ToString("o"); Detail = $RecoveryAction
+    })
+    return [string]$entry.Id
+}
+
+function Set-MutationJournalEntryState {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSUseShouldProcessForStateChangingFunctions", "", Justification = "Persists mutation transaction state.")]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$EntryId,
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("Applied", "Committing", "Restored", "Committed", "RecoveryFailed")]
+        [string]$State,
+        [string]$ErrorMessage = ""
+    )
+
+    $journal = $script:MutationJournal
+    if ($null -eq $journal) {
+        $journal = Get-OrCreateMutationJournal
+    }
+    $entry = @($journal.Entries | Where-Object { [string]$_.Id -eq $EntryId } | Select-Object -First 1)
+    if ($entry.Count -ne 1) { throw "Mutation journal entry '$EntryId' was not found" }
+    $entry = $entry[0]
+    $entry.State = $State
+    $entry.Error = $ErrorMessage
+    if ($State -eq "Applied") {
+        $entry.AppliedAt = (Get-Date).ToUniversalTime().ToString("o")
+    } elseif ($State -eq "Committing") {
+        $entry.CommitStartedAt = (Get-Date).ToUniversalTime().ToString("o")
+    } elseif ($State -in @("Restored", "Committed")) {
+        $entry.RecoveredAt = (Get-Date).ToUniversalTime().ToString("o")
+    }
+    if (-not (Save-MutationJournal -Journal $journal)) {
+        throw "Mutation journal state '$State' could not be persisted: $($script:LastMutationJournalError)"
+    }
+    return $true
+}
+
+function Test-MutationDirectoryContract {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$OriginalPath,
+        [Parameter(Mandatory = $true)]
+        [string]$BackupPath
+    )
+
+    $windowsRoot = [IO.Path]::GetFullPath([string]$script:WindowsRoot).TrimEnd("\", "/")
+    $original = [IO.Path]::GetFullPath($OriginalPath).TrimEnd("\", "/")
+    $backup = [IO.Path]::GetFullPath($BackupPath).TrimEnd("\", "/")
+    $allowedOriginals = @(
+        [IO.Path]::GetFullPath((Join-Path $windowsRoot "SoftwareDistribution")).TrimEnd("\", "/"),
+        [IO.Path]::GetFullPath((Join-Path $windowsRoot "System32\catroot2")).TrimEnd("\", "/")
+    )
+    return (
+        $original -in $allowedOriginals -and
+        $backup.StartsWith("$original.SystemUpdatePro.", [StringComparison]::OrdinalIgnoreCase) -and
+        $backup.EndsWith(".bak", [StringComparison]::OrdinalIgnoreCase)
+    )
+}
+
+function Restore-DirectoryRenameSnapshot {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary]$Snapshot
+    )
+
+    $originalPath = [string]$Snapshot.OriginalPath
+    $backupPath = [string]$Snapshot.BackupPath
+    if (-not (Test-MutationDirectoryContract -OriginalPath $originalPath -BackupPath $backupPath)) {
+        return $false
+    }
+
+    try {
+        foreach ($serviceName in @($Snapshot.Services)) {
+            if ([string]::IsNullOrWhiteSpace([string]$serviceName)) { continue }
+            $service = Get-Service -Name ([string]$serviceName) -ErrorAction SilentlyContinue
+            if ($service -and $service.Status -ne "Stopped") {
+                Stop-Service -Name ([string]$serviceName) -Force -ErrorAction Stop
+            }
+        }
+
+        if ([bool]$Snapshot.Exists) {
+            if (-not (Test-Path -LiteralPath $backupPath -PathType Container)) {
+                # A planned entry can be recovered before its rename occurred.
+                return (Test-Path -LiteralPath $originalPath -PathType Container)
+            }
+            if (Test-Path -LiteralPath $originalPath) {
+                Remove-Item -LiteralPath $originalPath -Recurse -Force -ErrorAction Stop
+            }
+            Move-Item -LiteralPath $backupPath -Destination $originalPath -ErrorAction Stop
+            return (
+                (Test-Path -LiteralPath $originalPath -PathType Container) -and
+                -not (Test-Path -LiteralPath $backupPath)
+            )
+        }
+
+        if (Test-Path -LiteralPath $originalPath) {
+            Remove-Item -LiteralPath $originalPath -Recurse -Force -ErrorAction Stop
+        }
+        if (Test-Path -LiteralPath $backupPath) {
+            Remove-Item -LiteralPath $backupPath -Recurse -Force -ErrorAction Stop
+        }
+        return (-not (Test-Path -LiteralPath $originalPath) -and -not (Test-Path -LiteralPath $backupPath))
+    } catch {
+        return $false
+    }
+}
+
+function Invoke-JournaledDirectoryReset {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSUseShouldProcessForStateChangingFunctions", "", Justification = "The durable before-image makes this cache reset reversible.")]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [string[]]$Services,
+        [string]$Scope = "WindowsUpdateRepair"
+    )
+
+    $resolvedPath = [IO.Path]::GetFullPath($Path).TrimEnd("\", "/")
+    $backupPath = "$resolvedPath.SystemUpdatePro.$($script:RunId).bak"
+    if (-not (Test-MutationDirectoryContract -OriginalPath $resolvedPath -BackupPath $backupPath)) {
+        throw "Directory reset target is outside the approved Windows Update cache paths"
+    }
+    if (Test-Path -LiteralPath $backupPath) {
+        throw "Recovery backup already exists: $backupPath"
+    }
+
+    $snapshot = [ordered]@{
+        OriginalPath = $resolvedPath
+        BackupPath   = $backupPath
+        Exists       = (Test-Path -LiteralPath $resolvedPath -PathType Container)
+        Services     = @($Services)
+    }
+    $entryId = Add-MutationJournalEntry -Type "DirectoryRename" -Target $resolvedPath `
+        -Before $snapshot -RecoveryAction "Restore the original Windows Update cache directory" `
+        -Scope $Scope -RestoreOnFinalize $false
+
+    try {
+        if ([bool]$snapshot.Exists) {
+            Move-Item -LiteralPath $resolvedPath -Destination $backupPath -ErrorAction Stop
+        }
+        New-Item -ItemType Directory -Path $resolvedPath -Force -ErrorAction Stop | Out-Null
+        if (-not (Test-Path -LiteralPath $resolvedPath -PathType Container) -or
+            ([bool]$snapshot.Exists -and -not (Test-Path -LiteralPath $backupPath -PathType Container))) {
+            throw "Directory reset verification failed for '$resolvedPath'"
+        }
+        [void](Set-MutationJournalEntryState -EntryId $entryId -State "Applied")
+        return $entryId
+    } catch {
+        [void](Restore-MutationJournalScope -Scope $Scope)
+        throw
+    }
+}
+
+function Complete-DirectoryRenameSnapshot {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary]$Snapshot
+    )
+
+    $originalPath = [string]$Snapshot.OriginalPath
+    $backupPath = [string]$Snapshot.BackupPath
+    if (-not (Test-MutationDirectoryContract -OriginalPath $originalPath -BackupPath $backupPath)) {
+        return $false
+    }
+    try {
+        if (-not (Test-Path -LiteralPath $originalPath -PathType Container)) { return $false }
+        if (Test-Path -LiteralPath $backupPath) {
+            Remove-Item -LiteralPath $backupPath -Recurse -Force -ErrorAction Stop
+        }
+        return (-not (Test-Path -LiteralPath $backupPath))
+    } catch {
+        return $false
+    }
+}
+
+function Restore-MutationJournalEntry {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary]$Entry
+    )
+
+    if ([string]$Entry.State -in @("Restored", "Committed")) { return $true }
+    $success = switch ([string]$Entry.Type) {
+        "RegistryValue"  { Restore-RegistryValueSnapshot -Snapshot $Entry.Before }
+        "Service"        { Restore-ServiceSnapshot -Snapshot $Entry.Before }
+        "DirectoryRename" { Restore-DirectoryRenameSnapshot -Snapshot $Entry.Before }
+        "ScheduledTask"  { Restore-ScheduledTaskSnapshot -Snapshot $Entry.Before }
+        default          { $false }
+    }
+
+    if ($success) {
+        [void](Set-MutationJournalEntryState -EntryId ([string]$Entry.Id) -State "Restored")
+        [void]$script:MutationEvidence.Add([PSCustomObject][ordered]@{
+            EntryId = $Entry.Id; Scope = $Entry.Scope; Target = $Entry.Target; Action = "Restored"
+            Timestamp = (Get-Date).ToUniversalTime().ToString("o"); Detail = $Entry.RecoveryAction
+        })
+        return $true
+    }
+
+    [void](Set-MutationJournalEntryState -EntryId ([string]$Entry.Id) -State "RecoveryFailed" `
+        -ErrorMessage "Recovery verification failed")
+    return $false
+}
+
+function Complete-MutationJournalEntry {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary]$Entry
+    )
+
+    if ([bool]$Entry.RestoreOnFinalize) {
+        return Restore-MutationJournalEntry -Entry $Entry
+    }
+    if ([string]$Entry.State -in @("Restored", "Committed")) { return $true }
+
+    $success = if ([string]$Entry.Type -eq "DirectoryRename") {
+        if ([string]$Entry.State -ne "Committing") {
+            [void](Set-MutationJournalEntryState -EntryId ([string]$Entry.Id) -State "Committing")
+        }
+        Complete-DirectoryRenameSnapshot -Snapshot $Entry.Before
+    } else {
+        $true
+    }
+    if (-not $success) {
+        [void](Set-MutationJournalEntryState -EntryId ([string]$Entry.Id) -State "RecoveryFailed" `
+            -ErrorMessage "Commit verification failed")
+        return $false
+    }
+
+    [void](Set-MutationJournalEntryState -EntryId ([string]$Entry.Id) -State "Committed")
+    [void]$script:MutationEvidence.Add([PSCustomObject][ordered]@{
+        EntryId = $Entry.Id; Scope = $Entry.Scope; Target = $Entry.Target; Action = "Committed"
+        Timestamp = (Get-Date).ToUniversalTime().ToString("o"); Detail = $Entry.RecoveryAction
+    })
+    return $true
+}
+
+function Restore-MutationJournalScope {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Scope
+    )
+
+    if ($null -eq $script:MutationJournal) {
+        $script:MutationJournal = Get-MutationJournal -RunId $script:RunId
+    }
+    if ($null -eq $script:MutationJournal) { return $true }
+
+    $success = $true
+    $entries = @($script:MutationJournal.Entries | Where-Object {
+        [string]$_.Scope -eq $Scope -and [string]$_.State -notin @("Restored", "Committed")
+    } | Sort-Object -Property { [int]$_['Sequence'] } -Descending)
+    foreach ($entry in $entries) {
+        if (-not (Restore-MutationJournalEntry -Entry $entry)) { $success = $false }
+    }
+    return $success
+}
+
+function Complete-MutationJournal {
+    param(
+        [AllowEmptyCollection()][string[]]$PreserveScopes = @()
+    )
+
+    if ($null -eq $script:MutationJournal) {
+        $script:MutationJournal = Get-MutationJournal -RunId $script:RunId
+    }
+    if ($null -eq $script:MutationJournal) { return $true }
+
+    $success = $true
+    $entries = @($script:MutationJournal.Entries |
+        Sort-Object -Property { [int]$_['Sequence'] } -Descending)
+    foreach ($entry in $entries) {
+        if ([string]$entry.Scope -in $PreserveScopes) { continue }
+        if (-not (Complete-MutationJournalEntry -Entry $entry)) { $success = $false }
+    }
+
+    $remaining = @($script:MutationJournal.Entries | Where-Object {
+        [string]$_.State -notin @("Restored", "Committed")
+    })
+    if ($success -and $remaining.Count -eq 0) {
+        $journalPath = Get-MutationJournalPath -RunId ([string]$script:MutationJournal.RunId)
+        Remove-Item -LiteralPath $journalPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath "$journalPath.previous" -Force -ErrorAction SilentlyContinue
+        $script:MutationJournal = $null
+        return (-not (Test-Path -LiteralPath $journalPath))
+    }
+
+    $script:MutationJournal.Status = $(if ($success) { "AwaitingContinuation" } else { "RecoveryFailed" })
+    if (-not (Save-MutationJournal -Journal $script:MutationJournal)) { return $false }
+    return $success
+}
+
+function Invoke-UnfinishedMutationRecovery {
+    param([string]$ExcludeRunId = "")
+
+    $result = [ordered]@{ Attempted = 0; Recovered = 0; Failed = 0; Messages = @() }
+    if (-not (Test-Path -LiteralPath $script:MutationJournalDirectory)) { return $result }
+
+    foreach ($file in @(Get-ChildItem -LiteralPath $script:MutationJournalDirectory -Filter "*.json" -File -ErrorAction SilentlyContinue)) {
+        try {
+            $access = Test-ContinuationStateAccess -Path $file.FullName
+            if (-not $access.Valid) { throw $access.Reason }
+            $journalObject = ConvertTo-Hashtable -InputObject (
+                Get-Content -LiteralPath $file.FullName -Raw -ErrorAction Stop |
+                    ConvertFrom-Json -ErrorAction Stop
+            )
+            $validation = Test-MutationJournal -Journal $journalObject
+            if (-not $validation.Valid) { throw $validation.Reason }
+            if ([string]$journalObject.RunId -ne [IO.Path]::GetFileNameWithoutExtension($file.Name)) {
+                throw "Mutation journal filename does not match its run ID"
+            }
+            if (-not [string]::IsNullOrWhiteSpace($ExcludeRunId) -and
+                [string]$journalObject.RunId -eq $ExcludeRunId) {
+                continue
+            }
+
+            $result.Attempted++
+            $script:MutationJournal = $journalObject
+            $script:MutationJournal.Status = "Restoring"
+            if (-not (Save-MutationJournal -Journal $script:MutationJournal)) {
+                throw "Could not claim mutation journal for recovery"
+            }
+
+            $journalRecovered = $true
+            foreach ($entry in @($script:MutationJournal.Entries |
+                Where-Object { [string]$_.State -notin @("Restored", "Committed") } |
+                Sort-Object -Property { [int]$_['Sequence'] } -Descending)) {
+                # An interrupted run always rolls back, even when a successful
+                # terminal run would have committed a reversible cache swap.
+                # A durable Committing state is the sole exception: recovery
+                # completes that already-decided cleanup instead of reviving a
+                # partially deleted backup.
+                $entryRecovered = if ([string]$entry.State -eq "Committing") {
+                    Complete-MutationJournalEntry -Entry $entry
+                } else {
+                    Restore-MutationJournalEntry -Entry $entry
+                }
+                if (-not $entryRecovered) {
+                    $journalRecovered = $false
+                }
+            }
+
+            if ($journalRecovered) {
+                Remove-Item -LiteralPath $file.FullName -Force -ErrorAction Stop
+                $result.Recovered++
+                $result.Messages += "Recovered unfinished run $($journalObject.RunId)"
+            } else {
+                $script:MutationJournal.Status = "RecoveryFailed"
+                [void](Save-MutationJournal -Journal $script:MutationJournal)
+                $result.Failed++
+                $result.Messages += "Recovery verification failed for run $($journalObject.RunId)"
+            }
+        } catch {
+            $result.Failed++
+            $result.Messages += "Could not recover '$($file.Name)': $($_.Exception.Message)"
+        } finally {
+            $script:MutationJournal = $null
+        }
+    }
+    return $result
 }
 
 # ============================================================================
@@ -1119,6 +1701,7 @@ function Save-UpdateHistory {
             duration_seconds  = $RunData.DurationSeconds
             stages            = @($RunData.Stages)
             dependencies      = @($RunData.Dependencies)
+            mutation_recovery = @($RunData.MutationRecovery)
             evidence_delivery = $RunData.EvidenceDelivery
             parameters        = [ordered]@{
                 SkipOEM           = $SkipOEM.IsPresent
@@ -1755,108 +2338,293 @@ function Invoke-WithRetry {
 # SERVICE MANAGEMENT
 # ============================================================================
 
-function Set-ServiceState {
+function Get-ServiceStartupType {
     param(
+        [Parameter(Mandatory = $true)]
+        [string]$ServiceName
+    )
+
+    $service = Get-Service -Name $ServiceName -ErrorAction Stop
+    $startupType = [string]$service.StartType
+    if ($startupType -eq "Automatic") {
+        $servicePath = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
+        $delayed = (Get-ItemProperty -LiteralPath $servicePath -Name "DelayedAutoStart" `
+            -ErrorAction SilentlyContinue).DelayedAutoStart
+        if ([int]$delayed -eq 1) { return "AutomaticDelayedStart" }
+    }
+    return $startupType
+}
+
+function Get-ServiceDelayedAutoStartSnapshot {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ServiceName
+    )
+
+    $servicePath = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
+    $key = Get-Item -LiteralPath $servicePath -ErrorAction Stop
+    $exists = @($key.GetValueNames()) -contains "DelayedAutoStart"
+    return [ordered]@{
+        Exists = $exists
+        Value  = $(if ($exists) { [int]$key.GetValue("DelayedAutoStart") } else { 0 })
+    }
+}
+
+function Set-ServiceStartupType {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSUseShouldProcessForStateChangingFunctions", "", Justification = "Called only after the service before-image is durable.")]
+    param(
+        [Parameter(Mandatory = $true)]
         [string]$ServiceName,
-        [string]$DesiredState = "Running",
-        [string]$StartupType = "Automatic",
-        [int]$TimeoutSeconds = 60
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("Automatic", "AutomaticDelayedStart", "Manual", "Disabled")]
+        [string]$StartupType
+    )
+
+    $setServiceType = if ($StartupType -eq "AutomaticDelayedStart") { "Automatic" } else { $StartupType }
+    Set-Service -Name $ServiceName -StartupType $setServiceType -ErrorAction Stop
+
+    $servicePath = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
+    if ($StartupType -eq "AutomaticDelayedStart") {
+        New-ItemProperty -LiteralPath $servicePath -Name "DelayedAutoStart" -Value 1 `
+            -PropertyType DWord -Force -ErrorAction Stop | Out-Null
+    } elseif ($StartupType -eq "Automatic") {
+        New-ItemProperty -LiteralPath $servicePath -Name "DelayedAutoStart" -Value 0 `
+            -PropertyType DWord -Force -ErrorAction Stop | Out-Null
+    }
+}
+
+function Get-ServiceSnapshot {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ServiceName
     )
 
     try {
         $service = Get-Service -Name $ServiceName -ErrorAction Stop
+        $stableStatus = switch ([string]$service.Status) {
+            "StartPending"    { [System.ServiceProcess.ServiceControllerStatus]::Running }
+            "ContinuePending" { [System.ServiceProcess.ServiceControllerStatus]::Running }
+            "StopPending"     { [System.ServiceProcess.ServiceControllerStatus]::Stopped }
+            "PausePending"    { [System.ServiceProcess.ServiceControllerStatus]::Paused }
+            default           { $null }
+        }
+        if ($null -ne $stableStatus) {
+            $service.WaitForStatus($stableStatus, [TimeSpan]::FromSeconds(30))
+            $service = Get-Service -Name $ServiceName -ErrorAction Stop
+        }
+        $delayedSnapshot = Get-ServiceDelayedAutoStartSnapshot -ServiceName $ServiceName
+        return [ordered]@{
+            Exists           = $true
+            Name             = $ServiceName
+            Status           = [string]$service.Status
+            StartupType      = Get-ServiceStartupType -ServiceName $ServiceName
+            DelayedAutoStartExists = [bool]$delayedSnapshot.Exists
+            DelayedAutoStartValue  = [int]$delayedSnapshot.Value
+            RestartOnRestore = $false
+        }
+    } catch {
+        return [ordered]@{
+            Exists = $false; Name = $ServiceName; Status = ""; StartupType = ""
+            RestartOnRestore = $false
+        }
+    }
+}
 
-        Set-Service -Name $ServiceName -StartupType $StartupType -ErrorAction SilentlyContinue
+function Restore-ServiceSnapshot {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary]$Snapshot
+    )
 
-        if ($DesiredState -eq "Running" -and $service.Status -ne "Running") {
-            Start-Service -Name $ServiceName -ErrorAction Stop
+    if (-not [bool]$Snapshot.Exists) {
+        return ($null -eq (Get-Service -Name ([string]$Snapshot.Name) -ErrorAction SilentlyContinue))
+    }
 
-            $timeout = [DateTime]::Now.AddSeconds($TimeoutSeconds)
-            do {
-                Start-Sleep -Milliseconds 500
-                $service = Get-Service -Name $ServiceName
-            } while ($service.Status -ne "Running" -and [DateTime]::Now -lt $timeout)
+    try {
+        $serviceName = [string]$Snapshot.Name
+        Set-ServiceStartupType -ServiceName $serviceName -StartupType ([string]$Snapshot.StartupType)
+        $servicePath = "HKLM:\SYSTEM\CurrentControlSet\Services\$serviceName"
+        if ([bool]$Snapshot.DelayedAutoStartExists) {
+            New-ItemProperty -LiteralPath $servicePath -Name "DelayedAutoStart" `
+                -Value ([int]$Snapshot.DelayedAutoStartValue) -PropertyType DWord -Force `
+                -ErrorAction Stop | Out-Null
+        } else {
+            Remove-ItemProperty -LiteralPath $servicePath -Name "DelayedAutoStart" `
+                -Force -ErrorAction SilentlyContinue
+        }
+        $current = Get-Service -Name $serviceName -ErrorAction Stop
+        switch ([string]$Snapshot.Status) {
+            "Running" {
+                if ([bool]$Snapshot.RestartOnRestore -and $current.Status -eq "Running") {
+                    Restart-Service -Name $serviceName -Force -ErrorAction Stop
+                } elseif ($current.Status -ne "Running") {
+                    Start-Service -Name $serviceName -ErrorAction Stop
+                }
+            }
+            "Stopped" {
+                if ($current.Status -ne "Stopped") {
+                    Stop-Service -Name $serviceName -Force -ErrorAction Stop
+                }
+            }
+            "Paused" {
+                if ($current.Status -eq "Stopped") {
+                    Start-Service -Name $serviceName -ErrorAction Stop
+                }
+                Suspend-Service -Name $serviceName -ErrorAction Stop
+            }
+            default {
+                throw "Unsupported saved service status '$($Snapshot.Status)'"
+            }
         }
 
-        return ($service.Status -eq $DesiredState)
+        $deadline = (Get-Date).AddSeconds(30)
+        do {
+            $current = Get-Service -Name $serviceName -ErrorAction Stop
+            $delayedCurrent = Get-ServiceDelayedAutoStartSnapshot -ServiceName $serviceName
+            if ([string]$current.Status -eq [string]$Snapshot.Status -and
+                (Get-ServiceStartupType -ServiceName $serviceName) -eq [string]$Snapshot.StartupType -and
+                [bool]$delayedCurrent.Exists -eq [bool]$Snapshot.DelayedAutoStartExists -and
+                (-not [bool]$Snapshot.DelayedAutoStartExists -or
+                    [int]$delayedCurrent.Value -eq [int]$Snapshot.DelayedAutoStartValue)) {
+                return $true
+            }
+            Start-Sleep -Milliseconds 250
+        } while ((Get-Date) -lt $deadline)
+        return $false
     } catch {
         return $false
     }
 }
 
+function Set-JournaledServiceState {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSUseShouldProcessForStateChangingFunctions", "", Justification = "The run-scoped mutation journal provides explicit recovery semantics.")]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ServiceName,
+        [ValidateSet("Running", "Stopped")]
+        [string]$DesiredStatus,
+        [ValidateSet("Automatic", "AutomaticDelayedStart", "Manual", "Disabled")]
+        [string]$StartupType,
+        [string]$Scope = "Run",
+        [string]$RecoveryAction = "Restore exact service status and startup mode"
+    )
+
+    $snapshot = Get-ServiceSnapshot -ServiceName $ServiceName
+    if (-not [bool]$snapshot.Exists) {
+        throw "Service '$ServiceName' does not exist"
+    }
+    if ([string]$snapshot.Status -eq $DesiredStatus -and
+        [string]$snapshot.StartupType -eq $StartupType) {
+        return ""
+    }
+
+    $entryId = Add-MutationJournalEntry -Type "Service" -Target $ServiceName `
+        -Before $snapshot -RecoveryAction $RecoveryAction -Scope $Scope
+    try {
+        Set-ServiceStartupType -ServiceName $ServiceName -StartupType $StartupType
+        $service = Get-Service -Name $ServiceName -ErrorAction Stop
+        if ($DesiredStatus -eq "Running" -and $service.Status -ne "Running") {
+            Start-Service -Name $ServiceName -ErrorAction Stop
+        } elseif ($DesiredStatus -eq "Stopped" -and $service.Status -ne "Stopped") {
+            Stop-Service -Name $ServiceName -Force -ErrorAction Stop
+        }
+
+        $deadline = (Get-Date).AddSeconds(30)
+        do {
+            $service = Get-Service -Name $ServiceName -ErrorAction Stop
+            if ([string]$service.Status -eq $DesiredStatus -and
+                (Get-ServiceStartupType -ServiceName $ServiceName) -eq $StartupType) {
+                [void](Set-MutationJournalEntryState -EntryId $entryId -State "Applied")
+                return $entryId
+            }
+            Start-Sleep -Milliseconds 250
+        } while ((Get-Date) -lt $deadline)
+        throw "Service '$ServiceName' did not reach $DesiredStatus/$StartupType"
+    } catch {
+        [void](Restore-MutationJournalScope -Scope $Scope)
+        throw
+    }
+}
+
+function Test-WindowsUpdateRuntime {
+    $missingServices = @()
+    foreach ($serviceName in @("wuauserv", "bits", "cryptsvc")) {
+        if ($null -eq (Get-Service -Name $serviceName -ErrorAction SilentlyContinue)) {
+            $missingServices += $serviceName
+        }
+    }
+    if ($missingServices.Count -gt 0) {
+        return [PSCustomObject]@{
+            Healthy = $false
+            Message = "Required services are missing: $($missingServices -join ', ')"
+        }
+    }
+
+    try {
+        $session = New-Object -ComObject "Microsoft.Update.Session" -ErrorAction Stop
+        $searcher = $session.CreateUpdateSearcher()
+        [void]$searcher.GetTotalHistoryCount()
+        return [PSCustomObject]@{
+            Healthy = $true
+            Message = "Windows Update Agent diagnostics succeeded"
+        }
+    } catch {
+        return [PSCustomObject]@{
+            Healthy = $false
+            Message = "Windows Update Agent diagnostics failed: $($_.Exception.Message)"
+        }
+    }
+}
+
 function Repair-WindowsUpdateServices {
-    Write-Log "Repairing Windows Update services..." "STEP"
+    Write-Log "Diagnosing Windows Update services..." "STEP"
+    $diagnostics = Test-WindowsUpdateRuntime
+    if ($diagnostics.Healthy) {
+        Write-Log "$($diagnostics.Message); repair mutations were not needed" "SUCCESS"
+        return $true
+    }
 
+    Write-Log $diagnostics.Message "WARNING"
     if ($DryRun) {
-        Write-Log "Would stop WU services, clear cache, re-register DLLs, reset Winsock, restart services" "INFO"
+        Write-Log "Would journal service state, rename the update caches reversibly, validate WUA, and restore exact service state" "INFO"
         return $true
     }
 
-    $services = @(
-        @{ Name = "wuauserv"; DisplayName = "Windows Update" },
-        @{ Name = "bits"; DisplayName = "Background Intelligent Transfer" },
-        @{ Name = "cryptsvc"; DisplayName = "Cryptographic Services" },
-        @{ Name = "msiserver"; DisplayName = "Windows Installer" },
-        @{ Name = "TrustedInstaller"; DisplayName = "Windows Modules Installer" }
-    )
-
-    # Stop services
-    Write-Log "Stopping Windows Update services..." "DEBUG"
-    foreach ($svc in $services) {
-        Stop-Service -Name $svc.Name -Force -ErrorAction SilentlyContinue
-    }
-
-    Start-Sleep -Seconds 3
-
-    # Clear update cache
-    Write-Log "Clearing Windows Update cache..." "DEBUG"
-    $cachePaths = @(
-        "$env:SystemRoot\SoftwareDistribution\Download\*",
-        "$env:SystemRoot\System32\catroot2\*"
-    )
-
-    foreach ($path in $cachePaths) {
-        Remove-Item -Path $path -Recurse -Force -ErrorAction SilentlyContinue
-    }
-
-    # Re-register DLLs
-    Write-Log "Re-registering Windows Update DLLs..." "DEBUG"
-    $dlls = @(
-        "atl.dll", "urlmon.dll", "mshtml.dll", "shdocvw.dll", "browseui.dll",
-        "jscript.dll", "vbscript.dll", "scrrun.dll", "msxml.dll", "msxml3.dll",
-        "msxml6.dll", "actxprxy.dll", "softpub.dll", "wintrust.dll", "dssenh.dll",
-        "rsaenh.dll", "gpkcsp.dll", "sccbase.dll", "slbcsp.dll", "cryptdlg.dll",
-        "oleaut32.dll", "ole32.dll", "shell32.dll", "initpki.dll", "wuapi.dll",
-        "wuaueng.dll", "wuaueng1.dll", "wucltui.dll", "wups.dll", "wups2.dll",
-        "wuweb.dll", "qmgr.dll", "qmgrprxy.dll", "wucltux.dll", "muweb.dll", "wuwebv.dll"
-    )
-
-    foreach ($dll in $dlls) {
-        $dllPath = Join-Path $env:SystemRoot "System32\$dll"
-        if (Test-Path $dllPath) {
-            & regsvr32.exe /s $dllPath 2>$null
+    $scope = "WindowsUpdateRepair"
+    $serviceNames = @("wuauserv", "bits", "cryptsvc")
+    try {
+        Write-Log "Stopping Windows Update services with durable recovery state..." "DEBUG"
+        foreach ($serviceName in $serviceNames) {
+            [void](Set-JournaledServiceState -ServiceName $serviceName -DesiredStatus "Stopped" `
+                -StartupType "Manual" -Scope $scope `
+                -RecoveryAction "Restore exact Windows Update service status and startup mode")
         }
-    }
 
-    # Reset Winsock
-    Write-Log "Resetting network components..." "DEBUG"
-    & netsh winsock reset 2>$null
-    & netsh winhttp reset proxy 2>$null
+        Write-Log "Replacing Windows Update caches with reversible run-scoped directories..." "DEBUG"
+        [void](Invoke-JournaledDirectoryReset -Path (Join-Path $script:WindowsRoot "SoftwareDistribution") `
+            -Services @("wuauserv", "bits") -Scope $scope)
+        [void](Invoke-JournaledDirectoryReset -Path (Join-Path $script:WindowsRoot "System32\catroot2") `
+            -Services @("cryptsvc") -Scope $scope)
 
-    # Start services
-    Write-Log "Starting Windows Update services..." "DEBUG"
-    $failed = @()
-    foreach ($svc in $services) {
-        if (-not (Set-ServiceState -ServiceName $svc.Name -DesiredState "Running" -StartupType "Automatic")) {
-            $failed += $svc.DisplayName
+        Write-Log "Starting Windows Update services for validation..." "DEBUG"
+        foreach ($serviceName in $serviceNames) {
+            [void](Set-JournaledServiceState -ServiceName $serviceName -DesiredStatus "Running" `
+                -StartupType "Manual" -Scope $scope `
+                -RecoveryAction "Restore exact Windows Update service status and startup mode")
         }
-    }
 
-    if ($failed.Count -eq 0) {
-        Write-Log "Windows Update services repaired successfully" "SUCCESS"
+        $verification = Test-WindowsUpdateRuntime
+        if (-not $verification.Healthy) {
+            throw "Repair verification failed: $($verification.Message)"
+        }
+        Write-Log "Windows Update Agent repaired; original cache backups remain recoverable until run finalization" "SUCCESS"
         return $true
-    } else {
-        Write-Log "Failed to start: $($failed -join ', ')" "WARNING"
+    } catch {
+        $message = "Windows Update repair failed: $($_.Exception.Message)"
+        Write-Log $message "WARNING"
+        if (-not (Restore-MutationJournalScope -Scope $scope)) {
+            Write-Log "Windows Update repair rollback could not be verified" "ERROR"
+        }
         return $false
     }
 }
@@ -1864,55 +2632,129 @@ function Repair-WindowsUpdateServices {
 function Set-WSUSBypass {
     param([switch]$Enable)
 
-    $wuPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate"
     $auPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU"
-
-    if ($Enable) {
-        Write-Log "Configuring WSUS bypass (direct to Microsoft)..." "DEBUG"
-
-        # Backup current settings
-        $script:WSUSBackup = @{}
-
-        if (Test-Path $wuPath) {
-            $script:WSUSBackup.WUServer = (Get-ItemProperty $wuPath -Name WUServer -ErrorAction SilentlyContinue).WUServer
-            $script:WSUSBackup.WUStatusServer = (Get-ItemProperty $wuPath -Name WUStatusServer -ErrorAction SilentlyContinue).WUStatusServer
+    $scope = "WSUS"
+    if (-not $Enable) {
+        if ($DryRun) { return $true }
+        Write-Log "Restoring exact WSUS policy and Windows Update service state..." "DEBUG"
+        if (-not (Restore-MutationJournalScope -Scope $scope)) {
+            throw "WSUS mutation journal recovery could not be verified"
         }
+        return $true
+    }
 
-        if (Test-Path $auPath) {
-            $script:WSUSBackup.UseWUServer = (Get-ItemProperty $auPath -Name UseWUServer -ErrorAction SilentlyContinue).UseWUServer
+    Write-Log "Configuring temporary WSUS bypass (direct to Microsoft)..." "DEBUG"
+    if (-not (Test-Path -LiteralPath $auPath)) {
+        Write-Log "No WSUS AU policy key is present; Microsoft Update is already the direct source" "INFO"
+        return $true
+    }
+    if ($DryRun) {
+        Write-Log "Would set UseWUServer to 0, restart wuauserv, then restore the exact prior value and service state" "INFO"
+        return $true
+    }
+
+    try {
+        $serviceSnapshot = Get-ServiceSnapshot -ServiceName "wuauserv"
+        if (-not [bool]$serviceSnapshot.Exists) { throw "Windows Update service does not exist" }
+        $serviceSnapshot.RestartOnRestore = $true
+        $serviceEntryId = Add-MutationJournalEntry -Type "Service" -Target "wuauserv" `
+            -Before $serviceSnapshot -RecoveryAction "Restore exact wuauserv status/startup mode and restart after WSUS policy recovery" `
+            -Scope $scope
+
+        $registrySnapshot = Get-RegistryValueSnapshot -Path $auPath -Name "UseWUServer"
+        $registryEntryId = Add-MutationJournalEntry -Type "RegistryValue" `
+            -Target "$auPath\UseWUServer" -Before $registrySnapshot `
+            -RecoveryAction "Restore the exact UseWUServer value, type, and existence" -Scope $scope
+
+        New-ItemProperty -LiteralPath $auPath -Name "UseWUServer" -Value 0 `
+            -PropertyType DWord -Force -ErrorAction Stop | Out-Null
+        $current = Get-RegistryValueSnapshot -Path $auPath -Name "UseWUServer"
+        if (-not $current.Exists -or [string]$current.Kind -ne "DWord" -or [int]$current.Value -ne 0) {
+            throw "UseWUServer write verification failed"
         }
+        [void](Set-MutationJournalEntryState -EntryId $registryEntryId -State "Applied")
 
-        if (-not $DryRun) {
-            # Disable WSUS
-            if (Test-Path $auPath) {
-                Set-ItemProperty -Path $auPath -Name UseWUServer -Value 0 -Type DWord -ErrorAction SilentlyContinue
-            }
-
-            # Restart Windows Update service
-            Restart-Service wuauserv -Force -ErrorAction SilentlyContinue
-            Start-Sleep -Seconds 3
+        Restart-Service -Name "wuauserv" -Force -ErrorAction Stop
+        $deadline = (Get-Date).AddSeconds(30)
+        do {
+            $service = Get-Service -Name "wuauserv" -ErrorAction Stop
+            if ($service.Status -eq "Running") { break }
+            Start-Sleep -Milliseconds 250
+        } while ((Get-Date) -lt $deadline)
+        if ($service.Status -ne "Running") {
+            throw "wuauserv did not return to Running after the policy change"
         }
-
-        Write-Log "WSUS bypass enabled" "SUCCESS"
-    } else {
-        # Restore original settings
-        if ($script:WSUSBackup -and $script:WSUSBackup.UseWUServer) {
-            Write-Log "Restoring WSUS settings..." "DEBUG"
-
-            if (-not $DryRun) {
-                if (Test-Path $auPath) {
-                    Set-ItemProperty -Path $auPath -Name UseWUServer -Value $script:WSUSBackup.UseWUServer -Type DWord -ErrorAction SilentlyContinue
-                }
-
-                Restart-Service wuauserv -Force -ErrorAction SilentlyContinue
-            }
-        }
+        [void](Set-MutationJournalEntryState -EntryId $serviceEntryId -State "Applied")
+        Write-Log "WSUS bypass enabled with a durable exact-state recovery record" "SUCCESS"
+        return $true
+    } catch {
+        [void](Restore-MutationJournalScope -Scope $scope)
+        throw
     }
 }
 
 # ============================================================================
 # POST-REBOOT CONTINUATION
 # ============================================================================
+
+function Get-ScheduledTaskSnapshot {
+    param(
+        [string]$TaskName = $script:TaskName,
+        [string]$TaskPath = "\"
+    )
+
+    if ($TaskName -ne $script:TaskName -or $TaskPath -ne "\") {
+        throw "Scheduled-task snapshot target is outside the continuation-task contract"
+    }
+    $task = Get-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction SilentlyContinue
+    return [ordered]@{
+        Exists   = ($null -ne $task)
+        TaskName = $TaskName
+        TaskPath = $TaskPath
+        Xml      = $(if ($null -ne $task) {
+            [string](Export-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction Stop)
+        } else { "" })
+    }
+}
+
+function Restore-ScheduledTaskSnapshot {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary]$Snapshot
+    )
+
+    if ([string]$Snapshot.TaskName -ne $script:TaskName -or [string]$Snapshot.TaskPath -ne "\") {
+        return $false
+    }
+    try {
+        $current = Get-ScheduledTask -TaskName ([string]$Snapshot.TaskName) `
+            -TaskPath ([string]$Snapshot.TaskPath) -ErrorAction SilentlyContinue
+        if ($null -ne $current) {
+            Unregister-ScheduledTask -TaskName ([string]$Snapshot.TaskName) `
+                -TaskPath ([string]$Snapshot.TaskPath) -Confirm:$false -ErrorAction Stop
+        }
+        if ([bool]$Snapshot.Exists) {
+            if ([string]::IsNullOrWhiteSpace([string]$Snapshot.Xml)) {
+                throw "Saved scheduled-task XML is missing"
+            }
+            Register-ScheduledTask -TaskName ([string]$Snapshot.TaskName) `
+                -TaskPath ([string]$Snapshot.TaskPath) -Xml ([string]$Snapshot.Xml) `
+                -Force -ErrorAction Stop | Out-Null
+        }
+
+        $restored = Get-ScheduledTask -TaskName ([string]$Snapshot.TaskName) `
+            -TaskPath ([string]$Snapshot.TaskPath) -ErrorAction SilentlyContinue
+        if (-not [bool]$Snapshot.Exists) { return ($null -eq $restored) }
+        if ($null -eq $restored) { return $false }
+        $restoredXml = [string](Export-ScheduledTask -TaskName ([string]$Snapshot.TaskName) `
+            -TaskPath ([string]$Snapshot.TaskPath) -ErrorAction Stop)
+        $expectedNormalized = [regex]::Replace(([string]$Snapshot.Xml).Trim(), ">\s+<", "><")
+        $actualNormalized = [regex]::Replace($restoredXml.Trim(), ">\s+<", "><")
+        return ($expectedNormalized -ceq $actualNormalized)
+    } catch {
+        return $false
+    }
+}
 
 function Register-ContinuationTask {
     Write-Log "Creating post-reboot continuation task..." "DEBUG"
@@ -1940,9 +2782,18 @@ function Register-ContinuationTask {
     }
 
     try {
+        $taskSnapshot = Get-ScheduledTaskSnapshot
+        $taskEntryId = Add-MutationJournalEntry -Type "ScheduledTask" `
+            -Target "\$($script:TaskName)" -Before $taskSnapshot `
+            -RecoveryAction "Remove the run task and restore the exact preexisting task XML or absence" `
+            -Scope "Continuation"
+
         # Keep the task command line free of saved parameters and webhook URLs;
         # the validated state file is the sole resume contract.
-        Unregister-ScheduledTask -TaskName $script:TaskName -Confirm:$false -ErrorAction SilentlyContinue
+        if ([bool]$taskSnapshot.Exists) {
+            Unregister-ScheduledTask -TaskName $script:TaskName -TaskPath "\" `
+                -Confirm:$false -ErrorAction Stop
+        }
 
         $powershellPath = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
         $arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$scriptPath`""
@@ -1952,7 +2803,13 @@ function Register-ContinuationTask {
         $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
             -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 4)
 
-        Register-ScheduledTask -TaskName $script:TaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
+        Register-ScheduledTask -TaskName $script:TaskName -TaskPath "\" -Action $action `
+            -Trigger $trigger -Principal $principal -Settings $settings -Force `
+            -ErrorAction Stop | Out-Null
+        if (-not (Test-ContinuationTask)) {
+            throw "Scheduled task registration verification failed"
+        }
+        [void](Set-MutationJournalEntryState -EntryId $taskEntryId -State "Applied")
 
         $state.Phase = "AwaitingReboot"
         if (-not (Save-State -State $state)) {
@@ -1964,7 +2821,8 @@ function Register-ContinuationTask {
         Write-Log "Continuation task registered: $($script:TaskName)" "SUCCESS"
         return $true
     } catch {
-        Unregister-ScheduledTask -TaskName $script:TaskName -Confirm:$false -ErrorAction SilentlyContinue
+        $taskRecovered = Restore-MutationJournalScope -Scope "Continuation"
+        if ($taskRecovered) { [void](Complete-MutationJournal) }
         [void](Clear-State)
         $script:ContinuationRegistered = $false
         Write-Log "Failed to create continuation task: $($_.Exception.Message)" "WARNING"
@@ -1974,7 +2832,7 @@ function Register-ContinuationTask {
 
 function Test-ContinuationTask {
     try {
-        return $null -ne (Get-ScheduledTask -TaskName $script:TaskName -ErrorAction SilentlyContinue)
+        return $null -ne (Get-ScheduledTask -TaskName $script:TaskName -TaskPath "\" -ErrorAction SilentlyContinue)
     } catch {
         return $false
     }
@@ -1985,8 +2843,22 @@ function Unregister-ContinuationTask {
 
     $success = $true
     try {
-        if (Test-ContinuationTask) {
-            Unregister-ScheduledTask -TaskName $script:TaskName -Confirm:$false -ErrorAction Stop
+        $continuationEntries = @()
+        if ($null -eq $script:MutationJournal) {
+            $script:MutationJournal = Get-MutationJournal -RunId $script:RunId
+        }
+        if ($null -ne $script:MutationJournal) {
+            $continuationEntries = @($script:MutationJournal.Entries | Where-Object {
+                [string]$_.Scope -eq "Continuation" -and
+                [string]$_.State -notin @("Restored", "Committed")
+            })
+        }
+
+        if ($continuationEntries.Count -gt 0) {
+            $success = Restore-MutationJournalScope -Scope "Continuation"
+        } elseif (Test-ContinuationTask) {
+            Unregister-ScheduledTask -TaskName $script:TaskName -TaskPath "\" `
+                -Confirm:$false -ErrorAction Stop
         }
     } catch {
         $success = $false
@@ -2023,40 +2895,125 @@ function Get-RegistryValueSnapshot {
         [string]$Name
     )
 
-    $key = Get-Item -LiteralPath $Path -ErrorAction Stop
+    $key = Get-Item -LiteralPath $Path -ErrorAction SilentlyContinue
+    if ($null -eq $key) {
+        return [ordered]@{
+            Path = $Path; Name = $Name; KeyExists = $false
+            Exists = $false; Value = $null; Kind = ""
+        }
+    }
     $valueNames = @($key.GetValueNames())
     $exists = $valueNames -contains $Name
     return [ordered]@{
-        Path   = $Path
-        Name   = $Name
-        Exists = $exists
-        Value  = $(if ($exists) { $key.GetValue($Name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) } else { $null })
-        Kind   = $(if ($exists) { $key.GetValueKind($Name).ToString() } else { "" })
+        Path      = $Path
+        Name      = $Name
+        KeyExists = $true
+        Exists    = $exists
+        Value     = $(if ($exists) { $key.GetValue($Name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) } else { $null })
+        Kind      = $(if ($exists) { $key.GetValueKind($Name).ToString() } else { "" })
     }
+}
+
+function Test-MutationRegistryTarget {
+    param(
+        [string]$Path,
+        [string]$Name
+    )
+
+    $normalizedPath = $Path.TrimEnd("\")
+    if ($normalizedPath -eq "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" -and
+        $Name -eq "UseWUServer") {
+        return $true
+    }
+    return (
+        $normalizedPath.StartsWith(
+            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\VolumeCaches\",
+            [StringComparison]::OrdinalIgnoreCase
+        ) -and $Name -eq "StateFlags0100"
+    )
+}
+
+function ConvertTo-RegistryValueKind {
+    param(
+        [AllowNull()][object]$Value,
+        [string]$Kind
+    )
+
+    switch ($Kind) {
+        "Binary" {
+            [byte[]]$bytes = @($Value | ForEach-Object { [byte]$_ })
+            return ,$bytes
+        }
+        "MultiString" {
+            [string[]]$strings = @($Value | ForEach-Object { [string]$_ })
+            return ,$strings
+        }
+        "DWord" { return [int]$Value }
+        "QWord" { return [long]$Value }
+        "String" { return [string]$Value }
+        "ExpandString" { return [string]$Value }
+        default { throw "Unsupported registry value kind '$Kind'" }
+    }
+}
+
+function Test-RegistrySnapshotEqual {
+    param(
+        [System.Collections.IDictionary]$Expected,
+        [System.Collections.IDictionary]$Actual
+    )
+
+    if ([bool]$Expected.KeyExists -ne [bool]$Actual.KeyExists -or
+        [bool]$Expected.Exists -ne [bool]$Actual.Exists) {
+        return $false
+    }
+    if (-not [bool]$Expected.Exists) { return $true }
+    if ([string]$Expected.Kind -ne [string]$Actual.Kind) { return $false }
+
+    if ([string]$Expected.Kind -in @("Binary", "MultiString")) {
+        $expectedValues = @($Expected.Value)
+        $actualValues = @($Actual.Value)
+        if ($expectedValues.Count -ne $actualValues.Count) { return $false }
+        for ($index = 0; $index -lt $expectedValues.Count; $index++) {
+            if ([string]$expectedValues[$index] -cne [string]$actualValues[$index]) {
+                return $false
+            }
+        }
+        return $true
+    }
+    return ([string]$Expected.Value -ceq [string]$Actual.Value)
 }
 
 function Restore-RegistryValueSnapshot {
     param([System.Collections.IDictionary]$Snapshot)
 
+    if (-not (Test-MutationRegistryTarget -Path ([string]$Snapshot.Path) -Name ([string]$Snapshot.Name))) {
+        return $false
+    }
     try {
         if ([bool]$Snapshot.Exists) {
-            New-ItemProperty -LiteralPath $Snapshot.Path -Name $Snapshot.Name -Value $Snapshot.Value `
+            if (-not (Test-Path -LiteralPath $Snapshot.Path)) {
+                New-Item -Path $Snapshot.Path -Force -ErrorAction Stop | Out-Null
+            }
+            $value = ConvertTo-RegistryValueKind -Value $Snapshot.Value -Kind ([string]$Snapshot.Kind)
+            New-ItemProperty -LiteralPath $Snapshot.Path -Name $Snapshot.Name -Value $value `
                 -PropertyType $Snapshot.Kind -Force -ErrorAction Stop | Out-Null
         } else {
             Remove-ItemProperty -LiteralPath $Snapshot.Path -Name $Snapshot.Name -Force -ErrorAction SilentlyContinue
+            if (-not [bool]$Snapshot.KeyExists -and (Test-Path -LiteralPath $Snapshot.Path)) {
+                $key = Get-Item -LiteralPath $Snapshot.Path -ErrorAction Stop
+                if (@($key.GetValueNames()).Count -eq 0 -and @($key.GetSubKeyNames()).Count -eq 0) {
+                    Remove-Item -LiteralPath $Snapshot.Path -Force -ErrorAction Stop
+                }
+            }
         }
 
         $restored = Get-RegistryValueSnapshot -Path $Snapshot.Path -Name $Snapshot.Name
-        if ([bool]$restored.Exists -ne [bool]$Snapshot.Exists) { return $false }
-        if ($Snapshot.Exists -and
-            ([string]$restored.Kind -ne [string]$Snapshot.Kind -or [string]$restored.Value -ne [string]$Snapshot.Value)) {
-            return $false
-        }
-        return $true
+        return Test-RegistrySnapshotEqual -Expected $Snapshot -Actual $restored
     } catch {
         return $false
     }
 }
+
 
 function Invoke-ComponentCleanup {
     $dismArguments = "/Online /Cleanup-Image /StartComponentCleanup"
@@ -2131,9 +3088,9 @@ function Invoke-ComponentCleanup {
         "System error memory dump files",
         "Delivery Optimization Files"
     )
-    $snapshots = [System.Collections.ArrayList]::new()
     $flagFailures = [System.Collections.ArrayList]::new()
     $cleanMgrSucceeded = $false
+    $cleanupScope = "Cleanup"
 
     try {
         foreach ($item in $cleanupItems) {
@@ -2142,9 +3099,18 @@ function Invoke-ComponentCleanup {
 
             try {
                 $snapshot = Get-RegistryValueSnapshot -Path $itemPath -Name "StateFlags0100"
-                [void]$snapshots.Add($snapshot)
+                $entryId = Add-MutationJournalEntry -Type "RegistryValue" `
+                    -Target "$itemPath\StateFlags0100" -Before $snapshot `
+                    -RecoveryAction "Restore the exact cleanmgr StateFlags0100 value, type, and existence" `
+                    -Scope $cleanupScope
                 New-ItemProperty -LiteralPath $itemPath -Name "StateFlags0100" -Value 2 `
                     -PropertyType DWord -Force -ErrorAction Stop | Out-Null
+                $written = Get-RegistryValueSnapshot -Path $itemPath -Name "StateFlags0100"
+                if (-not $written.Exists -or [string]$written.Kind -ne "DWord" -or
+                    [int]$written.Value -ne 2) {
+                    throw "StateFlags0100 write verification failed"
+                }
+                [void](Set-MutationJournalEntryState -EntryId $entryId -State "Applied")
             } catch {
                 [void]$flagFailures.Add("$item`: $($_.Exception.Message)")
             }
@@ -2163,10 +3129,8 @@ function Invoke-ComponentCleanup {
         $result.HResult = $_.Exception.HResult
         [void]$flagFailures.Add($_.Exception.Message)
     } finally {
-        foreach ($snapshot in @($snapshots)) {
-            if (-not (Restore-RegistryValueSnapshot -Snapshot $snapshot)) {
-                [void]$flagFailures.Add("Could not restore $($snapshot.Path)\$($snapshot.Name)")
-            }
+        if (-not (Restore-MutationJournalScope -Scope $cleanupScope)) {
+            [void]$flagFailures.Add("Could not restore one or more cleanmgr registry values")
         }
     }
 
@@ -3320,10 +4284,15 @@ function Repair-DellServices {
     }
 
     if ($service.Status -ne "Running") {
-        Set-Service -Name $serviceName -StartupType Automatic -ErrorAction SilentlyContinue
-        Start-Service -Name $serviceName -ErrorAction SilentlyContinue
-        Start-Sleep -Seconds 3
-        $service = Get-Service -Name $serviceName
+        try {
+            [void](Set-JournaledServiceState -ServiceName $serviceName -DesiredStatus "Running" `
+                -StartupType "Automatic" -Scope "Dell" `
+                -RecoveryAction "Restore the exact Dell Client Management Service status and startup mode")
+            $service = Get-Service -Name $serviceName -ErrorAction Stop
+        } catch {
+            Write-Log "Dell Client Management Service repair failed: $($_.Exception.Message)" "WARNING"
+            return $false
+        }
     }
 
     return ($service.Status -eq "Running")
@@ -3389,8 +4358,9 @@ function Invoke-DellUpdate {
                 ($_.DisplayName -like "*Dell*" -or $_.Name -like "*DDV*" -or $_.Name -like "*SupportAssist*") -and
                 $_.Name -ne "DellClientManagementService"
             } | ForEach-Object {
-                Stop-Service -Name $_.Name -Force -ErrorAction SilentlyContinue
-                Set-Service -Name $_.Name -StartupType Disabled -ErrorAction SilentlyContinue
+                [void](Set-JournaledServiceState -ServiceName $_.Name -DesiredStatus "Stopped" `
+                    -StartupType "Disabled" -Scope "Dell" `
+                    -RecoveryAction "Restore the exact pre-update Dell service status and startup mode")
             }
         }
 
@@ -3518,6 +4488,19 @@ function Invoke-DellUpdate {
         }
         Write-Log $result.Message "ERROR"
         return $result
+    } finally {
+        if (-not $DryRun -and -not (Restore-MutationJournalScope -Scope "Dell")) {
+            $result.Success = $false
+            $result.Status = $(if ($result.Installed -gt 0) { "Partial" } else { "Failed" })
+            $result.Failed = [math]::Max(1, $result.Failed)
+            $restoreMessage = "Dell service state restoration could not be verified"
+            $result.Message = $(if ([string]::IsNullOrWhiteSpace($result.Message)) {
+                $restoreMessage
+            } else {
+                "$($result.Message); $restoreMessage"
+            })
+            Write-Log $restoreMessage "ERROR"
+        }
     }
 }
 
@@ -4441,6 +5424,10 @@ function New-HTMLReport {
     }
 
     $dependencies = @($RunData.Dependencies)
+    $mutationEvents = @($RunData.MutationRecovery)
+    $mutationRecoveryCount = @($mutationEvents | Where-Object {
+        [string]$_.Action -in @("Restored", "Committed")
+    }).Count
     $dependencyRows = ""
     foreach ($dependency in $dependencies) {
         $dependencyName = & $displayValue $dependency.Name "Unnamed dependency"
@@ -5650,6 +6637,7 @@ function New-HTMLReport {
         <div class="detail-item"><dt>Duration</dt><dd>$durationDisplay · $durationSeconds seconds</dd></div>
         <div class="detail-item"><dt>Reboot</dt><dd>$rebootLabel</dd></div>
         <div class="detail-item"><dt>Component rollback</dt><dd>$componentRollbackDisplay</dd></div>
+        <div class="detail-item"><dt>Mutation recovery</dt><dd>$mutationRecoveryCount verified actions</dd></div>
       </dl>
       <div class="log-path"><span>Log file</span><code>$logFileDisplay</code></div>
     </section>
@@ -5727,6 +6715,7 @@ function Send-WebhookNotification {
         warnings        = @($RunData.Warnings)
         stages          = @($RunData.Stages)
         dependencies    = @($RunData.Dependencies)
+        mutation_recovery = @($RunData.MutationRecovery)
         runtime_seconds = $RunData.DurationSeconds
     }
 
@@ -5946,6 +6935,31 @@ try {
                 -Attempted 1 -Failed 1 -ProviderCode 3 -Message $message -StartedAt $initializationStart))
             $script:ExitCode = 3
             break run
+        }
+
+        $recoveryStart = Get-Date
+        $recovery = Invoke-UnfinishedMutationRecovery -ExcludeRunId $(if ($script:ContinuationActive) {
+            $script:RunId
+        } else {
+            ""
+        })
+        if (($recovery.Attempted + $recovery.Failed) -gt 0) {
+            $recoveryStatus = if ($recovery.Failed -gt 0) { "Failed" } else { "Succeeded" }
+            $recoveryMessage = if ($recovery.Messages.Count -gt 0) {
+                $recovery.Messages -join "; "
+            } else {
+                "No unfinished privileged mutations required recovery"
+            }
+            [void](Add-StageResult (New-StageResult -Name "MutationRecovery" `
+                -Provider "SystemUpdatePro journal" -Status $recoveryStatus `
+                -Attempted ([math]::Max($recovery.Attempted, $recovery.Failed)) -Installed $recovery.Recovered `
+                -Failed $recovery.Failed -Message $recoveryMessage -StartedAt $recoveryStart))
+            if ($recovery.Failed -gt 0) {
+                $message = "Unfinished privileged mutation recovery failed; refusing new system changes"
+                [void]$script:Errors.Add($message)
+                $script:ExitCode = 3
+                break run
+            }
         }
 
         [void](Add-StageResult (New-StageResult -Name "Initialization" -Status "Succeeded" `
@@ -6313,10 +7327,24 @@ try {
     }
 
     if (-not $DryRun -and -not $script:ContinuationRegistered) {
+        $hasContinuationJournal = $false
+        if ($null -eq $script:MutationJournal) {
+            $script:MutationJournal = Get-MutationJournal -RunId $script:RunId
+        }
+        if ($null -ne $script:MutationJournal) {
+            $hasContinuationJournal = @($script:MutationJournal.Entries | Where-Object {
+                [string]$_.Scope -eq "Continuation" -and
+                [string]$_.State -notin @("Restored", "Committed")
+            }).Count -gt 0
+        }
         $continuationArtifactsPresent = $script:ContinuationActive -or
-            (Test-Path -LiteralPath $script:StateFile) -or (Test-ContinuationTask)
+            (Test-Path -LiteralPath $script:StateFile) -or $hasContinuationJournal
         $continuationCleanupStart = Get-Date
-        $continuationCleanupSucceeded = [bool](Unregister-ContinuationTask)
+        $continuationCleanupSucceeded = if ($continuationArtifactsPresent) {
+            [bool](Unregister-ContinuationTask)
+        } else {
+            $true
+        }
         if ($continuationArtifactsPresent) {
             $continuationCleanupStage = ConvertTo-StageResult -Name "ContinuationCleanup" -Provider "Task Scheduler" `
                 -Result @{
@@ -6329,6 +7357,40 @@ try {
                 } -StartedAt $continuationCleanupStart
             [void](Add-StageResult $continuationCleanupStage)
             if (-not $continuationCleanupSucceeded) { $script:ExitCode = 3 }
+        }
+    }
+
+    if (-not $DryRun) {
+        $mutationFinalizeStart = Get-Date
+        $mutationCountBeforeFinalize = @($script:MutationEvidence).Count
+        $preserveMutationScopes = @()
+        if ($script:ContinuationRegistered) { $preserveMutationScopes = @("Continuation") }
+        $mutationFinalizeSucceeded = Complete-MutationJournal -PreserveScopes $preserveMutationScopes
+        $mutationActions = [math]::Max(
+            0,
+            @($script:MutationEvidence).Count - $mutationCountBeforeFinalize
+        )
+        if ($mutationCountBeforeFinalize -gt 0 -or $mutationActions -gt 0 -or
+            $null -ne $script:MutationJournal) {
+            [void](Add-StageResult (New-StageResult -Name "MutationFinalization" `
+                -Provider "SystemUpdatePro journal" `
+                -Status $(if ($mutationFinalizeSucceeded) { "Succeeded" } else { "Failed" }) `
+                -Attempted ([math]::Max(1, $mutationActions)) `
+                -Failed $(if ($mutationFinalizeSucceeded) { 0 } else { 1 }) `
+                -Message $(if ($mutationFinalizeSucceeded) {
+                    $(if ($script:ContinuationRegistered) {
+                        "Temporary mutations restored or committed; continuation-task recovery remains durable across reboot"
+                    } else {
+                        "Temporary privileged mutations restored or committed and verified"
+                    })
+                } else {
+                    "One or more privileged mutations could not be restored or committed"
+                }) -StartedAt $mutationFinalizeStart))
+        }
+        if (-not $mutationFinalizeSucceeded) {
+            $message = "Privileged mutation journal finalization failed"
+            if (-not ($script:Errors -contains $message)) { [void]$script:Errors.Add($message) }
+            $script:ExitCode = 3
         }
     }
 

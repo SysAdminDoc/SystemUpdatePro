@@ -27,7 +27,7 @@ SystemUpdatePro is a fully automated, self-healing PowerShell script that handle
 
 ### Self-Healing Capabilities
 - **WinGet Auto-Install**: Installs the pinned Microsoft App Installer bundle with its signed, architecture-specific dependencies
-- **Windows Update Repair**: Resets WU components, re-registers 30+ DLLs, clears cache
+- **Windows Update Repair**: Diagnoses WUA first, then uses journaled service changes and reversible run-scoped cache swaps only when repair is needed
 - **Service Recovery**: Detects and repairs broken OEM services
 - **Retry Logic**: Exponential backoff with configurable retry attempts
 
@@ -40,6 +40,7 @@ SystemUpdatePro is a fully automated, self-healing PowerShell script that handle
 - **DryRun Mode**: Preview all available updates without installing anything
 - **Driver Backup**: Export current drivers before installing updates for rollback capability
 - **Verified Dependencies**: Restricts downloads and redirects to approved HTTPS origins, checks hashes and publishers before execution, enforces safe version floors, and never changes PowerShell Gallery trust
+- **Privileged Mutation Recovery**: Atomically journals exact registry, service, cache, and scheduled-task before-images; startup rolls back interrupted runs before allowing new changes
 
 ### Enterprise Integration
 - **Event Log**: Writes to Windows Application log for RMM/SIEM visibility
@@ -240,11 +241,14 @@ Get-EventLog -LogName Application -Source "SystemUpdatePro" -Newest 10
 | `C:\ProgramData\SystemUpdatePro\Logs\` | Log files and HTML reports |
 | `C:\ProgramData\SystemUpdatePro\update.lock` | Lock file (prevents concurrent runs) |
 | `C:\ProgramData\SystemUpdatePro\state.json` | Protected, versioned post-reboot continuation state |
+| `C:\ProgramData\SystemUpdatePro\Journals\` | Protected, run-scoped privileged-mutation recovery journals |
 | `C:\ProgramData\SystemUpdatePro\update_history.json` | Update history log (last 100 runs) |
 | `C:\ProgramData\SystemUpdatePro\DriverBackups\` | Driver backup snapshots (last 3 kept) |
 | `C:\ProgramData\SystemUpdatePro\HPIA\` | HP Image Assistant installation |
 
 Continuation state is atomically replaced and restricted to SYSTEM, Administrators, and the creating identity. It preserves the run ID, effective parameters, result history, attempt count, and next stage cursor; task command lines contain only the script path. Invalid or broadly writable state is moved to `state.corrupt.<timestamp>.<id>.json` instead of being executed. A continuation can resume at most three times, and terminal success or failure removes its one-shot task and active state.
+
+Privileged mutations use a separate atomic journal with the same protected access model. WSUS policy, service status/startup mode, cleanmgr flags, update-cache directory swaps, and continuation-task replacement are verified and restored in reverse order. An interrupted journal is recovered before a new run can mutate the machine; recovery failure stops the run.
 
 ---
 
@@ -389,11 +393,10 @@ Register-ScheduledTask -TaskName "SystemUpdatePro Weekly" -Action $action -Trigg
 |     +-- Auto-cleanup old backups (keep 3)                    |
 |                                                              |
 |  3. WINDOWS UPDATE REPAIR (if -RepairWindowsUpdate)          |
-|     +-- Stop WU services                                    |
-|     +-- Clear SoftwareDistribution cache                    |
-|     +-- Re-register 30+ DLLs                                |
-|     +-- Reset Winsock                                        |
-|     +-- Restart WU services                                  |
+|     +-- Diagnose Windows Update Agent before mutation         |
+|     +-- Journal exact service state and stop required services |
+|     +-- Rename SoftwareDistribution and catroot2 reversibly   |
+|     +-- Validate WUA; rollback on failure                     |
 |                                                              |
 |  4. OEM UPDATES (auto-detected)                              |
 |     +-- Dell: Install DCU -> Apply updates                   |

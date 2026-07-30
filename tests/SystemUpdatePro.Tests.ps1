@@ -46,6 +46,25 @@ BeforeAll {
         "Import-ContinuationState",
         "Set-ContinuationCursor",
         "Test-ShouldRunContinuationStage",
+        "Get-MutationJournalPath",
+        "New-MutationJournal",
+        "Test-MutationJournal",
+        "Save-MutationJournal",
+        "Get-MutationJournal",
+        "Get-OrCreateMutationJournal",
+        "Add-MutationJournalEntry",
+        "Set-MutationJournalEntryState",
+        "Test-MutationDirectoryContract",
+        "Restore-DirectoryRenameSnapshot",
+        "Invoke-JournaledDirectoryReset",
+        "Complete-DirectoryRenameSnapshot",
+        "Restore-MutationJournalEntry",
+        "Complete-MutationJournalEntry",
+        "Restore-MutationJournalScope",
+        "Complete-MutationJournal",
+        "Invoke-UnfinishedMutationRecovery",
+        "Get-ScheduledTaskSnapshot",
+        "Restore-ScheduledTaskSnapshot",
         "Register-ContinuationTask",
         "Test-ContinuationTask",
         "Unregister-ContinuationTask",
@@ -73,6 +92,15 @@ BeforeAll {
         "Test-DellInventoryCollector",
         "Update-DellInventoryCollector",
         "Install-DellCommandUpdate",
+        "Get-ServiceStartupType",
+        "Get-ServiceDelayedAutoStartSnapshot",
+        "Set-ServiceStartupType",
+        "Get-ServiceSnapshot",
+        "Restore-ServiceSnapshot",
+        "Set-JournaledServiceState",
+        "Test-WindowsUpdateRuntime",
+        "Repair-WindowsUpdateServices",
+        "Set-WSUSBypass",
         "Repair-DellServices",
         "Invoke-DellUpdate",
         "Invoke-LenovoUpdate",
@@ -80,6 +108,9 @@ BeforeAll {
         "Install-HPIA",
         "Invoke-HPUpdate",
         "Get-RegistryValueSnapshot",
+        "Test-MutationRegistryTarget",
+        "ConvertTo-RegistryValueKind",
+        "Test-RegistrySnapshotEqual",
         "Restore-RegistryValueSnapshot",
         "Invoke-ComponentCleanup",
         "Invoke-WindowsUpdate",
@@ -144,6 +175,13 @@ BeforeAll {
         $script:AcquisitionManifestVersion = 1
         $script:AcquisitionManifest = Get-AcquisitionManifest
         $script:AcquisitionProvenance = [System.Collections.ArrayList]::new()
+        $script:MutationJournalSchemaVersion = 1
+        $script:MutationJournalDirectory = Join-Path $stateTestDirectory "Journals"
+        New-Item -ItemType Directory -Path $script:MutationJournalDirectory -Force | Out-Null
+        $script:MutationJournal = $null
+        $script:MutationEvidence = [System.Collections.ArrayList]::new()
+        $script:WindowsRoot = Join-Path $stateTestDirectory "Windows"
+        New-Item -ItemType Directory -Path (Join-Path $script:WindowsRoot "System32") -Force | Out-Null
         $script:PSModuleInstallRoot = Join-Path $stateTestDirectory "Modules"
         $script:HPIAInstallRoot = Join-Path $stateTestDirectory "HPIA"
 
@@ -559,6 +597,7 @@ Describe "PowerShell 5.1 continuation state machine" {
     }
 
     It "rolls back state when scheduled-task registration fails" {
+        Mock Get-ScheduledTask { $null }
         Mock Unregister-ScheduledTask {}
         Mock New-ScheduledTaskAction { $script:TaskActionStub }
         Mock New-ScheduledTaskTrigger { $script:TaskTriggerStub }
@@ -571,16 +610,22 @@ Describe "PowerShell 5.1 continuation state machine" {
         Test-Path -LiteralPath $script:StateFile | Should -BeFalse
         $script:ContinuationRegistered | Should -BeFalse
         Should -Invoke Register-ScheduledTask -Times 1 -Exactly
-        Should -Invoke Unregister-ScheduledTask -Times 2 -Exactly
+        Should -Invoke Unregister-ScheduledTask -Times 0 -Exactly
+        Test-Path -LiteralPath (Get-MutationJournalPath) | Should -BeFalse
     }
 
     It "commits awaiting-reboot state and keeps secrets out of task arguments" {
+        $script:TaskPresent = $false
+        Mock Get-ScheduledTask {
+            if ($script:TaskPresent) { return "task" }
+            return $null
+        }
         Mock Unregister-ScheduledTask {}
         Mock New-ScheduledTaskAction { $script:TaskActionStub }
         Mock New-ScheduledTaskTrigger { $script:TaskTriggerStub }
         Mock New-ScheduledTaskPrincipal { $script:TaskPrincipalStub }
         Mock New-ScheduledTaskSettingsSet { $script:TaskSettingsStub }
-        Mock Register-ScheduledTask { "task" }
+        Mock Register-ScheduledTask { $script:TaskPresent = $true; "task" }
         $script:WebhookUrl = "https://example.invalid/private-hook"
 
         Register-ContinuationTask | Should -BeTrue
@@ -589,6 +634,7 @@ Describe "PowerShell 5.1 continuation state machine" {
         $loaded.Phase | Should -Be "AwaitingReboot"
         $loaded.Parameters.WebhookUrl | Should -Be "https://example.invalid/private-hook"
         $script:ContinuationRegistered | Should -BeTrue
+        (Get-MutationJournal).Status | Should -Be "Open"
         Should -Invoke New-ScheduledTaskAction -Times 1 -Exactly -ParameterFilter {
             $Argument -notmatch "WebhookUrl|private-hook" -and
             $Argument -match "-NonInteractive" -and
@@ -607,6 +653,287 @@ Describe "PowerShell 5.1 continuation state machine" {
 
         Test-Path -LiteralPath $script:StateFile | Should -BeFalse
         Should -Invoke Unregister-ScheduledTask -Times 1 -Exactly
+    }
+}
+
+Describe "Privileged mutation journal and crash recovery" {
+    BeforeEach {
+        Initialize-SystemUpdateProTestState
+        Mock Write-Log {}
+    }
+
+    It "atomically persists a protected before-image before mutation" {
+        $before = [ordered]@{
+            Path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU"
+            Name = "UseWUServer"; KeyExists = $true; Exists = $true
+            Value = 1; Kind = "DWord"
+        }
+
+        $entryId = Add-MutationJournalEntry -Type "RegistryValue" `
+            -Target "$($before.Path)\$($before.Name)" -Before $before `
+            -RecoveryAction "Restore exact policy value" -Scope "WSUS"
+        $journal = Get-MutationJournal
+        $journalPath = Get-MutationJournalPath
+
+        $journal.Entries.Count | Should -Be 1
+        $journal.Entries[0].Id | Should -Be $entryId
+        $journal.Entries[0].State | Should -Be "Planned"
+        (Test-ContinuationStateAccess -Path $journalPath).Valid | Should -BeTrue
+        (Get-Acl -LiteralPath $journalPath).AreAccessRulesProtected | Should -BeTrue
+        @(Get-ChildItem -LiteralPath $script:MutationJournalDirectory -Filter "*.tmp.*").Count |
+            Should -Be 0
+        $script:MutationEvidence[0].Action | Should -Be "Journaled"
+    }
+
+    It "restores entries in reverse mutation order" {
+        $script:MutationJournal = New-MutationJournal
+        $script:MutationJournal.Entries = @(
+            [ordered]@{
+                Id = [guid]::NewGuid().ToString(); Sequence = 1; Type = "RegistryValue"
+                Target = "first"; Scope = "Ordered"; State = "Applied"; RestoreOnFinalize = $true
+                RecoveryAction = "first"; Before = [ordered]@{}; Metadata = [ordered]@{}
+            },
+            [ordered]@{
+                Id = [guid]::NewGuid().ToString(); Sequence = 2; Type = "RegistryValue"
+                Target = "second"; Scope = "Ordered"; State = "Applied"; RestoreOnFinalize = $true
+                RecoveryAction = "second"; Before = [ordered]@{}; Metadata = [ordered]@{}
+            }
+        )
+        $script:RestoreOrder = [System.Collections.ArrayList]::new()
+        Mock Restore-MutationJournalEntry {
+            [void]$script:RestoreOrder.Add([int]$Entry.Sequence)
+            return $true
+        }
+
+        Restore-MutationJournalScope -Scope "Ordered" | Should -BeTrue
+
+        @($script:RestoreOrder) | Should -Be @(2, 1)
+    }
+
+    It "restores an interrupted Windows Update cache swap on the next run" {
+        $cachePath = Join-Path $script:WindowsRoot "SoftwareDistribution"
+        New-Item -ItemType Directory -Path $cachePath -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $cachePath "old-cache.txt") -Value "before"
+        $staleRunId = $script:RunId
+
+        [void](Invoke-JournaledDirectoryReset -Path $cachePath -Services @())
+        Set-Content -LiteralPath (Join-Path $cachePath "new-cache.txt") -Value "after"
+        $backupPath = "$cachePath.SystemUpdatePro.$staleRunId.bak"
+        Test-Path -LiteralPath $backupPath | Should -BeTrue
+
+        $script:RunId = [guid]::NewGuid().ToString()
+        $script:MutationJournal = $null
+        $recovery = Invoke-UnfinishedMutationRecovery
+
+        $recovery.Recovered | Should -Be 1
+        $recovery.Failed | Should -Be 0
+        Test-Path -LiteralPath (Join-Path $cachePath "old-cache.txt") | Should -BeTrue
+        Test-Path -LiteralPath (Join-Path $cachePath "new-cache.txt") | Should -BeFalse
+        Test-Path -LiteralPath $backupPath | Should -BeFalse
+        Test-Path -LiteralPath (Join-Path $script:MutationJournalDirectory "$staleRunId.json") |
+            Should -BeFalse
+    }
+
+    It "commits a verified cache replacement only on normal finalization" {
+        $cachePath = Join-Path $script:WindowsRoot "System32\catroot2"
+        New-Item -ItemType Directory -Path $cachePath -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $cachePath "old.cat") -Value "before"
+        $backupPath = "$cachePath.SystemUpdatePro.$($script:RunId).bak"
+
+        [void](Invoke-JournaledDirectoryReset -Path $cachePath -Services @())
+        Set-Content -LiteralPath (Join-Path $cachePath "new.cat") -Value "after"
+        Complete-MutationJournal | Should -BeTrue
+
+        Test-Path -LiteralPath (Join-Path $cachePath "new.cat") | Should -BeTrue
+        Test-Path -LiteralPath $backupPath | Should -BeFalse
+        Test-Path -LiteralPath (Get-MutationJournalPath) | Should -BeFalse
+    }
+
+    It "completes a durably decided cache commit after interruption" {
+        $cachePath = Join-Path $script:WindowsRoot "SoftwareDistribution"
+        New-Item -ItemType Directory -Path $cachePath -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $cachePath "old-cache.txt") -Value "before"
+        $staleRunId = $script:RunId
+        $backupPath = "$cachePath.SystemUpdatePro.$staleRunId.bak"
+
+        $entryId = Invoke-JournaledDirectoryReset -Path $cachePath -Services @()
+        Set-Content -LiteralPath (Join-Path $cachePath "new-cache.txt") -Value "after"
+        [void](Set-MutationJournalEntryState -EntryId $entryId -State "Committing")
+
+        $script:RunId = [guid]::NewGuid().ToString()
+        $script:MutationJournal = $null
+        $recovery = Invoke-UnfinishedMutationRecovery
+
+        $recovery.Recovered | Should -Be 1
+        Test-Path -LiteralPath (Join-Path $cachePath "new-cache.txt") | Should -BeTrue
+        Test-Path -LiteralPath (Join-Path $cachePath "old-cache.txt") | Should -BeFalse
+        Test-Path -LiteralPath $backupPath | Should -BeFalse
+        Test-Path -LiteralPath (Join-Path $script:MutationJournalDirectory "$staleRunId.json") |
+            Should -BeFalse
+    }
+
+    It "refuses an unfinished journal whose ACL cannot be trusted" {
+        $journal = New-MutationJournal
+        $journalPath = Get-MutationJournalPath
+        $journal | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $journalPath
+        Mock Test-ContinuationStateAccess {
+            [PSCustomObject]@{ Valid = $false; Reason = "untrusted ACL" }
+        }
+
+        $result = Invoke-UnfinishedMutationRecovery
+
+        $result.Failed | Should -Be 1
+        $result.Messages[0] | Should -Match "untrusted ACL"
+        Test-Path -LiteralPath $journalPath | Should -BeTrue
+    }
+
+    It "preserves zero, missing, binary, and multi-string registry before-images exactly" {
+        $zero = [ordered]@{
+            Path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU"
+            Name = "UseWUServer"; KeyExists = $true; Exists = $true
+            Value = 0; Kind = "DWord"
+        }
+        $missing = [ordered]@{
+            Path = $zero.Path; Name = $zero.Name; KeyExists = $true
+            Exists = $false; Value = $null; Kind = ""
+        }
+        $binary = ConvertTo-RegistryValueKind -Value @(0, 127, 255) -Kind "Binary"
+        $multi = ConvertTo-RegistryValueKind -Value @("first", "second") -Kind "MultiString"
+
+        (Test-RegistrySnapshotEqual -Expected $zero -Actual $zero) | Should -BeTrue
+        (Test-RegistrySnapshotEqual -Expected $missing -Actual $missing) | Should -BeTrue
+        $binary.GetType().FullName | Should -Be "System.Byte[]"
+        @($binary) | Should -Be @(0, 127, 255)
+        $multi.GetType().FullName | Should -Be "System.String[]"
+        @($multi) | Should -Be @("first", "second")
+    }
+
+    It "restores the exact preexisting scheduled-task XML" {
+        $xml = "<Task><RegistrationInfo /><Triggers /><Principals /><Settings /><Actions /></Task>"
+        $script:TaskExists = $true
+        Mock Get-ScheduledTask {
+            if ($script:TaskExists) { return "task" }
+            return $null
+        }
+        Mock Unregister-ScheduledTask { $script:TaskExists = $false }
+        Mock Register-ScheduledTask { $script:TaskExists = $true; "restored-task" }
+        Mock Export-ScheduledTask { $xml }
+        $snapshot = [ordered]@{
+            Exists = $true; TaskName = $script:TaskName; TaskPath = "\"; Xml = $xml
+        }
+
+        Restore-ScheduledTaskSnapshot -Snapshot $snapshot | Should -BeTrue
+
+        Should -Invoke Unregister-ScheduledTask -Times 1 -Exactly
+        Should -Invoke Register-ScheduledTask -Times 1 -Exactly -ParameterFilter {
+            $Xml -eq $xml -and $TaskPath -eq "\"
+        }
+    }
+
+    It "restores service status, startup mode, and delayed-start existence" {
+        $snapshot = [ordered]@{
+            Exists = $true; Name = "wuauserv"; Status = "Running"
+            StartupType = "Automatic"; DelayedAutoStartExists = $false
+            DelayedAutoStartValue = 0; RestartOnRestore = $false
+        }
+        Mock Set-ServiceStartupType {}
+        Mock Remove-ItemProperty {}
+        Mock Get-Service { [PSCustomObject]@{ Status = "Running"; StartType = "Automatic" } }
+        Mock Get-ServiceStartupType { "Automatic" }
+        Mock Get-ServiceDelayedAutoStartSnapshot {
+            [ordered]@{ Exists = $false; Value = 0 }
+        }
+
+        Restore-ServiceSnapshot -Snapshot $snapshot | Should -BeTrue
+
+        Should -Invoke Set-ServiceStartupType -Times 1 -Exactly -ParameterFilter {
+            $ServiceName -eq "wuauserv" -and $StartupType -eq "Automatic"
+        }
+        Should -Invoke Remove-ItemProperty -Times 1 -Exactly -ParameterFilter {
+            $Name -eq "DelayedAutoStart"
+        }
+    }
+
+    It "does not mutate a healthy Windows Update runtime" {
+        Mock Test-WindowsUpdateRuntime {
+            [PSCustomObject]@{ Healthy = $true; Message = "healthy" }
+        }
+        Mock Set-JournaledServiceState {}
+        Mock Invoke-JournaledDirectoryReset {}
+
+        Repair-WindowsUpdateServices | Should -BeTrue
+
+        Should -Invoke Set-JournaledServiceState -Times 0 -Exactly
+        Should -Invoke Invoke-JournaledDirectoryReset -Times 0 -Exactly
+    }
+
+    It "removes irreversible network resets and cache wildcard deletion from repair" {
+        $source = Get-Content -LiteralPath $script:SourceScriptPath -Raw
+
+        $source | Should -Not -Match "regsvr32\.exe"
+        $source | Should -Not -Match "netsh\s+winsock\s+reset"
+        $source | Should -Not -Match "netsh\s+winhttp\s+reset\s+proxy"
+        $source | Should -Not -Match "SoftwareDistribution\\Download\\\*"
+        $source | Should -Not -Match "catroot2\\\*"
+    }
+
+    It "journals WSUS value absence and service state before enabling bypass" {
+        $auPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU"
+        $script:RegistryWritten = $false
+        $script:JournalEntryNumber = 0
+        Mock Test-Path { $true } -ParameterFilter { $LiteralPath -eq $auPath }
+        Mock Get-ServiceSnapshot {
+            [ordered]@{
+                Exists = $true; Name = "wuauserv"; Status = "Running"
+                StartupType = "Manual"; DelayedAutoStartExists = $false
+                DelayedAutoStartValue = 0; RestartOnRestore = $false
+            }
+        }
+        Mock Get-RegistryValueSnapshot {
+            [ordered]@{
+                Path = $Path; Name = $Name; KeyExists = $true
+                Exists = $script:RegistryWritten
+                Value = $(if ($script:RegistryWritten) { 0 } else { $null })
+                Kind = $(if ($script:RegistryWritten) { "DWord" } else { "" })
+            }
+        }
+        Mock Add-MutationJournalEntry {
+            $script:JournalEntryNumber++
+            return "entry-$($script:JournalEntryNumber)"
+        }
+        Mock New-ItemProperty { $script:RegistryWritten = $true }
+        Mock Set-MutationJournalEntryState { $true }
+        Mock Restart-Service {}
+        Mock Get-Service { [PSCustomObject]@{ Status = "Running" } }
+
+        Set-WSUSBypass -Enable | Should -BeTrue
+
+        Should -Invoke Add-MutationJournalEntry -Times 2 -Exactly
+        Should -Invoke Add-MutationJournalEntry -Times 1 -Exactly -ParameterFilter {
+            $Type -eq "RegistryValue" -and -not $Before.Exists -and $Scope -eq "WSUS"
+        }
+        Should -Invoke Set-MutationJournalEntryState -Times 2 -Exactly -ParameterFilter {
+            $State -eq "Applied"
+        }
+        Should -Invoke Restart-Service -Times 1 -Exactly -ParameterFilter {
+            $Name -eq "wuauserv"
+        }
+    }
+
+    It "keeps continuation-task recovery durable across a reboot boundary" {
+        $snapshot = [ordered]@{
+            Exists = $false; TaskName = $script:TaskName; TaskPath = "\"; Xml = ""
+        }
+        [void](Add-MutationJournalEntry -Type "ScheduledTask" -Target "\$($script:TaskName)" `
+            -Before $snapshot -RecoveryAction "Restore original task absence" -Scope "Continuation")
+        Complete-MutationJournal -PreserveScopes @("Continuation") | Should -BeTrue
+
+        (Get-MutationJournal).Status | Should -Be "AwaitingContinuation"
+        Test-Path -LiteralPath (Get-MutationJournalPath) | Should -BeTrue
+
+        Mock Restore-ScheduledTaskSnapshot { $true }
+        Complete-MutationJournal | Should -BeTrue
+        Test-Path -LiteralPath (Get-MutationJournalPath) | Should -BeFalse
     }
 }
 
@@ -782,6 +1109,7 @@ Describe "Fail-closed firmware safety" {
         Mock Test-DellInventoryCollector { $true }
         Mock Repair-DellServices { $true }
         Mock Get-Service { @() }
+        Mock Restore-MutationJournalScope { $true }
         Mock Start-Process { [PSCustomObject]@{ ExitCode = 0 } }
 
         $result = Invoke-DellUpdate -IncludeBIOS -SystemInfo $script:FirmwareSystemInfo `
@@ -793,6 +1121,9 @@ Describe "Fail-closed firmware safety" {
             $ArgumentList -match "/applyUpdates" -and
             $ArgumentList -match "-updateType=driver,application,others" -and
             $ArgumentList -notmatch "-autoSuspendBitLocker"
+        }
+        Should -Invoke Restore-MutationJournalScope -Times 1 -Exactly -ParameterFilter {
+            $Scope -eq "Dell"
         }
     }
 
@@ -887,17 +1218,32 @@ Describe "Explicit component cleanup safety" {
     It "restores every temporary cleanmgr registry flag" {
         Mock Start-Process { [PSCustomObject]@{ ExitCode = 0 } }
         Mock Test-Path { $true }
+        $script:WrittenRegistryPaths = @{}
         Mock Get-RegistryValueSnapshot {
-            [ordered]@{ Path = $Path; Name = $Name; Exists = $true; Value = 7; Kind = "DWord" }
+            $written = $script:WrittenRegistryPaths.ContainsKey([string]$Path)
+            [ordered]@{
+                Path = $Path; Name = $Name; KeyExists = $true; Exists = $true
+                Value = $(if ($written) { 2 } else { 7 }); Kind = "DWord"
+            }
         }
-        Mock New-ItemProperty {}
-        Mock Restore-RegistryValueSnapshot { $true }
+        Mock New-ItemProperty { $script:WrittenRegistryPaths[[string]$LiteralPath] = $true }
+        Mock Add-MutationJournalEntry { [guid]::NewGuid().ToString() }
+        Mock Set-MutationJournalEntryState { $true }
+        Mock Restore-MutationJournalScope { $true }
 
         $result = Invoke-ComponentCleanup
 
         $result.Success | Should -BeTrue
         $result.Status | Should -Be "Succeeded"
-        Should -Invoke Restore-RegistryValueSnapshot -Times 5 -Exactly
+        Should -Invoke Add-MutationJournalEntry -Times 5 -Exactly -ParameterFilter {
+            $Type -eq "RegistryValue" -and $Scope -eq "Cleanup"
+        }
+        Should -Invoke Set-MutationJournalEntryState -Times 5 -Exactly -ParameterFilter {
+            $State -eq "Applied"
+        }
+        Should -Invoke Restore-MutationJournalScope -Times 1 -Exactly -ParameterFilter {
+            $Scope -eq "Cleanup"
+        }
         Should -Invoke New-ItemProperty -Times 5 -Exactly -ParameterFilter {
             $Name -eq "StateFlags0100" -and $Value -eq 2
         }
@@ -909,11 +1255,19 @@ Describe "Explicit component cleanup safety" {
             return [PSCustomObject]@{ ExitCode = 5 }
         }
         Mock Test-Path { $true }
+        $script:WrittenRegistryPaths = @{}
         Mock Get-RegistryValueSnapshot {
-            [ordered]@{ Path = $Path; Name = $Name; Exists = $false; Value = $null; Kind = "" }
+            $written = $script:WrittenRegistryPaths.ContainsKey([string]$Path)
+            [ordered]@{
+                Path = $Path; Name = $Name; KeyExists = $true; Exists = $written
+                Value = $(if ($written) { 2 } else { $null })
+                Kind = $(if ($written) { "DWord" } else { "" })
+            }
         }
-        Mock New-ItemProperty {}
-        Mock Restore-RegistryValueSnapshot { $false }
+        Mock New-ItemProperty { $script:WrittenRegistryPaths[[string]$LiteralPath] = $true }
+        Mock Add-MutationJournalEntry { [guid]::NewGuid().ToString() }
+        Mock Set-MutationJournalEntryState { $true }
+        Mock Restore-MutationJournalScope { $false }
 
         $result = Invoke-ComponentCleanup
         $stage = ConvertTo-StageResult -Name "Cleanup" -Provider "DISM and cleanmgr" -Result $result
@@ -923,7 +1277,10 @@ Describe "Explicit component cleanup safety" {
         $stage.Status | Should -Be "Partial"
         $stage.Failed | Should -BeGreaterThan 0
         $stage.Message | Should -Match "failures"
-        Should -Invoke Restore-RegistryValueSnapshot -Times 5 -Exactly
+        Should -Invoke Add-MutationJournalEntry -Times 5 -Exactly
+        Should -Invoke Restore-MutationJournalScope -Times 1 -Exactly -ParameterFilter {
+            $Scope -eq "Cleanup"
+        }
     }
 
     It "states irreversible rollback impact in the HTML report" {

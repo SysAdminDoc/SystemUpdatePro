@@ -4,6 +4,7 @@ All notable changes to SystemUpdatePro will be documented in this file.
 
 ## [Unreleased]
 
+- Added protected, atomic, run-scoped mutation journals with startup crash recovery and verified reverse-order restoration for WSUS policy, service state, update-cache swaps, cleanmgr flags, Dell services, and continuation tasks; Windows Update repair now diagnoses first and no longer resets Winsock/WinHTTP, re-registers DLLs, or deletes cache contents in place.
 - Added a single elevated-dependency acquisition manifest with approved HTTPS origins, redirect constraints, architecture/version floors, exact package hashes, Authenticode publisher checks, verified module staging, WinGet/Dell source contracts, HPIA 5.3.6, Dell Inventory Collector 13.8.0+ enforcement, and persisted report/history/webhook provenance without weakening PowerShell Gallery trust.
 - Made firmware installation fail closed across Dell, Lenovo, and HP with tri-state disk/power/BitLocker checks, a configurable 50% charge floor, provider/model applicability scans, one shared firmware filter, actionable block reasons, and no `-Force` bypass for unknown safety state.
 - Made component cleanup reversible by default, moved irreversible DISM `/ResetBase` behind `-ResetComponentBase`, exposed rollback impact in dry runs and reports, and now restores temporary Disk Cleanup registry flags while reporting partial failures.
