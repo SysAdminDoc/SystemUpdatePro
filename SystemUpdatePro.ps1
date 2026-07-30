@@ -53,8 +53,8 @@
     Export current drivers before installing OEM/driver updates
 .PARAMETER ShowHistory
     Display update history from previous runs
-.PARAMETER WebhookUrl
-    URL to send completion notification (Slack, Teams, or generic webhook)
+.PARAMETER WebhookSecretReference
+    Environment-variable or protected JSON-file reference containing an HTTPS webhook endpoint
 .PARAMETER HistoryCount
     Number of history entries to display with -ShowHistory (default: 10)
 .PARAMETER MaxRetries
@@ -91,8 +91,8 @@
     .\SystemUpdatePro.ps1 -BackupDrivers -IncludeBIOS -Reboot
     # Backup drivers, update everything including BIOS, reboot
 .EXAMPLE
-    .\SystemUpdatePro.ps1 -WebhookUrl "https://hooks.slack.com/services/..."
-    # Run updates and notify Slack on completion
+    .\SystemUpdatePro.ps1 -WebhookSecretReference "env:SYSTEMUPDATEPRO_WEBHOOK_URL"
+    # Resolve the webhook from an environment variable without exposing it in argv
 .EXAMPLE
     .\SystemUpdatePro.ps1 -ShowHistory -HistoryCount 20
     # Show last 20 update runs
@@ -139,14 +139,50 @@ param(
     [switch]$DryRun,
     [switch]$BackupDrivers,
     [switch]$ShowHistory,
-    [string]$WebhookUrl,
+    [ValidateScript({
+        if ([string]::IsNullOrWhiteSpace([string]$_)) { return $true }
+        if ([string]$_ -match "(?i)^env:[A-Z_][A-Z0-9_]*$") { return $true }
+        if ([string]$_ -match "(?i)^file:(?<ConfigPath>[A-Z]:[\\/].+)$") {
+            $candidatePath = [string]$Matches.ConfigPath
+            if ($candidatePath -match '[*?"<>|]' -or
+                -not [IO.Path]::IsPathRooted($candidatePath)) {
+                throw "Webhook config reference must use an absolute local path without wildcards"
+            }
+            return $true
+        }
+        throw "WebhookSecretReference must be empty, env:VARIABLE_NAME, or file:C:\path\config.json"
+    })]
+    [string]$WebhookSecretReference = "",
+    [ValidateRange(1, 100)]
     [int]$HistoryCount = 10,
+    [ValidateRange(1, 10)]
     [int]$MaxRetries = 3,
+    [ValidateRange(1, 10)]
     [int]$MaxUpdatePasses = 3,
+    [ValidateRange(1, 1024)]
     [int]$MinDiskSpaceGB = 10,
     [ValidateRange(10, 100)]
     [int]$MinFirmwareChargePercent = 50,
+    [ValidateScript({
+        $candidatePath = [string]$_
+        if ([string]::IsNullOrWhiteSpace($candidatePath) -or
+            $candidatePath -notmatch "^[A-Z]:[\\/]" -or
+            $candidatePath -match '[*?"<>|]') {
+            throw "LogPath must be an absolute local path without wildcards"
+        }
+        try {
+            $fullPath = [IO.Path]::GetFullPath($candidatePath).TrimEnd("\", "/")
+            $rootPath = [IO.Path]::GetPathRoot($fullPath).TrimEnd("\", "/")
+            if ($fullPath -eq $rootPath) {
+                throw "LogPath must be a dedicated directory, not a drive root"
+            }
+        } catch {
+            throw "LogPath is invalid: $($_.Exception.Message)"
+        }
+        return $true
+    })]
     [string]$LogPath = "C:\ProgramData\SystemUpdatePro\Logs",
+    [ValidateRange(1, 3650)]
     [int]$LogRetentionDays = 30,
     [ValidateRange(10, 10240)]
     [int]$EvidenceMaxSizeMB = 512,
@@ -165,11 +201,13 @@ param(
 
 $script:Version = "4.1.0"
 $script:ProductName = "SystemUpdatePro"
+$script:WebhookSecretReference = [string]$WebhookSecretReference
+$script:WebhookUrl = ""
 $script:EvidenceMaxSizeMB = [int]$EvidenceMaxSizeMB
 $script:RedactionMode = [string]$RedactionMode
 $script:EventLogSource = "SystemUpdatePro"
 $script:ResultSchemaVersion = 1
-$script:StateSchemaVersion = 4
+$script:StateSchemaVersion = 5
 $script:CapabilitySchemaVersion = 1
 $script:HistorySchemaVersion = 2
 $script:LockSchemaVersion = 1
@@ -541,7 +579,11 @@ function Protect-EvidenceObject {
     )
 
     if ($null -eq $InputObject) { return $null }
-    $isSecretProperty = $PropertyName -match "(?i)(webhook|authorization|password|secret|token|api.?key|signature)"
+    $isSecretReferenceProperty = $PropertyName -match "(?i)(reference|ref)$"
+    $isSecretProperty = (
+        $PropertyName -match "(?i)(webhook|authorization|password|secret|token|api.?key|signature)" -and
+        -not $isSecretReferenceProperty
+    )
     $isSerialProperty = $PropertyName -match "(?i)^serial[_-]?(number)?$"
     if ($isSecretProperty) {
         if ($InputObject -is [string]) {
@@ -892,6 +934,118 @@ function Protect-EvidenceTree {
         }
     }
     return $succeeded
+}
+
+function Test-HttpsWebhookEndpoint {
+    param(
+        [AllowNull()][string]$Endpoint
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Endpoint)) {
+        return [PSCustomObject]@{ Valid = $false; Reason = "Webhook endpoint is empty" }
+    }
+    if ($Endpoint.Length -gt 4096 -or $Endpoint -match "[`r`n`0]") {
+        return [PSCustomObject]@{
+            Valid = $false
+            Reason = "Webhook endpoint length or characters are invalid"
+        }
+    }
+    $uri = $null
+    if (-not [uri]::TryCreate($Endpoint, [UriKind]::Absolute, [ref]$uri) -or
+        $uri.Scheme -ne [Uri]::UriSchemeHttps -or
+        [string]::IsNullOrWhiteSpace($uri.DnsSafeHost)) {
+        return [PSCustomObject]@{
+            Valid = $false
+            Reason = "Webhook endpoint must be an absolute HTTPS URL"
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($uri.UserInfo)) {
+        return [PSCustomObject]@{
+            Valid = $false
+            Reason = "Webhook endpoint must not contain URI user information"
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($uri.Fragment)) {
+        return [PSCustomObject]@{
+            Valid = $false
+            Reason = "Webhook endpoint must not contain a fragment"
+        }
+    }
+    return [PSCustomObject]@{ Valid = $true; Reason = ""; Uri = $uri }
+}
+
+function Resolve-WebhookSecretReference {
+    param(
+        [AllowNull()][string]$Reference = $WebhookSecretReference
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Reference)) {
+        return [PSCustomObject]@{
+            Success = $true
+            Url = ""
+            Source = "None"
+            Error = ""
+        }
+    }
+
+    $endpoint = ""
+    $source = ""
+    try {
+        if ($Reference -match "(?i)^env:(?<VariableName>[A-Z_][A-Z0-9_]*)$") {
+            $variableName = [string]$Matches.VariableName
+            foreach ($target in @(
+                [EnvironmentVariableTarget]::Process,
+                [EnvironmentVariableTarget]::Machine,
+                [EnvironmentVariableTarget]::User
+            )) {
+                $endpoint = [Environment]::GetEnvironmentVariable($variableName, $target)
+                if (-not [string]::IsNullOrWhiteSpace($endpoint)) { break }
+            }
+            if ([string]::IsNullOrWhiteSpace($endpoint)) {
+                throw "Webhook environment reference is not set"
+            }
+            $source = "Environment"
+        } elseif ($Reference -match "(?i)^file:(?<ConfigPath>[A-Z]:[\\/].+)$") {
+            $configPath = [IO.Path]::GetFullPath([string]$Matches.ConfigPath)
+            if ([IO.Path]::GetExtension($configPath) -ne ".json" -or
+                -not (Test-Path -LiteralPath $configPath -PathType Leaf)) {
+                throw "Webhook config reference must name an existing JSON file"
+            }
+            $access = Test-EvidencePathAccess -Path $configPath
+            if (-not $access.Valid) {
+                throw "Webhook config ACL is not trusted: $($access.Reason)"
+            }
+            $config = ConvertTo-Hashtable -InputObject (
+                [IO.File]::ReadAllText($configPath) | ConvertFrom-Json -ErrorAction Stop
+            )
+            if ($config -isnot [System.Collections.IDictionary] -or
+                [int]$config.schema_version -ne 1 -or
+                -not $config.Contains("webhook_url")) {
+                throw "Webhook config must use schema_version 1 and webhook_url"
+            }
+            $endpoint = [string]$config.webhook_url
+            $source = "ProtectedFile"
+        } else {
+            throw "Webhook secret reference format is invalid"
+        }
+
+        $validation = Test-HttpsWebhookEndpoint -Endpoint $endpoint
+        if (-not $validation.Valid) { throw $validation.Reason }
+        Add-SensitiveEvidenceValue -Value $endpoint
+        return [PSCustomObject]@{
+            Success = $true
+            Url = $endpoint
+            Source = $source
+            Error = ""
+        }
+    } catch {
+        return [PSCustomObject]@{
+            Success = $false
+            Url = ""
+            Source = $source
+            Error = Protect-EvidenceText -Text $_.Exception.Message
+        }
+    }
 }
 
 # ============================================================================
@@ -1395,7 +1549,7 @@ function Get-EffectiveRunParameter {
         DryRun             = $DryRun.IsPresent
         BackupDrivers      = $BackupDrivers.IsPresent
         ShowHistory        = $false
-        WebhookUrl         = [string]$WebhookUrl
+        WebhookSecretReference = [string]$WebhookSecretReference
         HistoryCount       = [int]$HistoryCount
         MaxRetries         = [int]$MaxRetries
         MaxUpdatePasses    = [int]$MaxUpdatePasses
@@ -1414,7 +1568,7 @@ function Get-ContinuationParameterName {
     return @(
         "SkipOEM", "SkipWindows", "SkipWinget", "IncludeBIOS", "BypassWSUS",
         "RepairWindowsUpdate", "CleanupAfter", "ResetComponentBase", "ContinueAfterReboot", "DryRun",
-        "BackupDrivers", "ShowHistory", "WebhookUrl", "HistoryCount", "MaxRetries",
+        "BackupDrivers", "ShowHistory", "WebhookSecretReference", "HistoryCount", "MaxRetries",
         "MaxUpdatePasses", "MinDiskSpaceGB", "MinFirmwareChargePercent", "LogPath",
         "LogRetentionDays", "EvidenceMaxSizeMB", "RedactionMode", "Reboot", "Force"
     )
@@ -1428,6 +1582,7 @@ function Convert-ContinuationStateSchema {
     $migrated = ConvertTo-Hashtable -InputObject $State
     if ($migrated -isnot [System.Collections.IDictionary]) { return $migrated }
     $schemaVersion = [int]$migrated.SchemaVersion
+    $migrationSourceSchema = $schemaVersion
     if ($schemaVersion -eq 3) {
         if ($migrated.Parameters -is [System.Collections.IDictionary]) {
             if (-not $migrated.Parameters.Contains("EvidenceMaxSizeMB")) {
@@ -1438,7 +1593,24 @@ function Convert-ContinuationStateSchema {
             }
         }
         $migrated["SchemaVersion"] = 4
-        $migrated["_MigrationSourceSchema"] = 3
+        $schemaVersion = 4
+    }
+    if ($schemaVersion -eq 4) {
+        $legacyWebhookUrl = ""
+        if ($migrated.Parameters -is [System.Collections.IDictionary]) {
+            if ($migrated.Parameters.Contains("WebhookUrl")) {
+                $legacyWebhookUrl = [string]$migrated.Parameters.WebhookUrl
+                [void]$migrated.Parameters.Remove("WebhookUrl")
+            }
+            if (-not $migrated.Parameters.Contains("WebhookSecretReference")) {
+                $migrated.Parameters["WebhookSecretReference"] = ""
+            }
+        }
+        if (-not $migrated.Contains("ResolvedWebhookUrl")) {
+            $migrated["ResolvedWebhookUrl"] = $legacyWebhookUrl
+        }
+        $migrated["SchemaVersion"] = 5
+        $migrated["_MigrationSourceSchema"] = $migrationSourceSchema
     }
     return $migrated
 }
@@ -1489,6 +1661,15 @@ function Test-ContinuationState {
     foreach ($parameterName in Get-ContinuationParameterName) {
         if (-not $State.Parameters.Contains($parameterName)) {
             return & $failure "Continuation parameter '$parameterName' is missing"
+        }
+    }
+    if (-not $State.Contains("ResolvedWebhookUrl")) {
+        return & $failure "Resolved webhook continuation value is missing"
+    }
+    if (-not [string]::IsNullOrWhiteSpace([string]$State.ResolvedWebhookUrl)) {
+        $webhookValidation = Test-HttpsWebhookEndpoint -Endpoint ([string]$State.ResolvedWebhookUrl)
+        if (-not $webhookValidation.Valid) {
+            return & $failure "Resolved webhook continuation value is invalid"
         }
     }
 
@@ -1585,6 +1766,7 @@ function New-ContinuationState {
         CreatedAt      = $script:RunStartedAt.ToString("o")
         LastUpdatedAt  = (Get-Date).ToString("o")
         ScriptPath     = $ScriptPath
+        ResolvedWebhookUrl = [string]$WebhookUrl
         Parameters     = Get-EffectiveRunParameter
         StageResults   = @($script:StageResults)
         AcquisitionProvenance = @($script:AcquisitionProvenance)
@@ -1624,7 +1806,10 @@ function Import-ContinuationState {
     foreach ($name in $integerNames) {
         Set-Variable -Name $name -Scope Script -Value ([int]$State.Parameters[$name])
     }
-    Set-Variable -Name "WebhookUrl" -Scope Script -Value ([string]$State.Parameters.WebhookUrl)
+    Set-Variable -Name "WebhookSecretReference" -Scope Script `
+        -Value ([string]$State.Parameters.WebhookSecretReference)
+    Set-Variable -Name "WebhookUrl" -Scope Script -Value ([string]$State.ResolvedWebhookUrl)
+    Add-SensitiveEvidenceValue -Value ([string]$State.ResolvedWebhookUrl)
     Set-Variable -Name "LogPath" -Scope Script -Value ([string]$State.Parameters.LogPath)
     Set-Variable -Name "RedactionMode" -Scope Script -Value ([string]$State.Parameters.RedactionMode)
 
@@ -8202,6 +8387,12 @@ function Send-WebhookNotification {
     )
 
     if (-not $Url) { return $false }
+    $endpointValidation = Test-HttpsWebhookEndpoint -Endpoint $Url
+    if (-not $endpointValidation.Valid) {
+        Write-Log "Webhook notification rejected: $($endpointValidation.Reason)" "WARNING"
+        return $false
+    }
+    Add-SensitiveEvidenceValue -Value $Url
 
     Write-Log "Sending webhook notification..." "DEBUG"
 
@@ -9495,6 +9686,15 @@ if ($ShowHistory) {
     Show-UpdateHistory -Count $HistoryCount
     exit 0
 }
+
+$webhookResolution = Resolve-WebhookSecretReference -Reference $WebhookSecretReference
+if (-not $webhookResolution.Success) {
+    [Console]::Error.WriteLine(
+        "[X] Webhook configuration is invalid: $($webhookResolution.Error)"
+    )
+    exit 3
+}
+$script:WebhookUrl = [string]$webhookResolution.Url
 
 $scriptStart = $script:RunStartedAt
 $sysInfo = @{

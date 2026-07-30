@@ -35,6 +35,8 @@ BeforeAll {
         "Read-ProtectedJsonFile",
         "Protect-EvidenceFile",
         "Protect-EvidenceTree",
+        "Test-HttpsWebhookEndpoint",
+        "Resolve-WebhookSecretReference",
         "Test-LockDocument",
         "Get-AcquisitionManifest",
         "Get-AcquisitionManifestEntry",
@@ -190,6 +192,7 @@ BeforeAll {
     function Initialize-SystemUpdateProTestState {
         $script:DryRun = [switch]$false
         $script:WebhookUrl = ""
+        $script:WebhookSecretReference = ""
         $script:ResultSchemaVersion = 1
         $script:CapabilitySchemaVersion = 1
         $script:CapabilityAssessment = $null
@@ -206,7 +209,7 @@ BeforeAll {
         $script:OEMUpdates = [System.Collections.ArrayList]::new()
         $script:WindowsUpdates = [System.Collections.ArrayList]::new()
         $script:WingetUpdates = [System.Collections.ArrayList]::new()
-        $script:StateSchemaVersion = 4
+        $script:StateSchemaVersion = 5
         $script:MaxContinuationAttempts = 3
         $script:RunStartedAt = Get-Date
         $stateTestDirectory = Join-Path $TestDrive ([guid]::NewGuid().ToString("N"))
@@ -732,9 +735,13 @@ Installer SHA256: $($spec.Sha256)
         $capabilitySystem = New-CapabilitySystemInfo -Manufacturer "HP Inc."
         $script:CapabilityAssessment = Get-CapabilityAssessment -SystemInfo $capabilitySystem `
             -VersionInventory (New-CapabilityVersionInventory -HPStatus "Ready")
+        $script:WebhookUrl = "https://example.test/workflow?sig=REPORT-SECRET"
+        [void]$script:Errors.Add(
+            "Webhook https://example.test/workflow?sig=REPORT-SECRET failed"
+        )
         $run = New-RunData -StartedAt (Get-Date).AddSeconds(-1)
         $system = @{
-            Manufacturer = "HP"; Model = "EliteBook"; SerialNumber = "123"
+            Manufacturer = "HP"; Model = "EliteBook"; SerialNumber = "REPORT-SERIAL-123"
             OSName = "Windows"; OSBuild = "1"; BIOSVersion = "1"; BIOSDate = Get-Date
             Processor = "CPU"; TotalRAM = 16; InstallationType = "Client"
             Architecture = "x64"; ExecutionContext = "AdministratorUser"
@@ -750,6 +757,8 @@ Installer SHA256: $($spec.Sha256)
         $report | Should -Match "Platform capability"
         $report | Should -Match "Provider capability"
         $report | Should -Match "AdministratorUser"
+        $report | Should -Not -Match "REPORT-SECRET|REPORT-SERIAL-123"
+        $report | Should -Match "REDACTED"
     }
 }
 
@@ -817,22 +826,27 @@ Describe "Protected local evidence store" {
             Should -Be 1
     }
 
-    It "migrates a v3 continuation state to v4 with evidence policy defaults" {
+    It "migrates a v3 continuation state through v5 with evidence and secret-source defaults" {
         $legacy = New-ContinuationState -StageCursor "WindowsUpdate" `
             -ScriptPath $script:SourceScriptPath
         $legacy.SchemaVersion = 3
         [void]$legacy.Parameters.Remove("EvidenceMaxSizeMB")
         [void]$legacy.Parameters.Remove("RedactionMode")
+        [void]$legacy.Parameters.Remove("WebhookSecretReference")
+        $legacy.Parameters["WebhookUrl"] = "https://example.invalid/legacy-secret"
+        [void]$legacy.Remove("ResolvedWebhookUrl")
         Write-ProtectedAtomicJson -Path $script:StateFile -Data $legacy | Should -BeTrue
 
         $loaded = Get-State
 
-        $loaded.SchemaVersion | Should -Be 4
+        $loaded.SchemaVersion | Should -Be 5
         $loaded.Parameters.EvidenceMaxSizeMB | Should -Be 512
         $loaded.Parameters.RedactionMode | Should -Be "SecretsAndSerials"
+        $loaded.Parameters.WebhookSecretReference | Should -Be ""
+        $loaded.ResolvedWebhookUrl | Should -Be "https://example.invalid/legacy-secret"
         $loaded.Contains("_MigrationSourceSchema") | Should -BeFalse
         ((Get-Content -LiteralPath $script:StateFile -Raw | ConvertFrom-Json).SchemaVersion) |
-            Should -Be 4
+            Should -Be 5
     }
 
     It "migrates and redacts legacy history without leaving sensitive backup data" {
@@ -1128,6 +1142,7 @@ Describe "Redacted diagnostic and recovery bundle" {
 
     It "persists the complete redacted run policy for later failed-run collection" {
         $script:WebhookUrl = "https://example.test/workflow?sig=DO-NOT-PERSIST"
+        $script:WebhookSecretReference = "env:SYSTEMUPDATEPRO_WEBHOOK_URL"
         $script:EvidenceMaxSizeMB = 768
         $runData = New-RunData -StartedAt (Get-Date).AddSeconds(-1)
 
@@ -1139,9 +1154,147 @@ Describe "Redacted diagnostic and recovery bundle" {
             $policy.Contains($parameterName) | Should -BeTrue
         }
         $policy.EvidenceMaxSizeMB | Should -Be 768
-        $policy.WebhookUrl | Should -Be "[REDACTED]"
+        $policy.WebhookSecretReference | Should -Be "env:SYSTEMUPDATEPRO_WEBHOOK_URL"
+        $policy.Contains("WebhookUrl") | Should -BeFalse
         (Get-Content -LiteralPath $script:HistoryFile -Raw) |
             Should -Not -Match "DO-NOT-PERSIST"
+    }
+}
+
+Describe "Input validation and webhook secret references" {
+    BeforeEach {
+        Initialize-SystemUpdateProTestState
+    }
+
+    It "resolves an HTTPS endpoint from an environment reference and registers it for redaction" {
+        $variableName = "SYSTEMUPDATEPRO_TEST_WEBHOOK_$([guid]::NewGuid().ToString('N'))"
+        $endpoint = "https://example.test/workflow?sig=ENVIRONMENT-SECRET"
+        try {
+            [Environment]::SetEnvironmentVariable(
+                $variableName,
+                $endpoint,
+                [EnvironmentVariableTarget]::Process
+            )
+
+            $resolved = Resolve-WebhookSecretReference -Reference "env:$variableName"
+
+            $resolved.Success | Should -BeTrue
+            $resolved.Source | Should -Be "Environment"
+            $resolved.Url | Should -Be $endpoint
+            Protect-EvidenceText -Text "Delivery failed for $endpoint" |
+                Should -Not -Match "ENVIRONMENT-SECRET"
+        } finally {
+            [Environment]::SetEnvironmentVariable(
+                $variableName,
+                $null,
+                [EnvironmentVariableTarget]::Process
+            )
+        }
+    }
+
+    It "accepts only a protected schema-versioned config containing an HTTPS endpoint" {
+        $configPath = Join-Path $script:DataPath "webhook.json"
+        $endpoint = "https://example.test/hook?token=FILE-SECRET"
+        Write-ProtectedAtomicJson -Path $configPath -Data ([ordered]@{
+            schema_version = 1
+            webhook_url = $endpoint
+        }) | Should -BeTrue
+
+        $resolved = Resolve-WebhookSecretReference -Reference "file:$configPath"
+
+        $resolved.Success | Should -BeTrue
+        $resolved.Source | Should -Be "ProtectedFile"
+        $resolved.Url | Should -Be $endpoint
+
+        $unsafeConfig = Join-Path $script:DataPath "unsafe-webhook.json"
+        [IO.File]::WriteAllText(
+            $unsafeConfig,
+            '{"schema_version":1,"webhook_url":"https://example.test/hook"}'
+        )
+        $acl = Get-Acl -LiteralPath $unsafeConfig
+        $acl.SetAccessRuleProtection($false, $true)
+        Set-Acl -LiteralPath $unsafeConfig -AclObject $acl
+
+        $unsafe = Resolve-WebhookSecretReference -Reference "file:$unsafeConfig"
+
+        $unsafe.Success | Should -BeFalse
+        $unsafe.Error | Should -Match "ACL"
+    }
+
+    It "rejects insecure endpoints without echoing their secret value" {
+        $variableName = "SYSTEMUPDATEPRO_TEST_WEBHOOK_$([guid]::NewGuid().ToString('N'))"
+        $endpoint = "http://example.test/hook?sig=INSECURE-SECRET"
+        try {
+            [Environment]::SetEnvironmentVariable(
+                $variableName,
+                $endpoint,
+                [EnvironmentVariableTarget]::Process
+            )
+
+            $resolved = Resolve-WebhookSecretReference -Reference "env:$variableName"
+
+            $resolved.Success | Should -BeFalse
+            $resolved.Error | Should -Match "HTTPS"
+            $resolved.Error | Should -Not -Match "INSECURE-SECRET"
+        } finally {
+            [Environment]::SetEnvironmentVariable(
+                $variableName,
+                $null,
+                [EnvironmentVariableTarget]::Process
+            )
+        }
+    }
+
+    It "rejects invalid ranges, paths, and raw webhook arguments before initialization" {
+        $hostExecutable = if ($PSVersionTable.PSEdition -eq "Core") {
+            Join-Path $PSHOME "pwsh.exe"
+        } else {
+            Join-Path $PSHOME "powershell.exe"
+        }
+        $invalidArguments = @(
+            @("-MaxRetries", "0"),
+            @("-LogPath", "relative\logs"),
+            @("-WebhookSecretReference", "bad-reference"),
+            @("-WebhookUrl", "https://example.invalid/hook")
+        )
+        foreach ($arguments in $invalidArguments) {
+            $result = Invoke-CapturedCommand -FilePath $hostExecutable `
+                -ArgumentList (@(
+                    "-NoLogo", "-NoProfile", "-NonInteractive",
+                    "-File", $script:SourceScriptPath
+                ) + $arguments) -TimeoutSeconds 20
+
+            $result.Success | Should -BeFalse
+            $result.ExitCode | Should -Not -Be 0
+            "$($result.StandardOutput)`n$($result.StandardError)" |
+                Should -Not -Match "requires administrator privileges"
+        }
+    }
+
+    It "keeps history as a read-only early command when its ACL permits access" {
+        $history = [ordered]@{
+            schema_version = 2
+            last_updated_at = (Get-Date).ToUniversalTime().ToString("o")
+            entries = @()
+        }
+        Write-ProtectedAtomicJson -Path $script:HistoryFile -Data $history |
+            Should -BeTrue
+        $hostExecutable = if ($PSVersionTable.PSEdition -eq "Core") {
+            Join-Path $PSHOME "pwsh.exe"
+        } else {
+            Join-Path $PSHOME "powershell.exe"
+        }
+
+        $result = Invoke-CapturedCommand -FilePath $hostExecutable -ArgumentList @(
+            "-NoLogo", "-NoProfile", "-NonInteractive",
+            "-File", $script:SourceScriptPath,
+            "-ShowHistory"
+        ) -TimeoutSeconds 20
+
+        $result.Success | Should -BeTrue
+        $result.ExitCode | Should -Be 0
+        "$($result.StandardOutput)`n$($result.StandardError)" |
+            Should -Not -Match "requires administrator privileges"
     }
 }
 
@@ -1158,6 +1311,7 @@ Describe "PowerShell 5.1 continuation state machine" {
     It "atomically round-trips a complete versioned state file" {
         $script:SkipOEM = [switch]$true
         $script:IncludeBIOS = [switch]$true
+        $script:WebhookSecretReference = "file:C:\ProgramData\SystemUpdatePro\webhook.json"
         $script:WebhookUrl = "https://example.invalid/private-hook"
         [void]$script:StageResults.Add((New-StageResult -Name "OEM" -Status "Succeeded" -Attempted 1 -Installed 1))
         [void](Add-AcquisitionProvenance -Name "LSUClient" -Version "1.8.1" `
@@ -1172,7 +1326,7 @@ Describe "PowerShell 5.1 continuation state machine" {
         if (-not $secondSave) { throw "Second atomic save failed: $script:LastStateError" }
         $loaded = Get-State
 
-        $loaded.SchemaVersion | Should -Be 4
+        $loaded.SchemaVersion | Should -Be 5
         $loaded.Phase | Should -Be "AwaitingReboot"
         $loaded.RunId | Should -Be "11111111-1111-1111-1111-111111111111"
         $loaded.Parameters.Count | Should -Be 24
@@ -1180,7 +1334,9 @@ Describe "PowerShell 5.1 continuation state machine" {
         $loaded.AcquisitionProvenance[0].Name | Should -Be "LSUClient"
         $loaded.Parameters.SkipOEM | Should -BeTrue
         $loaded.Parameters.IncludeBIOS | Should -BeTrue
-        $loaded.Parameters.WebhookUrl | Should -Be "https://example.invalid/private-hook"
+        $loaded.Parameters.WebhookSecretReference |
+            Should -Be "file:C:\ProgramData\SystemUpdatePro\webhook.json"
+        $loaded.ResolvedWebhookUrl | Should -Be "https://example.invalid/private-hook"
         $loaded.Parameters.MinFirmwareChargePercent | Should -Be 50
         $loaded.StageResults.Count | Should -Be 1
         (Test-ContinuationStateAccess -Path $script:StateFile).Valid | Should -BeTrue
@@ -1200,6 +1356,7 @@ Describe "PowerShell 5.1 continuation state machine" {
         $script:ResetComponentBase = [switch]$true
         $script:BackupDrivers = [switch]$true
         $script:Force = [switch]$true
+        $script:WebhookSecretReference = "env:SYSTEMUPDATEPRO_WEBHOOK_URL"
         $script:WebhookUrl = "https://example.invalid/hook"
         $script:HistoryCount = 25
         $script:MaxRetries = 5
@@ -1232,6 +1389,7 @@ Describe "PowerShell 5.1 continuation state machine" {
         $script:ResetComponentBase.IsPresent | Should -BeTrue
         $script:BackupDrivers.IsPresent | Should -BeTrue
         $script:Force.IsPresent | Should -BeTrue
+        $script:WebhookSecretReference | Should -Be "env:SYSTEMUPDATEPRO_WEBHOOK_URL"
         $script:WebhookUrl | Should -Be "https://example.invalid/hook"
         $script:HistoryCount | Should -Be 25
         $script:MaxRetries | Should -Be 5
@@ -1313,13 +1471,16 @@ Describe "PowerShell 5.1 continuation state machine" {
         Mock New-ScheduledTaskPrincipal { $script:TaskPrincipalStub }
         Mock New-ScheduledTaskSettingsSet { $script:TaskSettingsStub }
         Mock Register-ScheduledTask { $script:TaskPresent = $true; "task" }
+        $script:WebhookSecretReference = "env:SYSTEMUPDATEPRO_WEBHOOK_URL"
         $script:WebhookUrl = "https://example.invalid/private-hook"
 
         Register-ContinuationTask | Should -BeTrue
         $loaded = Get-State
 
         $loaded.Phase | Should -Be "AwaitingReboot"
-        $loaded.Parameters.WebhookUrl | Should -Be "https://example.invalid/private-hook"
+        $loaded.Parameters.WebhookSecretReference |
+            Should -Be "env:SYSTEMUPDATEPRO_WEBHOOK_URL"
+        $loaded.ResolvedWebhookUrl | Should -Be "https://example.invalid/private-hook"
         $script:ContinuationRegistered | Should -BeTrue
         (Get-MutationJournal).Status | Should -Be "Open"
         Should -Invoke New-ScheduledTaskAction -Times 1 -Exactly -ParameterFilter {

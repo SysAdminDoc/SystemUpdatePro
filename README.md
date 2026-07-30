@@ -44,6 +44,7 @@ SystemUpdatePro is a fully automated, self-healing PowerShell script that handle
 - **Privileged Mutation Recovery**: Atomically journals exact registry, service, cache, and scheduled-task before-images; startup rolls back interrupted runs before allowing new changes
 - **Protected Evidence Store**: Uses write-through atomic replacement, last-known-good recovery, corrupt-file quarantine, verified SYSTEM/Administrators ACLs, and configurable secret/serial redaction
 - **Diagnostic Bundle**: Produces one bounded, hash-manifested, fully redacted archive of the latest run, provider output, Windows servicing evidence, and recovery status
+- **Validated Inputs and Secret References**: Rejects unsafe ranges, paths, and endpoints before initialization; webhook secrets resolve from environment or protected-file references instead of process arguments
 
 ### Enterprise Integration
 - **Event Log**: Writes to Windows Application log for RMM/SIEM visibility
@@ -137,15 +138,23 @@ cd SystemUpdatePro
 
 ### Webhook Notifications
 ```powershell
-# Notify Slack on completion
-.\SystemUpdatePro.ps1 -WebhookUrl "https://hooks.slack.com/services/T00/B00/xxx"
+# Have the RMM inject its protected secret into this process environment variable
+.\SystemUpdatePro.ps1 -WebhookSecretReference "env:SYSTEMUPDATEPRO_WEBHOOK_URL"
 
-# Notify Microsoft Teams
-.\SystemUpdatePro.ps1 -WebhookUrl "https://outlook.office.com/webhook/..."
-
-# Generic webhook (any JSON-accepting endpoint)
-.\SystemUpdatePro.ps1 -WebhookUrl "https://your-api.example.com/webhook"
+# Or resolve an endpoint from a protected schema-versioned config
+.\SystemUpdatePro.ps1 -WebhookSecretReference "file:C:\ProgramData\SystemUpdatePro\webhook.json"
 ```
+
+Raw webhook URLs are intentionally not accepted as parameters because command-line arguments are visible to process inventory and RMM tooling. Environment values may come from an RMM secret variable. A file reference must point to a SYSTEM/Administrators-only JSON file:
+
+```json
+{
+  "schema_version": 1,
+  "webhook_url": "https://your-provider.example/webhook-secret"
+}
+```
+
+Provision that file through the same privileged configuration-management channel used to deploy the script. The endpoint must be absolute HTTPS, must not contain URI user information or a fragment, and is registered for redaction before logging or transcript startup.
 
 ### Update History
 ```powershell
@@ -184,8 +193,8 @@ The standalone command requires administrator privileges, prints the completed a
 # Custom configuration
 .\SystemUpdatePro.ps1 -MaxRetries 5 -MaxUpdatePasses 5 -MinDiskSpaceGB 20 -LogRetentionDays 60 -EvidenceMaxSizeMB 1024
 
-# Kitchen sink: backup drivers, dry run with webhook
-.\SystemUpdatePro.ps1 -DryRun -BackupDrivers -WebhookUrl "https://hooks.slack.com/services/..."
+# Kitchen sink: backup drivers, dry run with an RMM-provided webhook secret
+.\SystemUpdatePro.ps1 -DryRun -BackupDrivers -WebhookSecretReference "env:SYSTEMUPDATEPRO_WEBHOOK_URL"
 ```
 
 ---
@@ -206,14 +215,14 @@ The standalone command requires administrator privileges, prints the completed a
 | `-DryRun` | Switch | False | Preview updates without installing |
 | `-BackupDrivers` | Switch | False | Export current drivers before updating |
 | `-ShowHistory` | Switch | False | Display previous update run history |
-| `-WebhookUrl` | String | (none) | Webhook URL for completion notification |
-| `-HistoryCount` | Int | 10 | Number of history entries to show |
-| `-MaxRetries` | Int | 3 | Maximum retry attempts for failed operations |
-| `-MaxUpdatePasses` | Int | 3 | Maximum Windows Update passes |
-| `-MinDiskSpaceGB` | Int | 10 | Minimum free disk space required (GB) |
+| `-WebhookSecretReference` | String | (none) | `env:VARIABLE_NAME` or `file:C:\path\config.json`; the resolved value must be HTTPS |
+| `-HistoryCount` | Int | 10 | Number of history entries to show (1-100) |
+| `-MaxRetries` | Int | 3 | Maximum retry attempts for failed operations (1-10) |
+| `-MaxUpdatePasses` | Int | 3 | Maximum Windows Update passes (1-10) |
+| `-MinDiskSpaceGB` | Int | 10 | Minimum free disk space required (1-1024 GB) |
 | `-MinFirmwareChargePercent` | Int | 50 | Minimum battery charge for firmware (10-100) |
-| `-LogPath` | String | C:\ProgramData\SystemUpdatePro\Logs | Log directory |
-| `-LogRetentionDays` | Int | 30 | Days to retain owned evidence artifacts |
+| `-LogPath` | String | C:\ProgramData\SystemUpdatePro\Logs | Dedicated absolute local log directory |
+| `-LogRetentionDays` | Int | 30 | Days to retain owned evidence artifacts (1-3650) |
 | `-EvidenceMaxSizeMB` | Int | 512 | Maximum combined size of retained evidence (10-10240 MB) |
 | `-RedactionMode` | Enum | SecretsAndSerials | `Secrets` or `SecretsAndSerials` for persisted evidence |
 | `-CreateDiagnosticBundle` | Switch | False | Create a diagnostic/recovery ZIP from the latest local evidence, then exit |
@@ -279,9 +288,10 @@ Get-EventLog -LogName Application -Source "SystemUpdatePro" -Newest 10
 | `C:\ProgramData\SystemUpdatePro\update_history.json` | Update history log (last 100 runs) |
 | `C:\ProgramData\SystemUpdatePro\DriverBackups\` | Driver backup snapshots (last 3 kept) |
 | `C:\ProgramData\SystemUpdatePro\Bundles\` | Protected diagnostic/recovery ZIP archives |
+| `C:\ProgramData\SystemUpdatePro\webhook.json` | Optional operator-provisioned webhook config (SYSTEM/Administrators ACL required) |
 | `C:\ProgramData\SystemUpdatePro\HPIA\` | HP Image Assistant installation |
 
-Continuation state is atomically replaced and restricted to SYSTEM and Administrators. It preserves the run ID, effective parameters, result history, attempt count, and next stage cursor; task command lines contain only the script path. Schema v3 state migrates to v4 with explicit evidence-policy defaults. Invalid, incompatible, or broadly writable state is quarantined instead of being executed. A continuation can resume at most three times, and terminal success or failure removes its one-shot task and active state.
+Continuation state is atomically replaced and restricted to SYSTEM and Administrators. It preserves the run ID, effective parameters, result history, attempt count, next stage cursor, webhook reference, and resolved endpoint needed after reboot; task command lines contain only the script path. Schema v3/v4 state migrates to v5 with explicit evidence-policy and secret-source defaults. Invalid, incompatible, or broadly writable state is quarantined instead of being executed. A continuation can resume at most three times, and terminal success or failure removes its one-shot task and active state.
 
 Privileged mutations use a separate atomic journal with the same protected access model. WSUS policy, service status/startup mode, cleanmgr flags, update-cache directory swaps, and continuation-task replacement are verified and restored in reverse order. An interrupted journal is recovered before a new run can mutate the machine; recovery failure stops the run.
 
@@ -324,7 +334,7 @@ Reports are saved to the log directory and automatically open in your browser (u
 
 ## Webhook Payload
 
-When using `-WebhookUrl`, the following JSON payload is sent:
+When using `-WebhookSecretReference`, the resolved endpoint receives the following JSON payload:
 
 ```json
 {

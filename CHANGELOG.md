@@ -4,6 +4,7 @@ All notable changes to SystemUpdatePro will be documented in this file.
 
 ## [Unreleased]
 
+- Replaced raw webhook command-line input with validated environment/protected-file secret references, added pre-initialization range/path/HTTPS validation, advanced continuation state to schema v5 with v3/v4 migration, retained read-only history as an unelevated early command, and extended redaction across console, transcript, exceptions, reports, history, and diagnostic bundles.
 - Added a standalone, bounded diagnostic/recovery bundle with a schema-versioned SHA-256 manifest, latest run and policy data, runtime/provider capability inventory, redacted transcript and OEM output, Windows Update/USO/CBS/DISM evidence, mutation-journal status, explicit collector errors, atomic protected publication, and deterministic PowerShell 5.1/7 ZIP paths.
 - Added a protected local evidence store with write-through atomic replacement, last-known-good recovery, corrupt-file quarantine, forward state/history migration, verified SYSTEM/Administrators ACLs, recursive secret/serial redaction, and exact age/size retention across logs, reports, OEM output, journals, quarantine files, and driver backups.
 - Added a machine-readable platform/provider capability matrix with tested Windows client/Server/Core, x86/x64/ARM64, PowerShell 5.1/7, administrator/SYSTEM, manufacturer, and installed-version gates; unsupported stages now skip explicitly and capability evidence persists across continuation, reports, history, and webhooks.
