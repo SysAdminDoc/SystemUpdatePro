@@ -43,6 +43,7 @@ SystemUpdatePro is a fully automated, self-healing PowerShell script that handle
 - **Capability Matrix**: Gates each provider by Windows build/edition, Server/Core, architecture, PowerShell runtime, execution context, and verified provider version
 - **Privileged Mutation Recovery**: Atomically journals exact registry, service, cache, and scheduled-task before-images; startup rolls back interrupted runs before allowing new changes
 - **Protected Evidence Store**: Uses write-through atomic replacement, last-known-good recovery, corrupt-file quarantine, verified SYSTEM/Administrators ACLs, and configurable secret/serial redaction
+- **Diagnostic Bundle**: Produces one bounded, hash-manifested, fully redacted archive of the latest run, provider output, Windows servicing evidence, and recovery status
 
 ### Enterprise Integration
 - **Event Log**: Writes to Windows Application log for RMM/SIEM visibility
@@ -155,6 +156,17 @@ cd SystemUpdatePro
 .\SystemUpdatePro.ps1 -ShowHistory -HistoryCount 25
 ```
 
+### Diagnostic and Recovery Bundle
+```powershell
+# After a failed or completed run, collect support evidence without running updates
+.\SystemUpdatePro.ps1 -CreateDiagnosticBundle
+
+# Apply a smaller hard ceiling to the generated ZIP
+.\SystemUpdatePro.ps1 -CreateDiagnosticBundle -DiagnosticBundleMaxSizeMB 25
+```
+
+The standalone command requires administrator privileges, prints the completed archive path, and exits without acquiring the update lock or running any update stage.
+
 ### Advanced Usage
 ```powershell
 # Full provisioning workflow with post-reboot continuation
@@ -204,6 +216,8 @@ cd SystemUpdatePro
 | `-LogRetentionDays` | Int | 30 | Days to retain owned evidence artifacts |
 | `-EvidenceMaxSizeMB` | Int | 512 | Maximum combined size of retained evidence (10-10240 MB) |
 | `-RedactionMode` | Enum | SecretsAndSerials | `Secrets` or `SecretsAndSerials` for persisted evidence |
+| `-CreateDiagnosticBundle` | Switch | False | Create a diagnostic/recovery ZIP from the latest local evidence, then exit |
+| `-DiagnosticBundleMaxSizeMB` | Int | 50 | Hard archive-size ceiling (5-512 MB) |
 | `-Reboot` | Switch | False | Allow automatic reboot if required |
 | `-Force` | Switch | False | Continue non-firmware work despite low disk or pending reboot; never overrides unknown/blocked firmware safety |
 
@@ -264,6 +278,7 @@ Get-EventLog -LogName Application -Source "SystemUpdatePro" -Newest 10
 | `C:\ProgramData\SystemUpdatePro\Journals\` | Protected, run-scoped privileged-mutation recovery journals |
 | `C:\ProgramData\SystemUpdatePro\update_history.json` | Update history log (last 100 runs) |
 | `C:\ProgramData\SystemUpdatePro\DriverBackups\` | Driver backup snapshots (last 3 kept) |
+| `C:\ProgramData\SystemUpdatePro\Bundles\` | Protected diagnostic/recovery ZIP archives |
 | `C:\ProgramData\SystemUpdatePro\HPIA\` | HP Image Assistant installation |
 
 Continuation state is atomically replaced and restricted to SYSTEM and Administrators. It preserves the run ID, effective parameters, result history, attempt count, and next stage cursor; task command lines contain only the script path. Schema v3 state migrates to v4 with explicit evidence-policy defaults. Invalid, incompatible, or broadly writable state is quarantined instead of being executed. A continuation can resume at most three times, and terminal success or failure removes its one-shot task and active state.
@@ -272,7 +287,22 @@ Privileged mutations use a separate atomic journal with the same protected acces
 
 All script-owned local evidence uses write-through temporary files and atomic replacement where the format permits it. Structured files are parsed and schema-validated before promotion; a protected `.previous` copy is restored when the primary is corrupt, and invalid inputs are moved to timestamped quarantine files. Legacy history arrays migrate to the v2 history envelope. Operator-facing evidence always redacts secret-bearing URL/query/header values, and device serials are also redacted by default; use `-RedactionMode Secrets` only when serial retention is operationally required. Active continuation state retains the original webhook endpoint under its private ACL so delivery can resume, then terminal cleanup removes it.
 
-Retention runs at startup and after driver export. It removes only recognized SystemUpdatePro artifacts older than `-LogRetentionDays`, then removes the oldest remaining artifacts until their combined size is at most `-EvidenceMaxSizeMB`; active run files and live state/history recovery copies are excluded. Driver backups remain additionally capped at three. Reports and machine-readable results record exact file/directory counts, bytes freed, remaining bytes, and cleanup errors.
+Retention runs at startup and after driver export. It removes only recognized SystemUpdatePro artifacts older than `-LogRetentionDays`, including diagnostic bundles, then removes the oldest remaining artifacts until their combined size is at most `-EvidenceMaxSizeMB`; active run files and live state/history recovery copies are excluded. Driver backups remain additionally capped at three. Reports and machine-readable results record exact file/directory counts, bytes freed, remaining bytes, and cleanup errors.
+
+---
+
+## Diagnostic Bundle
+
+`-CreateDiagnosticBundle` is a best-effort recovery command: an unavailable event channel or failed `Get-WindowsUpdateLog` conversion is recorded in `manifest.json` and does not discard the rest of the archive. Each ZIP contains:
+
+- Schema-versioned `manifest.json` with SHA-256, included/original byte counts, truncation flags, omissions, and collector errors
+- Latest validated run result, effective policy, and any active continuation state
+- Current OS/PowerShell/provider versions, capability assessment, and dependency provenance
+- Recent protected run logs, transcripts, HTML report, Dell logs, and HP Image Assistant output
+- Seven days of bounded Windows Update Client, Update Orchestrator, and System events; reconstructed Windows Update output; and bounded CBS, DISM, and reporting-log tails when available
+- Mutation-journal status plus the latest verified recovery actions
+
+Archives are published atomically under the same SYSTEM/Administrators-only ACL as other evidence and never exceed `-DiagnosticBundleMaxSizeMB`. Bundle creation always redacts secrets and serial numbers, even when ordinary local evidence uses `-RedactionMode Secrets`. Source logs are tail-truncated before packaging when necessary, and temporary staging data is removed after success or failure.
 
 ---
 

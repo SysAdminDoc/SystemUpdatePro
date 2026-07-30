@@ -22,6 +22,7 @@
     - Webhook notifications (Slack, Teams, generic)
     - Driver backup before OEM updates
     - Update history tracking with JSON log
+    - Bounded, redacted diagnostic and recovery archives
 
     OEM TOOLS:
     - Dell/Alienware: Dell Command Update CLI
@@ -72,6 +73,10 @@
     Maximum combined size of retained logs, reports, and driver backups (default: 512 MB)
 .PARAMETER RedactionMode
     Redact secrets only, or secrets and device serial numbers (default: SecretsAndSerials)
+.PARAMETER CreateDiagnosticBundle
+    Collect a bounded, redacted diagnostic archive from the latest failed or completed run, then exit
+.PARAMETER DiagnosticBundleMaxSizeMB
+    Maximum diagnostic archive size (default: 50 MB)
 .PARAMETER Reboot
     Allow automatic reboot if required
 .PARAMETER Force
@@ -91,6 +96,9 @@
 .EXAMPLE
     .\SystemUpdatePro.ps1 -ShowHistory -HistoryCount 20
     # Show last 20 update runs
+.EXAMPLE
+    .\SystemUpdatePro.ps1 -CreateDiagnosticBundle
+    # Collect the latest run, provider, Windows Update, and recovery evidence, then exit
 .EXAMPLE
     .\SystemUpdatePro.ps1 -IncludeBIOS -Reboot -ContinueAfterReboot
     # Full update with BIOS, auto-reboot, and post-reboot continuation
@@ -144,6 +152,9 @@ param(
     [int]$EvidenceMaxSizeMB = 512,
     [ValidateSet("Secrets", "SecretsAndSerials")]
     [string]$RedactionMode = "SecretsAndSerials",
+    [switch]$CreateDiagnosticBundle,
+    [ValidateRange(5, 512)]
+    [int]$DiagnosticBundleMaxSizeMB = 50,
     [switch]$Reboot,
     [switch]$Force
 )
@@ -162,6 +173,7 @@ $script:StateSchemaVersion = 4
 $script:CapabilitySchemaVersion = 1
 $script:HistorySchemaVersion = 2
 $script:LockSchemaVersion = 1
+$script:DiagnosticBundleSchemaVersion = 1
 $script:MaxContinuationAttempts = 3
 $script:RunId = [guid]::NewGuid().ToString()
 $script:RunStartedAt = Get-Date
@@ -492,6 +504,11 @@ function Protect-EvidenceText {
         "(?i)(Authorization\s*[:=]\s*(?:Bearer|Basic)\s+)[A-Za-z0-9._~+/=-]+",
         '${1}[REDACTED]'
     )
+    $safeText = [regex]::Replace(
+        $safeText,
+        "(?i)(https?://)[^/\s:@]+:[^@/\s]+@",
+        '${1}[REDACTED]@'
+    )
 
     if (-not [string]::IsNullOrWhiteSpace([string]$WebhookUrl)) {
         $safeText = [regex]::Replace(
@@ -526,7 +543,18 @@ function Protect-EvidenceObject {
     if ($null -eq $InputObject) { return $null }
     $isSecretProperty = $PropertyName -match "(?i)(webhook|authorization|password|secret|token|api.?key|signature)"
     $isSerialProperty = $PropertyName -match "(?i)^serial[_-]?(number)?$"
-    if ($isSecretProperty -or ($isSerialProperty -and $RedactionMode -eq "SecretsAndSerials")) {
+    if ($isSecretProperty) {
+        if ($InputObject -is [string]) {
+            Add-SensitiveEvidenceValue -Value ([string]$InputObject)
+        }
+        return "[REDACTED]"
+    }
+    if ($isSerialProperty) {
+        if ($InputObject -is [string]) {
+            Add-SensitiveEvidenceValue -Value ([string]$InputObject)
+        }
+    }
+    if ($isSerialProperty -and $RedactionMode -eq "SecretsAndSerials") {
         return "[REDACTED]"
     }
     if ($InputObject -is [string]) {
@@ -2278,6 +2306,21 @@ function Get-EvidenceRetentionCandidate {
         }
     }
 
+    $bundleRoot = Join-Path $script:DataPath "Bundles"
+    if (Test-Path -LiteralPath $bundleRoot -PathType Container) {
+        foreach ($file in @(Get-ChildItem -LiteralPath $bundleRoot -File -Force `
+            -Filter "SystemUpdatePro_Diagnostic_*.zip" -ErrorAction SilentlyContinue)) {
+            [void]$candidates.Add([PSCustomObject]@{
+                Path = $file.FullName
+                Kind = "File"
+                LastWriteTime = $file.LastWriteTime
+                Bytes = [long]$file.Length
+                Files = 1
+                Category = "DiagnosticBundle"
+            })
+        }
+    }
+
     foreach ($root in @($script:DataPath, $script:MutationJournalDirectory)) {
         if (-not (Test-Path -LiteralPath $root -PathType Container)) { continue }
         foreach ($file in @(Get-ChildItem -LiteralPath $root -File -Force -ErrorAction SilentlyContinue |
@@ -2536,17 +2579,9 @@ function Save-UpdateHistory {
             capabilities      = $RunData.Capabilities
             retention         = $RunData.Retention
             evidence_delivery = $RunData.EvidenceDelivery
-            parameters        = [ordered]@{
-                SkipOEM           = $SkipOEM.IsPresent
-                SkipWindows       = $SkipWindows.IsPresent
-                SkipWinget        = $SkipWinget.IsPresent
-                IncludeBIOS       = $IncludeBIOS.IsPresent
-                MinFirmwareChargePercent = $MinFirmwareChargePercent
-                BackupDrivers     = $BackupDrivers.IsPresent
-                CleanupAfter      = $CleanupAfter.IsPresent
-                ResetComponentBase = $ResetComponentBase.IsPresent
-                ContinueAfterReboot = $ContinueAfterReboot.IsPresent
-            }
+            parameters        = Protect-EvidenceObject -InputObject (
+                Get-EffectiveRunParameter
+            )
         })
 
         # Prepend new entry, keep last 100 runs
@@ -8358,8 +8393,1102 @@ Duration: $($RunData.DurationSeconds) seconds
 }
 
 # ============================================================================
+# REDACTED DIAGNOSTIC AND RECOVERY BUNDLE
+# ============================================================================
+
+function ConvertTo-ProcessArgument {
+    param(
+        [AllowNull()][string]$Argument
+    )
+
+    if ([string]::IsNullOrEmpty($Argument)) { return '""' }
+    if ($Argument -notmatch '[\s"]') { return $Argument }
+
+    $builder = New-Object Text.StringBuilder
+    $backslash = [char]92
+    [void]$builder.Append('"')
+    $backslashCount = 0
+    foreach ($character in $Argument.ToCharArray()) {
+        if ($character -eq $backslash) {
+            $backslashCount++
+            continue
+        }
+        if ($character -eq '"') {
+            [void]$builder.Append($backslash, (($backslashCount * 2) + 1))
+            [void]$builder.Append('"')
+            $backslashCount = 0
+            continue
+        }
+        if ($backslashCount -gt 0) {
+            [void]$builder.Append($backslash, $backslashCount)
+            $backslashCount = 0
+        }
+        [void]$builder.Append($character)
+    }
+    if ($backslashCount -gt 0) {
+        [void]$builder.Append($backslash, ($backslashCount * 2))
+    }
+    [void]$builder.Append('"')
+    return $builder.ToString()
+}
+
+function Invoke-CapturedCommand {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSUseShouldProcessForStateChangingFunctions", "", Justification = "Runs a caller-supplied diagnostic command without a shell and returns bounded output.")]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$FilePath,
+        [AllowEmptyCollection()][string[]]$ArgumentList = @(),
+        [string]$WorkingDirectory = "",
+        [ValidateRange(1, 900)]
+        [int]$TimeoutSeconds = 120,
+        [ValidateRange(1024, 4194304)]
+        [int]$MaximumOutputCharacters = 262144
+    )
+
+    $startedAt = Get-Date
+    $process = $null
+    $standardOutput = ""
+    $standardError = ""
+    $result = [ordered]@{
+        SchemaVersion = 1
+        Command = [IO.Path]::GetFileName($FilePath)
+        StartedAt = $startedAt.ToUniversalTime().ToString("o")
+        DurationSeconds = 0
+        Success = $false
+        TimedOut = $false
+        ExitCode = -1
+        StandardOutput = ""
+        StandardError = ""
+        Error = ""
+    }
+    try {
+        if (-not (Test-Path -LiteralPath $FilePath -PathType Leaf)) {
+            throw "Diagnostic executable was not found"
+        }
+        $startInfo = New-Object Diagnostics.ProcessStartInfo
+        $startInfo.FileName = $FilePath
+        $startInfo.Arguments = (@($ArgumentList | ForEach-Object {
+            ConvertTo-ProcessArgument -Argument ([string]$_)
+        }) -join " ")
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+        if (-not [string]::IsNullOrWhiteSpace($WorkingDirectory)) {
+            $startInfo.WorkingDirectory = $WorkingDirectory
+        }
+
+        $process = New-Object Diagnostics.Process
+        $process.StartInfo = $startInfo
+        if (-not $process.Start()) { throw "Diagnostic process could not be started" }
+        $outputTask = $process.StandardOutput.ReadToEndAsync()
+        $errorTask = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+            $result["TimedOut"] = $true
+            try { $process.Kill() } catch {
+                $result["Error"] = "Timed-out diagnostic process could not be terminated"
+            }
+            [void]$process.WaitForExit(5000)
+        }
+        if ($process.HasExited) {
+            $standardOutput = [string]$outputTask.Result
+            $standardError = [string]$errorTask.Result
+            $result["ExitCode"] = [int]$process.ExitCode
+        } else {
+            $result["Error"] = "Diagnostic process did not terminate after timeout"
+        }
+        $result["Success"] = (-not $result.TimedOut -and $result.ExitCode -eq 0)
+    } catch {
+        $result["Error"] = Protect-EvidenceText -Text $_.Exception.Message
+    } finally {
+        if ($null -ne $process) { $process.Dispose() }
+        $result["DurationSeconds"] = [math]::Max(
+            0,
+            [int]((Get-Date) - $startedAt).TotalSeconds
+        )
+        foreach ($streamName in @("StandardOutput", "StandardError")) {
+            $streamValue = if ($streamName -eq "StandardOutput") {
+                $standardOutput
+            } else {
+                $standardError
+            }
+            if ($streamValue.Length -gt $MaximumOutputCharacters) {
+                $streamValue = (
+                    "[TRUNCATED TO LAST $MaximumOutputCharacters CHARACTERS]`r`n" +
+                    $streamValue.Substring($streamValue.Length - $MaximumOutputCharacters)
+                )
+            }
+            $result[$streamName] = Protect-EvidenceText -Text $streamValue
+        }
+    }
+    return [PSCustomObject]$result
+}
+
+function Read-BoundedEvidenceText {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+        [ValidateRange(1024, 16777216)]
+        [int]$MaximumBytes = 4194304
+    )
+
+    $stream = $null
+    try {
+        $stream = [IO.FileStream]::new(
+            $Path,
+            [IO.FileMode]::Open,
+            [IO.FileAccess]::Read,
+            [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+        )
+        $originalBytes = [long]$stream.Length
+        $readLength = [int][math]::Min([long]$MaximumBytes, $originalBytes)
+        $offset = [math]::Max(0L, $originalBytes - $readLength)
+        [void]$stream.Seek($offset, [IO.SeekOrigin]::Begin)
+        $buffer = New-Object byte[] $readLength
+        $totalRead = 0
+        while ($totalRead -lt $readLength) {
+            $read = $stream.Read($buffer, $totalRead, $readLength - $totalRead)
+            if ($read -le 0) { break }
+            $totalRead += $read
+        }
+        if ($totalRead -lt $buffer.Length) {
+            $trimmed = New-Object byte[] $totalRead
+            [Array]::Copy($buffer, $trimmed, $totalRead)
+            $buffer = $trimmed
+        }
+
+        $encoding = New-Object Text.UTF8Encoding($false, $false)
+        if ($offset -eq 0 -and $buffer.Length -ge 2 -and
+            $buffer[0] -eq 0xFF -and $buffer[1] -eq 0xFE) {
+            $encoding = [Text.Encoding]::Unicode
+        } elseif ($offset -eq 0 -and $buffer.Length -ge 2 -and
+            $buffer[0] -eq 0xFE -and $buffer[1] -eq 0xFF) {
+            $encoding = [Text.Encoding]::BigEndianUnicode
+        } else {
+            $sampleLength = [math]::Min(4096, $buffer.Length)
+            $zeroBytes = 0
+            for ($index = 0; $index -lt $sampleLength; $index++) {
+                if ($buffer[$index] -eq 0) { $zeroBytes++ }
+            }
+            if ($sampleLength -gt 0 -and $zeroBytes -gt ($sampleLength / 8)) {
+                $encoding = [Text.Encoding]::Unicode
+            }
+        }
+        $text = $encoding.GetString($buffer)
+        $truncated = $originalBytes -gt $readLength
+        if ($truncated) {
+            $text = "[TRUNCATED TO LAST $readLength OF $originalBytes BYTES]`r`n$text"
+        }
+        return [PSCustomObject]@{
+            Success = $true
+            Text = Protect-EvidenceText -Text $text
+            OriginalBytes = $originalBytes
+            IncludedSourceBytes = [long]$readLength
+            Truncated = $truncated
+            Error = ""
+        }
+    } catch {
+        return [PSCustomObject]@{
+            Success = $false
+            Text = ""
+            OriginalBytes = 0L
+            IncludedSourceBytes = 0L
+            Truncated = $false
+            Error = Protect-EvidenceText -Text $_.Exception.Message
+        }
+    } finally {
+        if ($null -ne $stream) { $stream.Dispose() }
+    }
+}
+
+function Add-DiagnosticBundleEntry {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSUseShouldProcessForStateChangingFunctions", "", Justification = "Writes a redacted entry inside a generated diagnostic staging directory.")]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary]$Context,
+        [Parameter(Mandatory = $true)]
+        [string]$RelativePath,
+        [Parameter(Mandatory = $true)]
+        [string]$Category,
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()][string]$Content,
+        [long]$OriginalBytes = -1,
+        [bool]$Truncated = $false,
+        [switch]$AllowTruncate
+    )
+
+    try {
+        $normalizedRelativePath = $RelativePath.Replace("\", "/").TrimStart("/")
+        if ([string]::IsNullOrWhiteSpace($normalizedRelativePath) -or
+            @($normalizedRelativePath.Split("/") | Where-Object { $_ -eq ".." }).Count -gt 0) {
+            throw "Diagnostic entry path is invalid"
+        }
+        $safeContent = Protect-EvidenceText -Text $Content
+        $encoding = New-Object Text.UTF8Encoding($false)
+        $contentBytes = $encoding.GetBytes($safeContent)
+        if ($OriginalBytes -lt 0) { $OriginalBytes = [long]$contentBytes.Length }
+
+        $remainingBytes = [long]$Context.RemainingBytes
+        if ($contentBytes.Length -gt $remainingBytes) {
+            if (-not $AllowTruncate -or $remainingBytes -lt 1024) {
+                [void]$Context.Omissions.Add([ordered]@{
+                    path = $normalizedRelativePath
+                    category = $Category
+                    reason = "Bundle size budget exhausted"
+                    original_bytes = $OriginalBytes
+                })
+                return $false
+            }
+            $prefix = "[TRUNCATED BY BUNDLE SIZE BUDGET]`r`n"
+            $prefixBytes = $encoding.GetBytes($prefix)
+            $tailLength = [math]::Max(
+                0,
+                [int][math]::Min(
+                    [long]$contentBytes.Length,
+                    $remainingBytes - $prefixBytes.Length
+                )
+            )
+            $tail = New-Object byte[] $tailLength
+            if ($tailLength -gt 0) {
+                [Array]::Copy(
+                    $contentBytes,
+                    $contentBytes.Length - $tailLength,
+                    $tail,
+                    0,
+                    $tailLength
+                )
+            }
+            $safeContent = $prefix + $encoding.GetString($tail)
+            $contentBytes = $encoding.GetBytes($safeContent)
+            while ($contentBytes.Length -gt $remainingBytes -and $safeContent.Length -gt $prefix.Length) {
+                $removeCount = [math]::Min(1024, $safeContent.Length - $prefix.Length)
+                $safeContent = $prefix + $safeContent.Substring($prefix.Length + $removeCount)
+                $contentBytes = $encoding.GetBytes($safeContent)
+            }
+            $Truncated = $true
+        }
+
+        $rootPath = [IO.Path]::GetFullPath([string]$Context.Root).TrimEnd("\", "/")
+        $destinationPath = [IO.Path]::GetFullPath(
+            (Join-Path $rootPath $normalizedRelativePath.Replace("/", "\"))
+        )
+        if (-not $destinationPath.StartsWith(
+            "$rootPath$([IO.Path]::DirectorySeparatorChar)",
+            [StringComparison]::OrdinalIgnoreCase
+        )) {
+            throw "Diagnostic entry escaped the staging directory"
+        }
+        if (-not (Write-ProtectedAtomicFile -Path $destinationPath -Content $safeContent `
+            -KeepLastKnownGood:$false)) {
+            throw "Diagnostic entry could not be written: $($script:LastEvidenceWriteError)"
+        }
+        $writtenBytes = [long](Get-Item -LiteralPath $destinationPath).Length
+        $Context["RemainingBytes"] = [math]::Max(0L, $remainingBytes - $writtenBytes)
+        [void]$Context.Entries.Add([ordered]@{
+            path = $normalizedRelativePath
+            category = $Category
+            bytes = $writtenBytes
+            original_bytes = [long]$OriginalBytes
+            truncated = [bool]$Truncated
+            sha256 = (Get-FileHash -LiteralPath $destinationPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        })
+        return $true
+    } catch {
+        [void]$Context.Errors.Add(
+            "$(Protect-EvidenceText -Text $RelativePath): $(Protect-EvidenceText -Text $_.Exception.Message)"
+        )
+        return $false
+    }
+}
+
+function Add-DiagnosticBundleFile {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary]$Context,
+        [Parameter(Mandatory = $true)]
+        [string]$SourcePath,
+        [Parameter(Mandatory = $true)]
+        [string]$RelativePath,
+        [Parameter(Mandatory = $true)]
+        [string]$Category,
+        [ValidateRange(1024, 16777216)]
+        [int]$MaximumBytes = 4194304
+    )
+
+    $readLimit = [int][math]::Max(
+        1024,
+        [math]::Min(
+            [long]$MaximumBytes,
+            [math]::Max(1024L, [long]$Context.RemainingBytes)
+        )
+    )
+    $read = Read-BoundedEvidenceText -Path $SourcePath -MaximumBytes $readLimit
+    if (-not $read.Success) {
+        [void]$Context.Errors.Add(
+            "$(Protect-EvidenceText -Text $RelativePath): $($read.Error)"
+        )
+        return $false
+    }
+    return Add-DiagnosticBundleEntry -Context $Context -RelativePath $RelativePath `
+        -Category $Category -Content $read.Text -OriginalBytes $read.OriginalBytes `
+        -Truncated $read.Truncated -AllowTruncate
+}
+
+function Read-DiagnosticJsonSnapshot {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+        [AllowNull()][scriptblock]$MigrationScript = $null,
+        [AllowNull()][scriptblock]$ValidationScript = $null
+    )
+
+    $errors = [System.Collections.ArrayList]::new()
+    foreach ($candidate in @($Path, "$Path.previous")) {
+        if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) { continue }
+        try {
+            $access = Test-EvidencePathAccess -Path $candidate
+            if (-not $access.Valid) {
+                $writeSafety = Test-EvidencePathWriteSafety -Path $candidate -AllowCurrentIdentity
+                if (-not $writeSafety.Valid) { throw $writeSafety.Reason }
+                [void]$errors.Add(
+                    "$([IO.Path]::GetFileName($candidate)) used a legacy but write-safe ACL"
+                )
+            }
+            $data = ConvertTo-Hashtable -InputObject (
+                [IO.File]::ReadAllText($candidate) | ConvertFrom-Json -ErrorAction Stop
+            )
+            if ($null -ne $MigrationScript) { $data = & $MigrationScript $data }
+            if ($null -ne $ValidationScript) {
+                $validation = & $ValidationScript $data
+                if (($validation -is [bool] -and -not $validation) -or
+                    ($validation.PSObject.Properties["Valid"] -and -not [bool]$validation.Valid)) {
+                    $reason = if ($validation.PSObject.Properties["Reason"]) {
+                        [string]$validation.Reason
+                    } else {
+                        "Diagnostic JSON validation failed"
+                    }
+                    throw $reason
+                }
+            }
+            return [PSCustomObject]@{
+                Success = $true
+                Data = Protect-EvidenceObject -InputObject $data
+                Recovered = ($candidate -ne $Path)
+                Errors = @($errors)
+            }
+        } catch {
+            [void]$errors.Add(
+                "$([IO.Path]::GetFileName($candidate)): $(Protect-EvidenceText -Text $_.Exception.Message)"
+            )
+        }
+    }
+    return [PSCustomObject]@{
+        Success = $false
+        Data = $null
+        Recovered = $false
+        Errors = @($errors)
+    }
+}
+
+function Get-DiagnosticEvidenceFile {
+    $items = [System.Collections.ArrayList]::new()
+    if (Test-Path -LiteralPath $LogPath -PathType Container) {
+        $specifications = @(
+            @{ Pattern = "SystemUpdatePro_Transcript_*.log"; Category = "Transcript"; Count = 2 },
+            @{
+                Pattern = "SystemUpdatePro_*.log"
+                Exclude = "^SystemUpdatePro_Transcript_"
+                Category = "RunLog"
+                Count = 2
+            },
+            @{ Pattern = "SystemUpdatePro_Report_*.html"; Category = "Report"; Count = 1 },
+            @{ Pattern = "DCU_*.log"; Category = "Dell"; Count = 4 }
+        )
+        $seenPaths = @{}
+        foreach ($specification in $specifications) {
+            foreach ($file in @(Get-ChildItem -LiteralPath $LogPath -File -Force `
+                -Filter $specification.Pattern -ErrorAction SilentlyContinue | Where-Object {
+                    [string]::IsNullOrWhiteSpace([string]$specification.Exclude) -or
+                    $_.Name -notmatch [string]$specification.Exclude
+                } |
+                Sort-Object LastWriteTime -Descending |
+                Select-Object -First $specification.Count)) {
+                if ($seenPaths.ContainsKey($file.FullName)) { continue }
+                $seenPaths[$file.FullName] = $true
+                [void]$items.Add([PSCustomObject]@{
+                    Path = $file.FullName
+                    RelativePath = "evidence/$($specification.Category.ToLowerInvariant())/$($file.Name)"
+                    Category = $specification.Category
+                    MaximumBytes = 4194304
+                })
+            }
+        }
+
+        foreach ($directory in @(Get-ChildItem -LiteralPath $LogPath -Directory -Force `
+            -Filter "HPIA_*" -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 2)) {
+            foreach ($file in @(Get-ChildItem -LiteralPath $directory.FullName -File -Force `
+                -Recurse -ErrorAction SilentlyContinue | Where-Object {
+                    $_.Extension.ToLowerInvariant() -in @(
+                        ".log", ".txt", ".xml", ".json", ".csv", ".html", ".htm"
+                    )
+                } | Sort-Object LastWriteTime -Descending | Select-Object -First 8)) {
+                $relativeWithinDirectory = $file.FullName.Substring(
+                    $directory.FullName.Length
+                ).TrimStart("\", "/").Replace("\", "/")
+                [void]$items.Add([PSCustomObject]@{
+                    Path = $file.FullName
+                    RelativePath = "evidence/hp/$($directory.Name)/$relativeWithinDirectory"
+                    Category = "HP"
+                    MaximumBytes = 4194304
+                })
+            }
+        }
+    }
+    return @($items | Select-Object -First 24)
+}
+
+function Get-DiagnosticWindowsEvidence {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RawDirectory,
+        [ValidateRange(1, 30)]
+        [int]$SinceDays = 7,
+        [ValidateRange(10, 1000)]
+        [int]$MaximumEvents = 250
+    )
+
+    $errors = [System.Collections.ArrayList]::new()
+    $eventSets = [ordered]@{}
+    $eventChannels = @(
+        "Microsoft-Windows-WindowsUpdateClient/Operational",
+        "Microsoft-Windows-UpdateOrchestrator/Operational"
+    )
+    foreach ($channel in $eventChannels) {
+        try {
+            $eventSets[$channel] = @(
+                Get-WinEvent -FilterHashtable @{
+                    LogName = $channel
+                    StartTime = (Get-Date).AddDays(-$SinceDays)
+                } -MaxEvents $MaximumEvents -ErrorAction Stop | ForEach-Object {
+                    $eventMessage = Protect-EvidenceText -Text $_.Message
+                    if ($eventMessage.Length -gt 8192) {
+                        $eventMessage = $eventMessage.Substring(0, 8192) +
+                            "`r`n[TRUNCATED EVENT MESSAGE]"
+                    }
+                    [ordered]@{
+                        time_created = $_.TimeCreated.ToUniversalTime().ToString("o")
+                        id = $_.Id
+                        level = $_.LevelDisplayName
+                        provider = $_.ProviderName
+                        message = $eventMessage
+                    }
+                }
+            )
+        } catch {
+            $eventSets[$channel] = @()
+            [void]$errors.Add(
+                "$channel`: $(Protect-EvidenceText -Text $_.Exception.Message)"
+            )
+        }
+    }
+    try {
+        $eventSets["System/WindowsUpdateClient"] = @(
+            Get-WinEvent -FilterHashtable @{
+                LogName = "System"
+                ProviderName = "Microsoft-Windows-WindowsUpdateClient"
+                StartTime = (Get-Date).AddDays(-$SinceDays)
+            } -MaxEvents $MaximumEvents -ErrorAction Stop | ForEach-Object {
+                $eventMessage = Protect-EvidenceText -Text $_.Message
+                if ($eventMessage.Length -gt 8192) {
+                    $eventMessage = $eventMessage.Substring(0, 8192) +
+                        "`r`n[TRUNCATED EVENT MESSAGE]"
+                }
+                [ordered]@{
+                    time_created = $_.TimeCreated.ToUniversalTime().ToString("o")
+                    id = $_.Id
+                    level = $_.LevelDisplayName
+                    provider = $_.ProviderName
+                    message = $eventMessage
+                }
+            }
+        )
+    } catch {
+        $eventSets["System/WindowsUpdateClient"] = @()
+        [void]$errors.Add(
+            "System/WindowsUpdateClient: $(Protect-EvidenceText -Text $_.Exception.Message)"
+        )
+    }
+
+    $files = [System.Collections.ArrayList]::new()
+    $windowsUpdateLogPath = Join-Path $RawDirectory "WindowsUpdate.log"
+    $windowsPowerShellPath = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+    $commandResult = $null
+    if (Test-Path -LiteralPath $windowsPowerShellPath -PathType Leaf) {
+        $escapedLogPath = $windowsUpdateLogPath.Replace("'", "''")
+        $commandText = (
+            "`$ErrorActionPreference='Stop'; " +
+            "Get-WindowsUpdateLog -LogPath '$escapedLogPath' | Out-Null"
+        )
+        $encodedCommand = [Convert]::ToBase64String(
+            [Text.Encoding]::Unicode.GetBytes($commandText)
+        )
+        $commandResult = Invoke-CapturedCommand -FilePath $windowsPowerShellPath `
+            -ArgumentList @(
+                "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", $encodedCommand
+            ) -TimeoutSeconds 180
+        if ($commandResult.Success -and
+            (Test-Path -LiteralPath $windowsUpdateLogPath -PathType Leaf)) {
+            [void]$files.Add([PSCustomObject]@{
+                Path = $windowsUpdateLogPath
+                RelativePath = "windows/WindowsUpdate.log"
+                Category = "WindowsUpdate"
+                MaximumBytes = 8388608
+            })
+        } else {
+            $detail = if ($null -ne $commandResult -and
+                -not [string]::IsNullOrWhiteSpace($commandResult.Error)) {
+                $commandResult.Error
+            } elseif ($null -ne $commandResult) {
+                $commandResult.StandardError
+            } else {
+                "Windows Update log command did not return evidence"
+            }
+            [void]$errors.Add("Get-WindowsUpdateLog: $detail")
+        }
+    } else {
+        [void]$errors.Add("Get-WindowsUpdateLog: Windows PowerShell was not found")
+    }
+
+    $windowsLogSpecifications = @(
+        @{
+            Path = Join-Path $script:WindowsRoot "Logs\CBS\CBS.log"
+            RelativePath = "windows/CBS.log"
+            Category = "CBS"
+            MaximumBytes = 4194304
+        },
+        @{
+            Path = Join-Path $script:WindowsRoot "Logs\DISM\dism.log"
+            RelativePath = "windows/DISM.log"
+            Category = "DISM"
+            MaximumBytes = 2097152
+        },
+        @{
+            Path = Join-Path $script:WindowsRoot "SoftwareDistribution\ReportingEvents.log"
+            RelativePath = "windows/ReportingEvents.log"
+            Category = "WindowsUpdate"
+            MaximumBytes = 2097152
+        }
+    )
+    foreach ($specification in $windowsLogSpecifications) {
+        if (Test-Path -LiteralPath $specification.Path -PathType Leaf) {
+            [void]$files.Add([PSCustomObject]$specification)
+        }
+    }
+
+    return [PSCustomObject]@{
+        SchemaVersion = 1
+        SinceDays = $SinceDays
+        MaximumEventsPerChannel = $MaximumEvents
+        Events = $eventSets
+        WindowsUpdateLogCommand = $commandResult
+        Files = @($files)
+        Errors = @($errors)
+    }
+}
+
+function Get-DiagnosticRuntimeSnapshot {
+    param(
+        [AllowNull()][object]$FallbackCapabilities = $null,
+        [AllowEmptyCollection()][object[]]$Dependencies = @(),
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [System.Collections.ArrayList]$Errors
+    )
+
+    $systemInfo = $null
+    $providerVersions = $null
+    $capabilities = $FallbackCapabilities
+    try {
+        $systemInfo = Get-SystemInfo
+        Add-SensitiveEvidenceValue -Value ([string]$systemInfo.SerialNumber)
+    } catch {
+        [void]$Errors.Add("System inventory: $(Protect-EvidenceText -Text $_.Exception.Message)")
+    }
+    if ($null -ne $systemInfo) {
+        try {
+            $providerVersions = Get-ProviderVersionInventory -SystemInfo $systemInfo
+            $capabilities = Get-CapabilityAssessment -SystemInfo $systemInfo `
+                -VersionInventory $providerVersions
+        } catch {
+            [void]$Errors.Add(
+                "Provider inventory: $(Protect-EvidenceText -Text $_.Exception.Message)"
+            )
+        }
+    }
+
+    return Protect-EvidenceObject -InputObject ([ordered]@{
+        schema_version = 1
+        collected_at = (Get-Date).ToUniversalTime().ToString("o")
+        product = $script:ProductName
+        product_version = $script:Version
+        computer_name = $env:COMPUTERNAME
+        powershell = [ordered]@{
+            version = $PSVersionTable.PSVersion.ToString()
+            edition = [string]$PSVersionTable.PSEdition
+            process_architecture = [string]$env:PROCESSOR_ARCHITECTURE
+        }
+        system = $systemInfo
+        provider_versions = $providerVersions
+        capabilities = $capabilities
+        dependency_provenance = @($Dependencies)
+    })
+}
+
+function Get-DiagnosticRecoverySnapshot {
+    param(
+        [AllowEmptyCollection()][object[]]$LastRunActions = @(),
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [System.Collections.ArrayList]$Errors
+    )
+
+    $journals = [System.Collections.ArrayList]::new()
+    if (Test-Path -LiteralPath $script:MutationJournalDirectory -PathType Container) {
+        foreach ($file in @(Get-ChildItem -LiteralPath $script:MutationJournalDirectory `
+            -File -Force -Filter "*.json" -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -notmatch "\.previous$" } |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 20)) {
+            $read = Read-DiagnosticJsonSnapshot -Path $file.FullName `
+                -ValidationScript ${function:Test-MutationJournal}
+            foreach ($errorMessage in @($read.Errors)) {
+                [void]$Errors.Add("Journal $($file.Name): $errorMessage")
+            }
+            if (-not $read.Success) { continue }
+            $journalEntries = @($read.Data.Entries | ForEach-Object {
+                [ordered]@{
+                    id = $_.Id
+                    sequence = $_.Sequence
+                    type = $_.Type
+                    target = Protect-EvidenceText -Text $_.Target
+                    scope = $_.Scope
+                    state = $_.State
+                    restore_on_finalize = $_.RestoreOnFinalize
+                    recovery_action = Protect-EvidenceText -Text $_.RecoveryAction
+                    created_at = $_.CreatedAt
+                    applied_at = $_.AppliedAt
+                    recovered_at = $_.RecoveredAt
+                    error = Protect-EvidenceText -Text $_.Error
+                }
+            })
+            [void]$journals.Add([ordered]@{
+                schema_version = $read.Data.SchemaVersion
+                run_id = $read.Data.RunId
+                status = $read.Data.Status
+                created_at = $read.Data.CreatedAt
+                last_updated_at = $read.Data.LastUpdatedAt
+                recovered_from_last_known_good = $read.Recovered
+                entries = $journalEntries
+            })
+        }
+    }
+    return Protect-EvidenceObject -InputObject ([ordered]@{
+        schema_version = 1
+        collected_at = (Get-Date).ToUniversalTime().ToString("o")
+        journals = @($journals)
+        last_run_actions = @($LastRunActions)
+    })
+}
+
+function New-DiagnosticZipArchive {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSUseShouldProcessForStateChangingFunctions", "", Justification = "Creates a new diagnostic archive at an explicitly supplied temporary path.")]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$SourceDirectory,
+        [Parameter(Mandatory = $true)]
+        [string]$DestinationPath
+    )
+
+    $archiveStream = $null
+    $archive = $null
+    try {
+        Add-Type -AssemblyName System.IO.Compression -ErrorAction Stop
+        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+        $sourceRoot = [IO.Path]::GetFullPath($SourceDirectory).TrimEnd("\", "/")
+        $archiveStream = [IO.FileStream]::new(
+            $DestinationPath,
+            [IO.FileMode]::CreateNew,
+            [IO.FileAccess]::ReadWrite,
+            [IO.FileShare]::None
+        )
+        $archive = [IO.Compression.ZipArchive]::new(
+            $archiveStream,
+            [IO.Compression.ZipArchiveMode]::Create,
+            $true
+        )
+        foreach ($file in @(Get-ChildItem -LiteralPath $sourceRoot -File -Force `
+            -Recurse -ErrorAction Stop | Sort-Object FullName)) {
+            $relativePath = $file.FullName.Substring($sourceRoot.Length).TrimStart("\", "/")
+            $entryName = $relativePath.Replace("\", "/")
+            $entry = $archive.CreateEntry(
+                $entryName,
+                [IO.Compression.CompressionLevel]::Optimal
+            )
+            $entry.LastWriteTime = $file.LastWriteTime
+            $inputStream = $null
+            $entryStream = $null
+            try {
+                $inputStream = [IO.FileStream]::new(
+                    $file.FullName,
+                    [IO.FileMode]::Open,
+                    [IO.FileAccess]::Read,
+                    [IO.FileShare]::Read
+                )
+                $entryStream = $entry.Open()
+                $inputStream.CopyTo($entryStream)
+            } finally {
+                if ($null -ne $entryStream) { $entryStream.Dispose() }
+                if ($null -ne $inputStream) { $inputStream.Dispose() }
+            }
+        }
+        $archive.Dispose()
+        $archive = $null
+        $archiveStream.Flush($true)
+        $archiveStream.Dispose()
+        $archiveStream = $null
+        return $true
+    } catch {
+        $script:LastEvidenceWriteError = $_.Exception.Message
+        return $false
+    } finally {
+        if ($null -ne $archive) { $archive.Dispose() }
+        if ($null -ne $archiveStream) { $archiveStream.Dispose() }
+    }
+}
+
+function Install-ProtectedAtomicArtifact {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSUseShouldProcessForStateChangingFunctions", "", Justification = "Atomically publishes a generated and validated binary evidence artifact.")]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$SourcePath,
+        [Parameter(Mandatory = $true)]
+        [string]$DestinationPath,
+        [AllowNull()][scriptblock]$ValidationScript = $null
+    )
+
+    $backupPath = "$DestinationPath.previous"
+    $stream = $null
+    try {
+        if (-not (Test-Path -LiteralPath $SourcePath -PathType Leaf)) {
+            throw "Generated artifact does not exist"
+        }
+        if ($null -ne $ValidationScript -and -not (& $ValidationScript $SourcePath)) {
+            throw "Generated artifact validation failed"
+        }
+        $stream = [IO.FileStream]::new(
+            $SourcePath,
+            [IO.FileMode]::Open,
+            [IO.FileAccess]::ReadWrite,
+            [IO.FileShare]::None
+        )
+        $stream.Flush($true)
+        $stream.Dispose()
+        $stream = $null
+        if (-not (Set-EvidencePathAccess -Path $SourcePath)) {
+            throw "Generated artifact ACL could not be protected"
+        }
+        if (Test-Path -LiteralPath $DestinationPath) {
+            Remove-Item -LiteralPath $backupPath -Force -ErrorAction SilentlyContinue
+            [IO.File]::Replace($SourcePath, $DestinationPath, $backupPath, $true)
+            Remove-Item -LiteralPath $backupPath -Force -ErrorAction SilentlyContinue
+        } else {
+            [IO.File]::Move($SourcePath, $DestinationPath)
+        }
+        if (-not (Set-EvidencePathAccess -Path $DestinationPath)) {
+            throw "Published artifact ACL could not be protected"
+        }
+        return $true
+    } catch {
+        if ($null -ne $stream) { $stream.Dispose() }
+        $script:LastEvidenceWriteError = $_.Exception.Message
+        return $false
+    }
+}
+
+function New-DiagnosticBundle {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSUseShouldProcessForStateChangingFunctions", "", Justification = "Creates a bounded support archive from local product and Windows evidence.")]
+    param(
+        [ValidateRange(5, 512)]
+        [int]$MaximumSizeMB = $DiagnosticBundleMaxSizeMB
+    )
+
+    $bundleId = [guid]::NewGuid().ToString()
+    $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+    $bundleRoot = Join-Path $script:DataPath "Bundles"
+    $stagingRoot = Join-Path $bundleRoot ".staging_$($bundleId.Replace('-', ''))"
+    $payloadRoot = Join-Path $stagingRoot "payload"
+    $rawRoot = Join-Path $stagingRoot "raw"
+    $temporaryArchive = Join-Path $bundleRoot ".bundle_$($bundleId.Replace('-', '')).tmp"
+    $archivePath = Join-Path $bundleRoot "SystemUpdatePro_Diagnostic_${timestamp}_$($bundleId.Substring(0, 8)).zip"
+    $maximumBytes = [long]$MaximumSizeMB * 1MB
+    $previousRedactionMode = [string]$script:RedactionMode
+    $context = $null
+    try {
+        # Diagnostic bundles are always fully de-identified, independent of
+        # the normal local evidence policy.
+        $script:RedactionMode = "SecretsAndSerials"
+        foreach ($directory in @($bundleRoot, $stagingRoot, $payloadRoot, $rawRoot)) {
+            if (-not (New-ProtectedDirectory -Path $directory)) {
+                throw "Diagnostic directory could not be protected: $($script:LastEvidenceAccessError)"
+            }
+        }
+        $context = [ordered]@{
+            Root = $payloadRoot
+            RemainingBytes = [long][math]::Floor($maximumBytes * 0.75)
+            Entries = [System.Collections.ArrayList]::new()
+            Omissions = [System.Collections.ArrayList]::new()
+            Errors = [System.Collections.ArrayList]::new()
+        }
+
+        $historyRead = Read-DiagnosticJsonSnapshot -Path $script:HistoryFile `
+            -MigrationScript ${function:Convert-HistorySchema} `
+            -ValidationScript ${function:Test-HistoryDocument}
+        foreach ($errorMessage in @($historyRead.Errors)) {
+            [void]$context.Errors.Add("History: $errorMessage")
+        }
+        $latestRun = $null
+        if ($historyRead.Success -and @($historyRead.Data.entries).Count -gt 0) {
+            $latestRun = @($historyRead.Data.entries)[0]
+            [void](Add-DiagnosticBundleEntry -Context $context -RelativePath "run/latest_run.json" `
+                -Category "RunData" -Content (
+                    $latestRun | ConvertTo-Json -Depth 24
+                ))
+        } else {
+            [void]$context.Omissions.Add([ordered]@{
+                path = "run/latest_run.json"
+                category = "RunData"
+                reason = "No validated run history was available"
+                original_bytes = 0
+            })
+        }
+
+        $stateRead = Read-DiagnosticJsonSnapshot -Path $script:StateFile `
+            -MigrationScript ${function:Convert-ContinuationStateSchema} `
+            -ValidationScript ${function:Test-ContinuationState}
+        foreach ($errorMessage in @($stateRead.Errors)) {
+            [void]$context.Errors.Add("Continuation state: $errorMessage")
+        }
+        if ($stateRead.Success) {
+            [void](Add-DiagnosticBundleEntry -Context $context `
+                -RelativePath "run/active_continuation.json" -Category "RunPolicy" `
+                -Content ($stateRead.Data | ConvertTo-Json -Depth 24))
+        }
+
+        $policySource = if ($stateRead.Success) {
+            $stateRead.Data.Parameters
+        } elseif ($null -ne $latestRun) {
+            $latestRun.parameters
+        } else {
+            $null
+        }
+        $policyDocument = Protect-EvidenceObject -InputObject ([ordered]@{
+            schema_version = 1
+            source = $(if ($stateRead.Success) {
+                "active_continuation"
+            } elseif ($null -ne $latestRun) {
+                "latest_history"
+            } else {
+                "unavailable"
+            })
+            parameters = $policySource
+        })
+        [void](Add-DiagnosticBundleEntry -Context $context -RelativePath "run/policy.json" `
+            -Category "RunPolicy" -Content ($policyDocument | ConvertTo-Json -Depth 16))
+
+        $fallbackCapabilities = if ($null -ne $latestRun) {
+            $latestRun.capabilities
+        } elseif ($stateRead.Success) {
+            $stateRead.Data.Capabilities
+        } else {
+            $null
+        }
+        $dependencies = if ($null -ne $latestRun) {
+            @($latestRun.dependencies)
+        } elseif ($stateRead.Success) {
+            @($stateRead.Data.AcquisitionProvenance)
+        } else {
+            @()
+        }
+        $inventory = Get-DiagnosticRuntimeSnapshot `
+            -FallbackCapabilities $fallbackCapabilities -Dependencies $dependencies `
+            -Errors $context.Errors
+        [void](Add-DiagnosticBundleEntry -Context $context `
+            -RelativePath "inventory/runtime.json" -Category "Inventory" `
+            -Content ($inventory | ConvertTo-Json -Depth 24))
+
+        $lastRunRecovery = if ($null -ne $latestRun) {
+            @($latestRun.mutation_recovery)
+        } else {
+            @()
+        }
+        $recovery = Get-DiagnosticRecoverySnapshot -LastRunActions $lastRunRecovery `
+            -Errors $context.Errors
+        [void](Add-DiagnosticBundleEntry -Context $context `
+            -RelativePath "recovery/status.json" -Category "Recovery" `
+            -Content ($recovery | ConvertTo-Json -Depth 20))
+
+        $windowsEvidence = Get-DiagnosticWindowsEvidence -RawDirectory $rawRoot
+        foreach ($errorMessage in @($windowsEvidence.Errors)) {
+            [void]$context.Errors.Add("Windows evidence: $errorMessage")
+        }
+        $windowsIndex = Protect-EvidenceObject -InputObject ([ordered]@{
+            schema_version = $windowsEvidence.SchemaVersion
+            since_days = $windowsEvidence.SinceDays
+            maximum_events_per_channel = $windowsEvidence.MaximumEventsPerChannel
+            events = $windowsEvidence.Events
+            windows_update_log_command = $windowsEvidence.WindowsUpdateLogCommand
+        })
+        [void](Add-DiagnosticBundleEntry -Context $context `
+            -RelativePath "windows/events.json" -Category "WindowsEvents" `
+            -Content ($windowsIndex | ConvertTo-Json -Depth 20))
+        foreach ($file in @($windowsEvidence.Files)) {
+            [void](Add-DiagnosticBundleFile -Context $context -SourcePath $file.Path `
+                -RelativePath $file.RelativePath -Category $file.Category `
+                -MaximumBytes $file.MaximumBytes)
+        }
+
+        foreach ($file in @(Get-DiagnosticEvidenceFile)) {
+            $access = Test-EvidencePathAccess -Path $file.Path
+            if (-not $access.Valid) {
+                $writeSafety = Test-EvidencePathWriteSafety -Path $file.Path -AllowCurrentIdentity
+                if (-not $writeSafety.Valid) {
+                    [void]$context.Errors.Add(
+                        "$($file.RelativePath): source ACL was not trusted"
+                    )
+                    continue
+                }
+                [void]$context.Errors.Add(
+                    "$($file.RelativePath): source used a legacy but write-safe ACL"
+                )
+            }
+            [void](Add-DiagnosticBundleFile -Context $context -SourcePath $file.Path `
+                -RelativePath $file.RelativePath -Category $file.Category `
+                -MaximumBytes $file.MaximumBytes)
+        }
+
+        $latestRunId = if ($null -ne $latestRun) { [string]$latestRun.run_id } else { "" }
+        $latestRunStatus = if ($null -ne $latestRun) { [string]$latestRun.status } else { "" }
+        $manifest = Protect-EvidenceObject -InputObject ([ordered]@{
+            schema_version = $script:DiagnosticBundleSchemaVersion
+            bundle_id = $bundleId
+            created_at = (Get-Date).ToUniversalTime().ToString("o")
+            product = $script:ProductName
+            product_version = $script:Version
+            computer_name = $env:COMPUTERNAME
+            maximum_archive_bytes = $maximumBytes
+            latest_run = [ordered]@{
+                run_id = $latestRunId
+                status = $latestRunStatus
+            }
+            files = @($context.Entries)
+            omissions = @($context.Omissions)
+            collection_errors = @($context.Errors | Select-Object -First 100)
+        })
+        if (-not (Write-ProtectedAtomicJson -Path (Join-Path $payloadRoot "manifest.json") `
+            -Data $manifest -Depth 24 -KeepLastKnownGood:$false)) {
+            throw "Diagnostic manifest could not be written: $($script:LastEvidenceWriteError)"
+        }
+
+        if (-not (New-DiagnosticZipArchive -SourceDirectory $payloadRoot `
+            -DestinationPath $temporaryArchive)) {
+            throw "Diagnostic ZIP creation failed: $($script:LastEvidenceWriteError)"
+        }
+        $zipValidation = {
+            param([string]$CandidatePath)
+            $archive = $null
+            try {
+                $archive = [IO.Compression.ZipFile]::OpenRead($CandidatePath)
+                return @($archive.Entries | Where-Object {
+                    $_.FullName -eq "manifest.json"
+                }).Count -eq 1
+            } catch {
+                return $false
+            } finally {
+                if ($null -ne $archive) { $archive.Dispose() }
+            }
+        }
+        if (-not (Install-ProtectedAtomicArtifact -SourcePath $temporaryArchive `
+            -DestinationPath $archivePath -ValidationScript $zipValidation)) {
+            throw "Diagnostic archive could not be published: $($script:LastEvidenceWriteError)"
+        }
+        $archiveBytes = [long](Get-Item -LiteralPath $archivePath).Length
+        if ($archiveBytes -gt $maximumBytes) {
+            Remove-Item -LiteralPath $archivePath -Force -ErrorAction SilentlyContinue
+            throw "Diagnostic archive exceeded its $MaximumSizeMB MB limit"
+        }
+        return [PSCustomObject]@{
+            Success = $true
+            Path = $archivePath
+            Bytes = $archiveBytes
+            MaximumBytes = $maximumBytes
+            EntryCount = @($context.Entries).Count + 1
+            OmissionCount = @($context.Omissions).Count
+            ErrorCount = @($context.Errors).Count
+            Error = ""
+        }
+    } catch {
+        return [PSCustomObject]@{
+            Success = $false
+            Path = ""
+            Bytes = 0L
+            MaximumBytes = $maximumBytes
+            EntryCount = 0
+            OmissionCount = $(if ($null -ne $context) { @($context.Omissions).Count } else { 0 })
+            ErrorCount = $(if ($null -ne $context) { @($context.Errors).Count } else { 0 })
+            Error = Protect-EvidenceText -Text $_.Exception.Message
+        }
+    } finally {
+        $script:RedactionMode = $previousRedactionMode
+        $bundleRootFullPath = [IO.Path]::GetFullPath($bundleRoot).TrimEnd("\", "/")
+        if (Test-Path -LiteralPath $stagingRoot -PathType Container) {
+            $stagingFullPath = [IO.Path]::GetFullPath($stagingRoot)
+            if ($stagingFullPath.StartsWith(
+                "$bundleRootFullPath$([IO.Path]::DirectorySeparatorChar).staging_",
+                [StringComparison]::OrdinalIgnoreCase
+            )) {
+                Remove-Item -LiteralPath $stagingFullPath -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+        if (Test-Path -LiteralPath $temporaryArchive -PathType Leaf) {
+            Remove-Item -LiteralPath $temporaryArchive -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+# ============================================================================
 # MAIN EXECUTION
 # ============================================================================
+
+# Handle standalone diagnostic collection before update initialization.
+if ($CreateDiagnosticBundle) {
+    if (-not (Test-Administrator)) {
+        [Console]::Error.WriteLine(
+            "[X] Diagnostic bundle creation requires administrator privileges."
+        )
+        exit 3
+    }
+    $diagnosticBundle = New-DiagnosticBundle -MaximumSizeMB $DiagnosticBundleMaxSizeMB
+    if (-not $diagnosticBundle.Success) {
+        [Console]::Error.WriteLine(
+            "[X] Diagnostic bundle failed: $($diagnosticBundle.Error)"
+        )
+        exit 3
+    }
+    Write-Output $diagnosticBundle.Path
+    exit 0
+}
 
 # Handle -ShowHistory early exit
 if ($ShowHistory) {

@@ -152,6 +152,19 @@ BeforeAll {
         "Send-WebhookNotification",
         "Save-UpdateHistory",
         "Invoke-TerminalEvidence",
+        "ConvertTo-ProcessArgument",
+        "Invoke-CapturedCommand",
+        "Read-BoundedEvidenceText",
+        "Add-DiagnosticBundleEntry",
+        "Add-DiagnosticBundleFile",
+        "Read-DiagnosticJsonSnapshot",
+        "Get-DiagnosticEvidenceFile",
+        "Get-DiagnosticWindowsEvidence",
+        "Get-DiagnosticRuntimeSnapshot",
+        "Get-DiagnosticRecoverySnapshot",
+        "New-DiagnosticZipArchive",
+        "Install-ProtectedAtomicArtifact",
+        "New-DiagnosticBundle",
         "Install-PSModuleWithRetry",
         "Invoke-WindowsUpdatePSWU",
         "Invoke-WindowsUpdateWUA",
@@ -182,6 +195,7 @@ BeforeAll {
         $script:CapabilityAssessment = $null
         $script:HistorySchemaVersion = 2
         $script:LockSchemaVersion = 1
+        $script:DiagnosticBundleSchemaVersion = 1
         $script:RunId = "11111111-1111-1111-1111-111111111111"
         $script:StageResults = [System.Collections.ArrayList]::new()
         $script:Errors = [System.Collections.ArrayList]::new()
@@ -248,6 +262,7 @@ BeforeAll {
         $script:LogRetentionDays = 30
         $script:EvidenceMaxSizeMB = 512
         $script:RedactionMode = "SecretsAndSerials"
+        $script:DiagnosticBundleMaxSizeMB = 50
         $script:LogFile = Join-Path $stateTestDirectory "SystemUpdatePro_test.log"
         $script:TranscriptFile = Join-Path $stateTestDirectory "SystemUpdatePro_Transcript_test.log"
         $script:EntryScriptPath = $script:SourceScriptPath
@@ -874,21 +889,27 @@ Describe "Protected local evidence store" {
         [void](New-ProtectedDirectory -Path $vendorDirectory)
         [void](Write-ProtectedAtomicFile -Path (Join-Path $vendorDirectory "one.log") -Content "123")
         [void](Write-ProtectedAtomicFile -Path (Join-Path $vendorDirectory "two.xml") -Content "1234")
+        $bundleDirectory = Join-Path $script:DataPath "Bundles"
+        [void](New-ProtectedDirectory -Path $bundleDirectory)
+        $oldBundle = Join-Path $bundleDirectory `
+            "SystemUpdatePro_Diagnostic_20000101_000000_00000000.zip"
+        [void](Write-ProtectedAtomicFile -Path $oldBundle -Content "123456")
         $unowned = Join-Path $script:LogPath "operator-notes.log"
         [IO.File]::WriteAllText($unowned, "keep")
 
-        foreach ($path in @($oldLog, $oldReport, $vendorDirectory)) {
+        foreach ($path in @($oldLog, $oldReport, $vendorDirectory, $oldBundle)) {
             (Get-Item -LiteralPath $path).LastWriteTime = (Get-Date).AddDays(-60)
         }
         $result = Invoke-EvidenceRetention -RetentionDays 30 -MaximumSizeMB 512
 
-        $result.DeletedFiles | Should -Be 4
+        $result.DeletedFiles | Should -Be 5
         $result.DeletedDirectories | Should -Be 1
-        $result.BytesFreed | Should -Be 19
+        $result.BytesFreed | Should -Be 25
         $result.Errors.Count | Should -Be 0
         Test-Path -LiteralPath $unowned | Should -BeTrue
         Test-Path -LiteralPath $oldLog | Should -BeFalse
         Test-Path -LiteralPath $vendorDirectory | Should -BeFalse
+        Test-Path -LiteralPath $oldBundle | Should -BeFalse
     }
 
     It "enforces the configured evidence size ceiling by deleting oldest owned artifacts first" {
@@ -907,6 +928,220 @@ Describe "Protected local evidence store" {
         $result.RemainingBytes | Should -BeLessOrEqual (10MB)
         Test-Path -LiteralPath $oldLargeLog | Should -BeFalse
         Test-Path -LiteralPath $newLargeLog | Should -BeTrue
+    }
+}
+
+Describe "Redacted diagnostic and recovery bundle" {
+    BeforeEach {
+        Initialize-SystemUpdateProTestState
+        Mock Get-DiagnosticRuntimeSnapshot {
+            param($FallbackCapabilities, $Dependencies, $Errors)
+            Add-SensitiveEvidenceValue -Value "SERIAL-DIAGNOSTIC-123"
+            return [ordered]@{
+                schema_version = 1
+                product = "SystemUpdatePro"
+                product_version = "4.1.0"
+                system = @{
+                    serial_number = "SERIAL-DIAGNOSTIC-123"
+                    os_build = "26100"
+                }
+                capabilities = $FallbackCapabilities
+                dependency_provenance = @($Dependencies)
+            }
+        }
+        Mock Get-DiagnosticWindowsEvidence {
+            param($RawDirectory, $SinceDays, $MaximumEvents)
+            return [PSCustomObject]@{
+                SchemaVersion = 1
+                SinceDays = 7
+                MaximumEventsPerChannel = 250
+                Events = [ordered]@{
+                    "Microsoft-Windows-WindowsUpdateClient/Operational" = @(
+                        @{
+                            id = 20
+                            message = "Install failed with 0x80240022"
+                        }
+                    )
+                }
+                WindowsUpdateLogCommand = [PSCustomObject]@{
+                    Success = $true
+                    ExitCode = 0
+                    StandardOutput = ""
+                    StandardError = ""
+                }
+                Files = @()
+                Errors = @()
+            }
+        }
+    }
+
+    It "captures a failed run, policy, recovery, Windows, and provider evidence without secrets" {
+        $runId = [guid]::NewGuid().ToString()
+        $secretEndpoint = "https://user:PRIVATE-PASSWORD@example.test/hook?sig=PRIVATE-SIGNATURE"
+        $history = [ordered]@{
+            schema_version = 2
+            last_updated_at = (Get-Date).ToUniversalTime().ToString("o")
+            entries = @(
+                [ordered]@{
+                    schema_version = 1
+                    run_id = $runId
+                    timestamp = (Get-Date).ToString("o")
+                    status = "Failed"
+                    exit_code = 3
+                    errors = @("Provider failed at $secretEndpoint")
+                    warnings = @()
+                    stages = @()
+                    dependencies = @(@{ Name = "PSWindowsUpdate"; Version = "2.2.1.5" })
+                    mutation_recovery = @(
+                        @{ Action = "Restored"; Target = "wuauserv"; Detail = "verified" }
+                    )
+                    capabilities = @{ Platform = @{ Status = "Ready"; OSBuild = "26100" } }
+                    parameters = @{ WebhookUrl = $secretEndpoint; IncludeBIOS = $false }
+                }
+            )
+        }
+        Write-ProtectedAtomicJson -Path $script:HistoryFile -Data $history -Depth 20 |
+            Should -BeTrue
+
+        $providerLog = Join-Path $script:LogPath "DCU_Apply_20260729_000000.log"
+        [IO.File]::WriteAllText(
+            $providerLog,
+            "Serial SERIAL-DIAGNOSTIC-123 endpoint $secretEndpoint failed"
+        )
+        [void](Set-EvidencePathAccess -Path $providerLog)
+        Mock Get-DiagnosticEvidenceFile {
+            @(
+                [PSCustomObject]@{
+                    Path = $providerLog
+                    RelativePath = "evidence/dell/DCU_Apply_20260729_000000.log"
+                    Category = "Dell"
+                    MaximumBytes = 4194304
+                }
+            )
+        }
+        $script:RedactionMode = "Secrets"
+
+        $bundle = New-DiagnosticBundle -MaximumSizeMB 5
+
+        $bundle.Success | Should -BeTrue -Because $bundle.Error
+        $script:RedactionMode | Should -Be "Secrets"
+        $bundle.Bytes | Should -BeLessOrEqual (5MB)
+        Test-Path -LiteralPath $bundle.Path | Should -BeTrue
+        (Test-EvidencePathAccess -Path $bundle.Path).Valid | Should -BeTrue
+
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $archive = [IO.Compression.ZipFile]::OpenRead($bundle.Path)
+        try {
+            $entryNames = @($archive.Entries | ForEach-Object { $_.FullName })
+            $entryNames | Should -Contain "manifest.json"
+            $entryNames | Should -Contain "run/latest_run.json"
+            $entryNames | Should -Contain "run/policy.json"
+            $entryNames | Should -Contain "inventory/runtime.json"
+            $entryNames | Should -Contain "recovery/status.json"
+            $entryNames | Should -Contain "windows/events.json"
+            $entryNames | Should -Contain "evidence/dell/DCU_Apply_20260729_000000.log"
+
+            $entryText = [System.Collections.ArrayList]::new()
+            foreach ($entry in $archive.Entries) {
+                $reader = New-Object IO.StreamReader($entry.Open())
+                try {
+                    [void]$entryText.Add($reader.ReadToEnd())
+                } finally {
+                    $reader.Dispose()
+                }
+            }
+            $combinedText = $entryText -join "`n"
+            $combinedText | Should -Not -Match "SERIAL-DIAGNOSTIC-123"
+            $combinedText | Should -Not -Match "PRIVATE-PASSWORD|PRIVATE-SIGNATURE"
+            $combinedText | Should -Match "REDACTED"
+
+            $manifestEntry = @($archive.Entries | Where-Object FullName -eq "manifest.json")[0]
+            $manifestReader = New-Object IO.StreamReader($manifestEntry.Open())
+            try {
+                $manifest = $manifestReader.ReadToEnd() | ConvertFrom-Json
+            } finally {
+                $manifestReader.Dispose()
+            }
+            $manifest.schema_version | Should -Be 1
+            $manifest.latest_run.run_id | Should -Be $runId
+            $manifest.latest_run.status | Should -Be "Failed"
+            @($manifest.files).Count | Should -BeGreaterThan 5
+            foreach ($fileRecord in @($manifest.files)) {
+                $fileRecord.sha256 | Should -Match "^[a-f0-9]{64}$"
+            }
+        } finally {
+            $archive.Dispose()
+        }
+        @(Get-ChildItem -LiteralPath (Join-Path $script:DataPath "Bundles") `
+            -Directory -Force -Filter ".staging_*").Count | Should -Be 0
+    }
+
+    It "keeps large evidence inside the requested archive ceiling and records truncation" {
+        $largeLog = Join-Path $script:LogPath "SystemUpdatePro_20260729_000000.log"
+        [IO.File]::WriteAllText($largeLog, ("A" * (6MB)))
+        [void](Set-EvidencePathAccess -Path $largeLog)
+        Mock Get-DiagnosticEvidenceFile {
+            @(
+                [PSCustomObject]@{
+                    Path = $largeLog
+                    RelativePath = "evidence/runlog/large.log"
+                    Category = "RunLog"
+                    MaximumBytes = 16777216
+                }
+            )
+        }
+
+        $bundle = New-DiagnosticBundle -MaximumSizeMB 5
+
+        $bundle.Success | Should -BeTrue -Because $bundle.Error
+        $bundle.Bytes | Should -BeLessOrEqual (5MB)
+        $archive = [IO.Compression.ZipFile]::OpenRead($bundle.Path)
+        try {
+            $manifestEntry = @($archive.Entries | Where-Object FullName -eq "manifest.json")[0]
+            $reader = New-Object IO.StreamReader($manifestEntry.Open())
+            try {
+                $manifest = $reader.ReadToEnd() | ConvertFrom-Json
+            } finally {
+                $reader.Dispose()
+            }
+            $largeRecord = @($manifest.files | Where-Object {
+                $_.path -eq "evidence/runlog/large.log"
+            })[0]
+            $largeRecord.truncated | Should -BeTrue
+            $largeRecord.original_bytes | Should -BeGreaterThan (5MB)
+        } finally {
+            $archive.Dispose()
+        }
+    }
+
+    It "runs diagnostic commands without a shell and returns bounded structured output" {
+        $result = Invoke-CapturedCommand -FilePath $env:ComSpec `
+            -ArgumentList @("/d", "/c", "echo", "captured output") `
+            -TimeoutSeconds 10 -MaximumOutputCharacters 4096
+
+        $result.Success | Should -BeTrue
+        $result.ExitCode | Should -Be 0
+        $result.TimedOut | Should -BeFalse
+        $result.StandardOutput | Should -Match "captured output"
+        $result.Command | Should -Be "cmd.exe"
+    }
+
+    It "persists the complete redacted run policy for later failed-run collection" {
+        $script:WebhookUrl = "https://example.test/workflow?sig=DO-NOT-PERSIST"
+        $script:EvidenceMaxSizeMB = 768
+        $runData = New-RunData -StartedAt (Get-Date).AddSeconds(-1)
+
+        Save-UpdateHistory -RunData $runData | Should -BeTrue
+        $history = Read-UpdateHistory
+        $policy = @($history.entries)[0].parameters
+
+        foreach ($parameterName in Get-ContinuationParameterName) {
+            $policy.Contains($parameterName) | Should -BeTrue
+        }
+        $policy.EvidenceMaxSizeMB | Should -Be 768
+        $policy.WebhookUrl | Should -Be "[REDACTED]"
+        (Get-Content -LiteralPath $script:HistoryFile -Raw) |
+            Should -Not -Match "DO-NOT-PERSIST"
     }
 }
 
