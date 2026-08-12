@@ -3503,6 +3503,215 @@ function Compare-SystemHealthRegression {
 }
 
 # ============================================================================
+# PARALLEL READ-ONLY PLANNING
+# ============================================================================
+
+function Get-ParallelUpdateSafety {
+    param(
+        [bool]$DryRunMode = [bool]$script:DryRun,
+        [bool]$SkipOEMMode = [bool]$SkipOEM,
+        [bool]$SkipWindowsMode = [bool]$SkipWindows,
+        [bool]$IncludeFirmware = [bool]$IncludeBIOS,
+        [bool]$Repair = [bool]$RepairWindowsUpdate,
+        [bool]$Bypass = [bool]$BypassWSUS,
+        [bool]$Cleanup = [bool]$CleanupAfter,
+        [bool]$ResetBase = [bool]$ResetComponentBase,
+        [bool]$Backup = [bool]$BackupDrivers,
+        [bool]$Rollback = [bool]$RollbackDrivers,
+        [bool]$PreStageMode = [bool]$PreStage,
+        [bool]$ContinueMode = [bool]$ContinueAfterReboot
+    )
+
+    $reasons = [System.Collections.ArrayList]::new()
+    if (-not $DryRunMode) { [void]$reasons.Add("parallel execution is limited to non-installing dry-run plans") }
+    if ($SkipOEMMode -or $SkipWindowsMode) { [void]$reasons.Add("both OEM and Windows Update plans must be enabled") }
+    if ($IncludeFirmware) { [void]$reasons.Add("firmware applicability and installation remain serial") }
+    if ($Repair -or $Bypass) { [void]$reasons.Add("servicing repair or WSUS policy mutation was requested") }
+    if ($Cleanup -or $ResetBase) { [void]$reasons.Add("component cleanup must remain serial") }
+    if ($Backup -or $Rollback) { [void]$reasons.Add("driver backup or rollback was requested") }
+    if ($PreStageMode) { [void]$reasons.Add("pre-stage plan persistence must remain serial") }
+    if ($ContinueMode) { [void]$reasons.Add("reboot continuation coordination must remain serial") }
+    return [PSCustomObject][ordered]@{
+        SchemaVersion = 1
+        Allowed = ($reasons.Count -eq 0)
+        Mode = if ($reasons.Count -eq 0) { "ReadOnlyParallelPlan" } else { "Serial" }
+        Reasons = @($reasons)
+        Reason = if ($reasons.Count -eq 0) {
+            "OEM and Windows Update discovery can run concurrently without installation or persistent mutation"
+        } else { $reasons -join "; " }
+    }
+}
+
+function Invoke-ParallelReadOnlyPlans {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSUseShouldProcessForStateChangingFunctions", "", Justification = "Runs two explicitly supplied read-only plan scriptblocks in isolated runspaces.")]
+    param(
+        [Parameter(Mandatory = $true)][scriptblock]$OEMPlan,
+        [Parameter(Mandatory = $true)][scriptblock]$WindowsPlan
+    )
+
+    $functionDefinitions = [ordered]@{}
+    foreach ($functionCommand in @(Get-Command -CommandType Function -ErrorAction SilentlyContinue)) {
+        if ([string]$functionCommand.Name -match "^(prompt|TabExpansion|TabExpansion2)$") { continue }
+        try { $functionDefinitions[[string]$functionCommand.Name] = [string]$functionCommand.Definition } catch { }
+    }
+    $variableNames = @(
+        "DataPath", "WindowsRoot", "ProductName", "RunId", "DryRun", "SkipOEM", "SkipWindows", "SkipWinget",
+        "IncludeBIOS", "BypassWSUS", "RepairWindowsUpdate", "CleanupAfter", "ResetComponentBase",
+        "BackupDrivers", "RollbackDrivers", "MaxRetries", "MaxUpdatePasses", "MinDiskSpaceGB",
+        "MinFirmwareChargePercent", "LogPath", "LogRetentionDays", "EvidenceMaxSizeMB", "RedactionMode",
+        "Offline", "DependencyCachePath", "SourceTimeoutSeconds", "AllowMeteredNetwork", "PolicyPath",
+        "RolloutPolicyPath", "FeatureDeferralDays", "SecurityOnly", "PreStage", "Interactive",
+        "CurrentSystemInfo", "FirmwarePrerequisites", "CapabilityAssessment", "AcquisitionManifest",
+        "AcquisitionManifestVersion", "DependencyReadiness", "DownloadPolicy", "WindowsUpdatePolicy",
+        "PackagePolicy", "RolloutPolicy", "RolloutDecision", "PSModuleInstallRoot", "HPIAInstallRoot",
+        "MutationJournalDirectory", "MutationJournal", "MutationEvidence", "ProtectedEvidenceDirectories",
+        "SensitiveEvidenceValues", "WebhookUrl", "WebhookSecretReference", "MaxContinuationAttempts",
+        "StageResults", "Errors", "Warnings", "OEMUpdates", "WindowsUpdates", "WingetUpdates",
+        "RunStartedAt", "EventLogSource"
+    )
+    $variableValues = [ordered]@{}
+    foreach ($name in $variableNames) {
+        $variable = Get-Variable -Scope Script -Name $name -ErrorAction SilentlyContinue
+        if ($null -ne $variable) { $variableValues[$name] = $variable.Value }
+    }
+
+    $workerScript = {
+        param([string]$ActionText, [System.Collections.IDictionary]$Definitions, [System.Collections.IDictionary]$Variables)
+        foreach ($definition in $Definitions.GetEnumerator()) {
+            try { . ([scriptblock]::Create([string]$definition.Value)) } catch { }
+        }
+        foreach ($variable in $Variables.GetEnumerator()) {
+            Set-Variable -Name ([string]$variable.Key) -Scope Script -Value $variable.Value -Force
+        }
+        $script:DryRun = [switch]$true
+        Set-Variable -Name "DryRun" -Scope Script -Value ([switch]$true) -Force
+        try {
+            $value = & ([scriptblock]::Create($ActionText))
+            return [PSCustomObject]@{ Success = $true; Value = $value; Error = "" }
+        } catch {
+            return [PSCustomObject]@{ Success = $false; Value = $null; Error = (Protect-EvidenceText -Text $_.Exception.Message) }
+        }
+    }
+
+    $pool = $null
+    $jobs = @()
+    try {
+        $pool = [runspacefactory]::CreateRunspacePool(1, 2)
+        $pool.Open()
+        foreach ($plan in @(
+            @{ Name = "OEM"; Action = $OEMPlan },
+            @{ Name = "Windows"; Action = $WindowsPlan }
+        )) {
+            $powerShell = [powershell]::Create()
+            $powerShell.RunspacePool = $pool
+            [void]$powerShell.AddScript($workerScript.ToString()).AddArgument(
+                ([string]$plan.Action.ToString())
+            ).AddArgument($functionDefinitions).AddArgument($variableValues)
+            $jobs += [PSCustomObject]@{
+                Name = $plan.Name; PowerShell = $powerShell; Handle = $powerShell.BeginInvoke()
+            }
+        }
+        foreach ($job in $jobs) {
+            $job.Handle.AsyncWaitHandle.WaitOne() | Out-Null
+        }
+        $results = [ordered]@{}
+        $errors = [System.Collections.ArrayList]::new()
+        foreach ($job in $jobs) {
+            try {
+                $output = @($job.PowerShell.EndInvoke($job.Handle))
+                $workerResult = $output | Select-Object -Last 1
+                $results[$job.Name] = $workerResult
+                if ($null -eq $workerResult -or -not [bool]$workerResult.Success) {
+                    [void]$errors.Add("$($job.Name) plan failed: $([string]$workerResult.Error)")
+                }
+            } catch {
+                [void]$errors.Add("$($job.Name) plan runspace failed: $($_.Exception.Message)")
+                $results[$job.Name] = [PSCustomObject]@{ Success = $false; Value = $null; Error = $_.Exception.Message }
+            }
+        }
+        return [PSCustomObject][ordered]@{
+            SchemaVersion = 1
+            Success = ($errors.Count -eq 0)
+            Parallel = $true
+            OEM = $results["OEM"]
+            Windows = $results["Windows"]
+            Errors = @($errors)
+            Reason = if ($errors.Count -eq 0) { "Read-only OEM and Windows Update plans completed concurrently" } else { $errors -join "; " }
+        }
+    } catch {
+        $serialResults = [ordered]@{}
+        $serialErrors = [System.Collections.ArrayList]::new()
+        foreach ($plan in @(
+            @{ Name = "OEM"; Action = $OEMPlan },
+            @{ Name = "Windows"; Action = $WindowsPlan }
+        )) {
+            try { $serialResults[$plan.Name] = [PSCustomObject]@{ Success = $true; Value = (& $plan.Action); Error = "" } }
+            catch {
+                [void]$serialErrors.Add("$($plan.Name) serial fallback failed: $($_.Exception.Message)")
+                $serialResults[$plan.Name] = [PSCustomObject]@{ Success = $false; Value = $null; Error = $_.Exception.Message }
+            }
+        }
+        return [PSCustomObject][ordered]@{
+            SchemaVersion = 1
+            Success = ($serialErrors.Count -eq 0)
+            Parallel = $false
+            OEM = $serialResults["OEM"]
+            Windows = $serialResults["Windows"]
+            Errors = @($serialErrors)
+            Reason = if ($serialErrors.Count -eq 0) {
+                "Parallel runspace setup was unavailable; read-only plans completed serially"
+            } else { $serialErrors -join "; " }
+        }
+    } finally {
+        foreach ($job in $jobs) {
+            try { $job.PowerShell.Dispose() } catch { }
+        }
+        if ($null -ne $pool) {
+            try { $pool.Close(); $pool.Dispose() } catch { }
+        }
+    }
+}
+
+function Invoke-ParallelOEMWindowsUpdatePlan {
+    param(
+        [Parameter(Mandatory = $true)][object]$SystemInfo,
+        [int]$MaxPasses = [int]$MaxUpdatePasses
+    )
+
+    $script:CurrentSystemInfo = $SystemInfo
+    $script:MaxUpdatePasses = $MaxPasses
+    $oemPlan = {
+        $sysInfo = $script:CurrentSystemInfo
+        $manufacturer = [string]$sysInfo.Manufacturer
+        $additional = Invoke-AdditionalOEMUpdate -SystemInfo $sysInfo -IncludeGPU
+        $result = $null
+        if ($manufacturer -match "DELL|ALIENWARE") {
+            $result = Invoke-DellUpdate -IncludeBIOS:$false -SystemInfo $sysInfo -FirmwarePrerequisites $script:FirmwarePrerequisites
+        } elseif ($manufacturer -match "LENOVO") {
+            $result = Invoke-LenovoUpdate -IncludeBIOS:$false -SystemInfo $sysInfo -FirmwarePrerequisites $script:FirmwarePrerequisites
+        } elseif ($manufacturer -match "HP|HEWLETT") {
+            $result = Invoke-HPUpdate -IncludeBIOS:$false -SystemInfo $sysInfo -FirmwarePrerequisites $script:FirmwarePrerequisites
+        } else {
+            $result = $additional
+        }
+        if ($null -ne $result -and $result -ne $additional -and @($additional.Items).Count -gt 0) {
+            $result.Items = @($result.Items) + @($additional.Items)
+            $result.Available = [int]$result.Available + [int]$additional.Available
+            $result.Attempted = [int]$result.Attempted + [int]$additional.Attempted
+            $result.Failed = [int]$result.Failed + [int]$additional.Failed
+            $result.Skipped = [int]$result.Skipped + [int]$additional.Skipped
+            $result.RebootRequired = [bool]$result.RebootRequired -or [bool]$additional.RebootRequired
+        }
+        [ordered]@{ Result = $result; ItemNames = @($result.Items | ForEach-Object { [string]$_.Name }) }
+    }
+    $windowsPlan = {
+        $result = Invoke-WindowsUpdate -MaxPasses $script:MaxUpdatePasses
+        [ordered]@{ Result = $result; ItemNames = @($result.Items | ForEach-Object { [string]$_.Name }) }
+    }
+    return Invoke-ParallelReadOnlyPlans -OEMPlan $oemPlan -WindowsPlan $windowsPlan
+}
+
+# ============================================================================
 # SYSTEM CHECKS
 # ============================================================================
 
@@ -13013,6 +13222,9 @@ $oemCapability = $null
 $windowsCapability = $null
 $servicingCapability = $null
 $wingetCapability = $null
+$parallelSafety = $null
+$parallelPlanUsed = $false
+$parallelPlan = $null
 
 if ($DryRun) {
     try { $script:DryRunMutationBaseline = Get-DryRunMutationSnapshot } catch { $script:DryRunMutationBaseline = $null }
@@ -13403,6 +13615,17 @@ try {
         Write-StageProgress -Stage "Preflight" -PercentComplete 25 -Status $preflightMessage
         Write-Host ""
 
+        $parallelSafety = Get-ParallelUpdateSafety `
+            -DryRunMode ([bool]$DryRun) -SkipOEMMode ([bool]$SkipOEM) `
+            -SkipWindowsMode ([bool]$SkipWindows) -IncludeFirmware ([bool]$IncludeBIOS) `
+            -Repair ([bool]$RepairWindowsUpdate) -Bypass ([bool]$BypassWSUS) `
+            -Cleanup ([bool]$CleanupAfter) -ResetBase ([bool]$ResetComponentBase) `
+            -Backup ([bool]$BackupDrivers) -Rollback ([bool]$RollbackDrivers) `
+            -PreStageMode ([bool]$PreStage) -ContinueMode ([bool]$ContinueAfterReboot)
+        if ($parallelSafety.Allowed) {
+            Write-Log "Read-only OEM and Windows Update planning will run concurrently" "INFO"
+        }
+
         if (-not $script:ContinuationActive) {
             $preHealthStart = Get-Date
             $script:PreHealthCheck = Invoke-SystemHealthCheck -Phase "PreRun" -TimeoutSeconds 120
@@ -13530,6 +13753,23 @@ try {
             if ($RollbackDrivers) {
                 [void](Add-StageResult (New-StageResult -Name "OEM" -Provider "OEM" -Status "Skipped" `
                     -Skipped 1 -Message "OEM updates skipped while -RollbackDrivers is active" -StartedAt $oemStart))
+            } elseif ($parallelSafety.Allowed -and [bool]$windowsCapability.Supported -and
+                ($null -eq $oemCapability -or [bool]$oemCapability.Supported)) {
+                $parallelPlan = Invoke-ParallelOEMWindowsUpdatePlan -SystemInfo $sysInfo -MaxPasses $MaxUpdatePasses
+                $parallelPlanUsed = $true
+                $parallelOEMValue = if ($null -ne $parallelPlan.OEM) { $parallelPlan.OEM.Value } else { $null }
+                $oemResult = if ($parallelPlan.Success -and $null -ne $parallelOEMValue) {
+                    $parallelOEMValue.Result
+                } else {
+                    @{ Success = $false; Failed = 1; Message = $parallelPlan.Reason; Evidence = @($parallelPlan.Errors) }
+                }
+                $parallelOEMItemNames = if ($null -ne $parallelOEMValue) {
+                    @($parallelOEMValue.ItemNames)
+                } else { @() }
+                $oemStage = ConvertTo-StageResult -Name "OEM" -Provider "Parallel OEM plan" `
+                    -Result $oemResult -ItemNames $parallelOEMItemNames -StartedAt $oemStart
+                [void](Add-StageResult $oemStage)
+                if ($oemStage.Status -in @("Failed", "Partial")) { $script:ExitCode = 2 }
             } elseif ($SkipOEM) {
                 [void](Add-StageResult (New-StageResult -Name "OEM" -Provider "OEM" -Status "Skipped" `
                     -Skipped 1 -Message "OEM updates skipped by -SkipOEM; remove -SkipOEM to request firmware or OEM drivers" `
@@ -13619,6 +13859,20 @@ try {
             if ($RollbackDrivers) {
                 [void](Add-StageResult (New-StageResult -Name "WindowsUpdate" -Provider "Windows Update" `
                     -Status "Skipped" -Skipped 1 -Message "Windows Update skipped while -RollbackDrivers is active" -StartedAt $windowsStart))
+            } elseif ($parallelPlanUsed) {
+                $parallelWindowsValue = if ($null -ne $parallelPlan.Windows) { $parallelPlan.Windows.Value } else { $null }
+                $wuResult = if ($parallelPlan.Success -and $null -ne $parallelWindowsValue) {
+                    $parallelWindowsValue.Result
+                } else {
+                    @{ Success = $false; Failed = 1; Message = $parallelPlan.Reason; Evidence = @($parallelPlan.Errors) }
+                }
+                $parallelWindowsItemNames = if ($null -ne $parallelWindowsValue) {
+                    @($parallelWindowsValue.ItemNames)
+                } else { @() }
+                $wuStage = ConvertTo-StageResult -Name "WindowsUpdate" -Provider "Parallel Windows Update plan" `
+                    -Result $wuResult -ItemNames $parallelWindowsItemNames -StartedAt $windowsStart
+                [void](Add-StageResult $wuStage)
+                if ($wuStage.Status -in @("Failed", "Partial")) { $script:ExitCode = 2 }
             } elseif ($SkipWindows) {
                 [void](Add-StageResult (New-StageResult -Name "WindowsUpdate" -Provider "Windows Update" `
                     -Status "Skipped" -Skipped 1 -Message "Windows Update skipped by run configuration" -StartedAt $windowsStart))

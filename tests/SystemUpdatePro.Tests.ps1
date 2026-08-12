@@ -136,6 +136,9 @@ BeforeAll {
         "Invoke-DriverBackup",
         "Invoke-SystemHealthCheck",
         "Compare-SystemHealthRegression",
+        "Get-ParallelUpdateSafety",
+        "Invoke-ParallelReadOnlyPlans",
+        "Invoke-ParallelOEMWindowsUpdatePlan",
         "Get-WingetScopePlan",
         "ConvertFrom-WingetPackageOutput",
         "Get-WingetScopeInventory",
@@ -2668,6 +2671,46 @@ Describe "System health checks" {
 
         (Compare-SystemHealthRegression -Before @{ Status = "Degraded" } -After @{ Status = "Degraded" }).Regressed |
             Should -BeFalse
+    }
+}
+
+Describe "Parallel read-only planning" {
+    BeforeEach {
+        Initialize-SystemUpdateProTestState
+    }
+
+    It "allows concurrency only for a dry-run with no mutating gates" {
+        $safe = Get-ParallelUpdateSafety -DryRunMode $true -SkipOEMMode $false -SkipWindowsMode $false `
+            -IncludeFirmware $false -Repair $false -Bypass $false -Cleanup $false -ResetBase $false `
+            -Backup $false -Rollback $false -PreStageMode $false -ContinueMode $false
+        $safe.Allowed | Should -BeTrue
+        (Get-ParallelUpdateSafety -DryRunMode $false -SkipOEMMode $false -SkipWindowsMode $false).Allowed |
+            Should -BeFalse
+        (Get-ParallelUpdateSafety -DryRunMode $true -SkipOEMMode $false -SkipWindowsMode $false -Repair $true).Reason |
+            Should -Match "serial"
+    }
+
+    It "runs independent read-only plan scriptblocks concurrently" {
+        $result = Invoke-ParallelReadOnlyPlans `
+            -OEMPlan { [ordered]@{ Name = "OEM"; Success = $true } } `
+            -WindowsPlan { [ordered]@{ Name = "Windows"; Success = $true } }
+
+        $result.Success | Should -BeTrue
+        $result.OEM.Value.Name | Should -Be "OEM"
+        $result.Windows.Value.Name | Should -Be "Windows"
+    }
+
+    It "builds the OEM and Windows plan pair through the parallel executor" {
+        Mock Invoke-ParallelReadOnlyPlans {
+            [PSCustomObject]@{ Success = $true; Parallel = $true; Reason = "mocked" }
+        }
+
+        $result = Invoke-ParallelOEMWindowsUpdatePlan -SystemInfo @{ Manufacturer = "Test" } -MaxPasses 1
+
+        $result.Success | Should -BeTrue
+        Should -Invoke Invoke-ParallelReadOnlyPlans -Times 1 -Exactly -ParameterFilter {
+            $null -ne $OEMPlan -and $null -ne $WindowsPlan
+        }
     }
 }
 

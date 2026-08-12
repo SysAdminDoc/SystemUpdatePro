@@ -55,6 +55,7 @@ SystemUpdatePro is a fully automated, self-healing PowerShell script that handle
 - **Execution Controls**: Honors protected or Intune-detected maintenance windows, records deterministic cluster reboot coordination, temporarily selects High performance power mode and restores the original scheme, and exposes stage progress
 - **Dry-Run Contract**: Tracks Windows Update policy, WSUS, pre-stage, lock, and power-plan state before and after preview runs and fails closed if any tracked persistent state changes
 - **Servicing Health Gates**: Records bounded CBS.log evidence plus DISM `/CheckHealth` and SFC `/verifyonly` before and after work; only a healthy-to-degraded transition fails the run
+- **Safe Parallel Planning**: In dry-run mode, independent OEM and Windows Update discovery plans use isolated runspaces concurrently; any mutation, firmware, rollback, or continuation request automatically returns to serial execution
 
 ### Enterprise Integration
 - **Event Log**: Writes to Windows Application log for RMM/SIEM visibility
