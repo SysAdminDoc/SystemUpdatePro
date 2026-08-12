@@ -118,6 +118,17 @@ BeforeAll {
         "Get-DownloadPolicy",
         "Test-DownloadAllowed",
         "Get-PolicyDocument",
+        "Get-MaintenanceWindowPolicy",
+        "Test-MaintenanceWindow",
+        "Get-StaggeredRebootDecision",
+        "Save-StaggeredRebootLease",
+        "Get-PowerPlanState",
+        "Set-HighPerformancePowerPlan",
+        "Restore-PowerPlan",
+        "Get-DryRunMutationSnapshot",
+        "Compare-DryRunMutationSnapshot",
+        "Get-ConsoleColorCapability",
+        "Write-StageProgress",
         "Get-WingetScopePlan",
         "ConvertFrom-WingetPackageOutput",
         "Get-WingetScopeInventory",
@@ -260,7 +271,7 @@ BeforeAll {
         $script:OEMUpdates = [System.Collections.ArrayList]::new()
         $script:WindowsUpdates = [System.Collections.ArrayList]::new()
         $script:WingetUpdates = [System.Collections.ArrayList]::new()
-        $script:StateSchemaVersion = 6
+        $script:StateSchemaVersion = 7
         $script:MaxContinuationAttempts = 3
         $script:RunStartedAt = Get-Date
         $stateTestDirectory = Join-Path $TestDrive ([guid]::NewGuid().ToString("N"))
@@ -287,6 +298,7 @@ BeforeAll {
         $script:FeatureDeferralDays = 0
         $script:SecurityOnly = $false
         $script:PreStage = $false
+        $script:Interactive = $false
         $script:DependencyReadiness = $null
         $script:DownloadPolicy = $null
         $script:CurrentSystemInfo = $null
@@ -634,6 +646,57 @@ Describe "Windows Update policy and package-manager planning" {
         $availability.Name | Should -Contain "Chocolatey"
         $availability.Name | Should -Contain "Scoop"
         $availability.Status | Should -Not -Contain "Installed"
+    }
+
+    It "blocks outside a configured overnight maintenance window" {
+        $policy = [PSCustomObject]@{
+            Enabled = $true; Start = "22:00"; End = "06:00"; Days = @(); Source = "Policy"
+            Reason = "test"; IntuneDetected = $false
+        }
+
+        (Test-MaintenanceWindow -Policy $policy -Now ([datetime]"2026-08-12 23:00")).Allowed | Should -BeTrue
+        (Test-MaintenanceWindow -Policy $policy -Now ([datetime]"2026-08-12 12:00")).Allowed | Should -BeFalse
+    }
+
+    It "records a deterministic cluster reboot decision without persisting a dry-run lease" {
+        $policy = [ordered]@{ enabled = $true; group = "web"; max_concurrent = 2 }
+        $decision = Get-StaggeredRebootDecision -Policy $policy -DeviceIdentity "node-01"
+        $lease = Save-StaggeredRebootLease -Decision $decision -DryRunMode $true
+
+        $decision.Enabled | Should -BeTrue
+        $decision.MaxConcurrent | Should -Be 2
+        $lease.Success | Should -BeTrue
+        $lease.Persisted | Should -BeFalse
+    }
+
+    It "restores an unchanged power plan without invoking powercfg in dry run" {
+        $script:DryRun = [switch]$true
+        Mock Get-PowerPlanState {
+            [PSCustomObject]@{ Success = $true; ActiveScheme = "00000000-0000-0000-0000-000000000000"; ActiveName = "Balanced"; Reason = "test" }
+        }
+        Mock Start-Process { [PSCustomObject]@{ ExitCode = 0 } }
+
+        $state = Set-HighPerformancePowerPlan -DryRunMode $true
+        $restore = Restore-PowerPlan -State $state -DryRunMode $true
+
+        $state.Changed | Should -BeTrue
+        $restore.Success | Should -BeTrue
+        Should -Invoke Start-Process -Times 0 -Exactly
+    }
+
+    It "detects tracked dry-run mutations by content rather than timestamps" {
+        $before = [PSCustomObject]@{
+            Files = [ordered]@{ "state.json" = [ordered]@{ Exists = $false; Length = 0; Hash = "" } }
+            Registry = @([ordered]@{ Path = "HKLM:\test"; Name = "Value"; Exists = $false })
+        }
+        $after = [PSCustomObject]@{
+            Files = [ordered]@{ "state.json" = [ordered]@{ Exists = $true; Length = 4; Hash = "ABCD" } }
+            Registry = @([ordered]@{ Path = "HKLM:\test"; Name = "Value"; Exists = $false })
+        }
+
+        $comparison = Compare-DryRunMutationSnapshot -Before $before -After $after
+        $comparison.Changed | Should -BeTrue
+        $comparison.Changes | Should -Contain "file:state.json"
     }
 }
 
@@ -1125,7 +1188,7 @@ Describe "Protected local evidence store" {
             Should -Be 1
     }
 
-    It "migrates a v3 continuation state through v6 with evidence and secret-source defaults" {
+    It "migrates a v3 continuation state through v7 with evidence and secret-source defaults" {
         $legacy = New-ContinuationState -StageCursor "WindowsUpdate" `
             -ScriptPath $script:SourceScriptPath
         $legacy.SchemaVersion = 3
@@ -1138,14 +1201,14 @@ Describe "Protected local evidence store" {
 
         $loaded = Get-State
 
-        $loaded.SchemaVersion | Should -Be 6
+        $loaded.SchemaVersion | Should -Be 7
         $loaded.Parameters.EvidenceMaxSizeMB | Should -Be 512
         $loaded.Parameters.RedactionMode | Should -Be "SecretsAndSerials"
         $loaded.Parameters.WebhookSecretReference | Should -Be ""
         $loaded.ResolvedWebhookUrl | Should -Be "https://example.invalid/legacy-secret"
         $loaded.Contains("_MigrationSourceSchema") | Should -BeFalse
         ((Get-Content -LiteralPath $script:StateFile -Raw | ConvertFrom-Json).SchemaVersion) |
-            Should -Be 6
+            Should -Be 7
     }
 
     It "migrates and redacts legacy history without leaving sensitive backup data" {
@@ -1638,10 +1701,10 @@ Describe "PowerShell 5.1 continuation state machine" {
         if (-not $secondSave) { throw "Second atomic save failed: $script:LastStateError" }
         $loaded = Get-State
 
-        $loaded.SchemaVersion | Should -Be 6
+        $loaded.SchemaVersion | Should -Be 7
         $loaded.Phase | Should -Be "AwaitingReboot"
         $loaded.RunId | Should -Be "11111111-1111-1111-1111-111111111111"
-        $loaded.Parameters.Count | Should -Be 33
+        $loaded.Parameters.Count | Should -Be 34
         $loaded.AcquisitionProvenance.Count | Should -Be 1
         $loaded.AcquisitionProvenance[0].Name | Should -Be "LSUClient"
         $loaded.Parameters.SkipOEM | Should -BeTrue

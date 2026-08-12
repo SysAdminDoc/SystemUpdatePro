@@ -99,6 +99,8 @@
     Only apply updates classified as critical or security updates
 .PARAMETER PreStage
     Download approved Windows Updates and persist an install plan for a later run
+.PARAMETER Interactive
+    Ask for confirmation before requesting an automatic reboot
 .EXAMPLE
     .\SystemUpdatePro.ps1
     # Standard update: OEM + Windows + Winget
@@ -246,7 +248,8 @@ param(
     [ValidateRange(0, 3650)]
     [int]$FeatureDeferralDays = 0,
     [switch]$SecurityOnly,
-    [switch]$PreStage
+    [switch]$PreStage,
+    [switch]$Interactive
 )
 
 # ============================================================================
@@ -266,6 +269,7 @@ $script:RolloutPolicyPath = [string]$RolloutPolicyPath
 $script:FeatureDeferralDays = [int]$FeatureDeferralDays
 $script:SecurityOnly = [bool]$SecurityOnly
 $script:PreStage = [bool]$PreStage
+$script:Interactive = [bool]$Interactive
 $script:DependencyReadiness = $null
 $script:DownloadPolicy = $null
 $script:CurrentSystemInfo = $null
@@ -274,12 +278,15 @@ $script:RolloutDecision = $null
 $script:PackagePolicy = $null
 $script:RolloutPolicy = $null
 $script:WindowsUpdatePolicy = $null
+$script:MaintenanceDecision = $null
+$script:PowerPlanState = $null
+$script:DryRunMutationBaseline = $null
 $script:MaxRetries = [int]$MaxRetries
 $script:EvidenceMaxSizeMB = [int]$EvidenceMaxSizeMB
 $script:RedactionMode = [string]$RedactionMode
 $script:EventLogSource = "SystemUpdatePro"
 $script:ResultSchemaVersion = 1
-$script:StateSchemaVersion = 6
+$script:StateSchemaVersion = 7
 $script:CapabilitySchemaVersion = 1
 $script:HistorySchemaVersion = 2
 $script:LockSchemaVersion = 1
@@ -1515,6 +1522,8 @@ function New-RunData {
         WingetScopes     = @($script:WingetScopeResults)
         RolloutDecision  = $script:RolloutDecision
         WindowsUpdatePolicy = $script:WindowsUpdatePolicy
+        MaintenanceDecision = $script:MaintenanceDecision
+        PowerPlanState = $script:PowerPlanState
         EvidenceDelivery = @{}
     }
 }
@@ -1651,6 +1660,7 @@ function Get-EffectiveRunParameter {
         FeatureDeferralDays = [int]$FeatureDeferralDays
         SecurityOnly        = $SecurityOnly.IsPresent
         PreStage            = $PreStage.IsPresent
+        Interactive         = $Interactive.IsPresent
     }
 }
 
@@ -1662,7 +1672,7 @@ function Get-ContinuationParameterName {
         "MaxUpdatePasses", "MinDiskSpaceGB", "MinFirmwareChargePercent", "LogPath",
         "LogRetentionDays", "EvidenceMaxSizeMB", "RedactionMode", "Reboot", "Force",
         "Offline", "DependencyCachePath", "SourceTimeoutSeconds", "AllowMeteredNetwork",
-        "PolicyPath", "RolloutPolicyPath", "FeatureDeferralDays", "SecurityOnly", "PreStage"
+        "PolicyPath", "RolloutPolicyPath", "FeatureDeferralDays", "SecurityOnly", "PreStage", "Interactive"
     )
 }
 
@@ -1729,6 +1739,14 @@ function Convert-ContinuationStateSchema {
             $migrated.Parameters["PreStage"] = $false
         }
         $migrated["SchemaVersion"] = 6
+        $schemaVersion = 6
+        $migrated["_MigrationSourceSchema"] = $migrationSourceSchema
+    }
+    if ($schemaVersion -eq 6 -and $migrated.Parameters -is [System.Collections.IDictionary]) {
+        if (-not $migrated.Parameters.Contains("Interactive")) {
+            $migrated.Parameters["Interactive"] = $false
+        }
+        $migrated["SchemaVersion"] = 7
         $migrated["_MigrationSourceSchema"] = $migrationSourceSchema
     }
     return $migrated
@@ -1896,6 +1914,8 @@ function New-ContinuationState {
         WingetScopes = @($script:WingetScopeResults)
         RolloutDecision = $script:RolloutDecision
         WindowsUpdatePolicy = $script:WindowsUpdatePolicy
+        MaintenanceDecision = $script:MaintenanceDecision
+        PowerPlanState = $script:PowerPlanState
         Errors         = @($script:Errors)
         Warnings       = @($script:Warnings)
     }
@@ -1917,7 +1937,7 @@ function Import-ContinuationState {
     $switchNames = @(
         "SkipOEM", "SkipWindows", "SkipWinget", "IncludeBIOS", "BypassWSUS",
         "RepairWindowsUpdate", "CleanupAfter", "ResetComponentBase", "ContinueAfterReboot", "DryRun",
-        "BackupDrivers", "ShowHistory", "Reboot", "Force", "SecurityOnly", "PreStage"
+        "BackupDrivers", "ShowHistory", "Reboot", "Force", "SecurityOnly", "PreStage", "Interactive"
     )
     $integerNames = @(
         "HistoryCount", "MaxRetries", "MaxUpdatePasses", "MinDiskSpaceGB",
@@ -1977,6 +1997,12 @@ function Import-ContinuationState {
     $script:WindowsUpdatePolicy = if ($State.Contains("WindowsUpdatePolicy")) {
         ConvertTo-Hashtable -InputObject $State.WindowsUpdatePolicy
     } else { $null }
+    $script:MaintenanceDecision = if ($State.Contains("MaintenanceDecision")) {
+        ConvertTo-Hashtable -InputObject $State.MaintenanceDecision
+    } else { $null }
+    $script:PowerPlanState = if ($State.Contains("PowerPlanState")) {
+        ConvertTo-Hashtable -InputObject $State.PowerPlanState
+    } else { $null }
     $script:AcquisitionProvenance = [System.Collections.ArrayList]::new()
     foreach ($dependency in @($State.AcquisitionProvenance)) {
         [void]$script:AcquisitionProvenance.Add([PSCustomObject]$dependency)
@@ -2020,6 +2046,8 @@ function Set-ContinuationCursor {
     $script:ContinuationState.WingetScopes = @($script:WingetScopeResults)
     $script:ContinuationState.RolloutDecision = $script:RolloutDecision
     $script:ContinuationState.WindowsUpdatePolicy = $script:WindowsUpdatePolicy
+    $script:ContinuationState.MaintenanceDecision = $script:MaintenanceDecision
+    $script:ContinuationState.PowerPlanState = $script:PowerPlanState
     $script:ContinuationState.Errors = @($script:Errors)
     $script:ContinuationState.Warnings = @($script:Warnings)
     $script:ContinuationState.Parameters = Get-EffectiveRunParameter
@@ -2934,6 +2962,8 @@ function Save-UpdateHistory {
             winget_scopes     = @($RunData.WingetScopes)
             rollout_decision  = $RunData.RolloutDecision
             windows_update_policy = $RunData.WindowsUpdatePolicy
+            maintenance_decision = $RunData.MaintenanceDecision
+            power_plan_state = $RunData.PowerPlanState
             evidence_delivery = $RunData.EvidenceDelivery
             parameters        = Protect-EvidenceObject -InputObject (
                 Get-EffectiveRunParameter
@@ -3031,10 +3061,6 @@ function Invoke-DriverBackup {
     Write-Log "Backing up current drivers to: $backupDir" "STEP"
 
     try {
-        if (-not (New-ProtectedDirectory -Path $backupDir)) {
-            throw "Driver backup directory could not be protected"
-        }
-
         if ($DryRun) {
             Write-Log "Would export drivers via Export-WindowsDriver to $backupDir" "INFO"
             # Count installed third-party drivers for dry-run info
@@ -3045,6 +3071,10 @@ function Invoke-DriverBackup {
                 Write-Log "Driver enumeration not available in this context" "DEBUG"
             }
             return $backupDir
+        }
+
+        if (-not (New-ProtectedDirectory -Path $backupDir)) {
+            throw "Driver backup directory could not be protected"
         }
 
         Export-WindowsDriver -Online -Destination $backupDir -ErrorAction Stop | Out-Null
@@ -3068,6 +3098,316 @@ function Invoke-DriverBackup {
 # ============================================================================
 # SYSTEM CHECKS
 # ============================================================================
+
+function Get-MaintenanceWindowPolicy {
+    param([string]$Path = [string]$script:PolicyPath)
+
+    $policy = [ordered]@{
+        SchemaVersion = 1; Enabled = $false; Start = ""; End = ""; Days = @()
+        Source = "NotConfigured"; Reason = "No maintenance window is configured"
+        IntuneDetected = $false
+    }
+    try {
+        $document = Get-PolicyDocument -Path $Path
+        $window = if ($document.Contains("maintenance_window") -and
+            $document.maintenance_window -is [System.Collections.IDictionary]) {
+            $document.maintenance_window
+        } else { $null }
+        if ($null -ne $window) {
+            $policy.Enabled = if ($window.Contains("enabled")) { [bool]$window.enabled } else { $true }
+            $policy.Start = [string](Get-ResultValue -Result $window -Names @("start", "Start") -Default "")
+            $policy.End = [string](Get-ResultValue -Result $window -Names @("end", "End") -Default "")
+            $policy.Days = @($window.days | ForEach-Object { [string]$_ })
+            $policy.Source = "Policy"
+            $policy.Reason = "Protected maintenance-window policy"
+            return [PSCustomObject]$policy
+        }
+    } catch {
+        $policy.Source = "PolicyError"
+        $policy.Reason = Protect-EvidenceText -Text $_.Exception.Message
+        return [PSCustomObject]$policy
+    }
+
+    foreach ($registryPath in @(
+        "HKLM:\SOFTWARE\Microsoft\PolicyManager\current\device\Update",
+        "HKLM:\SOFTWARE\Microsoft\PolicyManager\current\device\UpdateSchedule",
+        "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate"
+    )) {
+        try {
+            if (-not (Test-Path -LiteralPath $registryPath)) { continue }
+            $values = Get-ItemProperty -LiteralPath $registryPath -ErrorAction SilentlyContinue
+            $start = Get-ResultValue -Result $values -Names @("MaintenanceWindowStart", "ActiveHoursStart", "UpdateWindowStart") -Default $null
+            $end = Get-ResultValue -Result $values -Names @("MaintenanceWindowEnd", "ActiveHoursEnd", "UpdateWindowEnd") -Default $null
+            if ($null -ne $start -and $null -ne $end) {
+                $policy.Enabled = $true
+                $policy.Start = [string]$start
+                $policy.End = [string]$end
+                $policy.Source = "Intune"
+                $policy.IntuneDetected = $true
+                $policy.Reason = "Maintenance window detected from $registryPath"
+                return [PSCustomObject]$policy
+            }
+        } catch { continue }
+    }
+    return [PSCustomObject]$policy
+}
+
+function Test-MaintenanceWindow {
+    param(
+        [AllowNull()][object]$Policy = $null,
+        [datetime]$Now = (Get-Date)
+    )
+
+    if ($null -eq $Policy) { $Policy = Get-MaintenanceWindowPolicy }
+    if (-not [bool]$Policy.Enabled) {
+        return [PSCustomObject][ordered]@{
+            SchemaVersion = 1; Allowed = $true; Status = "NotConfigured"; Source = [string]$Policy.Source
+            Reason = [string]$Policy.Reason; EvaluatedAt = $Now.ToString("o"); NextWindow = ""
+        }
+    }
+    $start = [TimeSpan]::Zero
+    $end = [TimeSpan]::Zero
+    if (-not [TimeSpan]::TryParse([string]$Policy.Start, [ref]$start) -or
+        -not [TimeSpan]::TryParse([string]$Policy.End, [ref]$end)) {
+        return [PSCustomObject][ordered]@{
+            SchemaVersion = 1; Allowed = $false; Status = "Unknown"; Source = [string]$Policy.Source
+            Reason = "Maintenance window start/end is invalid"; EvaluatedAt = $Now.ToString("o"); NextWindow = ""
+        }
+    }
+    $days = @($Policy.Days | ForEach-Object { [string]$_ } | Where-Object { $_ })
+    $dayAllowed = $days.Count -eq 0 -or @($days | Where-Object {
+        $_ -eq $Now.DayOfWeek.ToString() -or $_ -eq ([int]$Now.DayOfWeek).ToString()
+    }).Count -gt 0
+    $current = $Now.TimeOfDay
+    $timeAllowed = if ($start -eq $end) { $true } elseif ($start -lt $end) {
+        $current -ge $start -and $current -lt $end
+    } else {
+        $current -ge $start -or $current -lt $end
+    }
+    if ($dayAllowed -and $timeAllowed) {
+        return [PSCustomObject][ordered]@{
+            SchemaVersion = 1; Allowed = $true; Status = "Allowed"; Source = [string]$Policy.Source
+            Reason = "Current time is inside the configured maintenance window"
+            EvaluatedAt = $Now.ToString("o"); NextWindow = ""
+        }
+    }
+    $next = $Now.Date.AddDays(1).Add($start)
+    if ($dayAllowed -and $start -gt $current) { $next = $Now.Date.Add($start) }
+    return [PSCustomObject][ordered]@{
+        SchemaVersion = 1; Allowed = $false; Status = "Blocked"; Source = [string]$Policy.Source
+        Reason = "Current time is outside the configured maintenance window"
+        EvaluatedAt = $Now.ToString("o"); NextWindow = $next.ToString("o")
+    }
+}
+
+function Get-StaggeredRebootDecision {
+    param(
+        [AllowNull()][object]$Policy = $null,
+        [string]$DeviceIdentity = [string]$env:COMPUTERNAME,
+        [datetime]$Now = (Get-Date)
+    )
+
+    if ($null -eq $Policy) {
+        try {
+            $document = Get-PolicyDocument -Path ([string]$script:PolicyPath)
+            $Policy = if ($document.Contains("cluster") -and $document.cluster -is [System.Collections.IDictionary]) {
+                $document.cluster
+            } elseif ($document.Contains("cluster_reboot") -and $document.cluster_reboot -is [System.Collections.IDictionary]) {
+                $document.cluster_reboot
+            } else { $null }
+        } catch { $Policy = $null }
+    }
+    if ($null -eq $Policy -or (-not $Policy.Contains("enabled") -and -not $Policy.Contains("max_concurrent"))) {
+        return [PSCustomObject][ordered]@{
+            SchemaVersion = 1; Enabled = $false; Allowed = $true; Status = "NotConfigured"
+            Group = ""; Slot = 0; MaxConcurrent = 0; ActiveLeases = 0; Reason = "Cluster reboot coordination is not configured"
+            NextEligibleAt = ""; LeasePath = ""
+        }
+    }
+    $enabled = if ($Policy.Contains("enabled")) { [bool]$Policy.enabled } else { $true }
+    if (-not $enabled) {
+        return [PSCustomObject][ordered]@{ SchemaVersion = 1; Enabled = $false; Allowed = $true; Status = "Disabled"; Group = ""; Slot = 0; MaxConcurrent = 0; ActiveLeases = 0; Reason = "Cluster reboot coordination is disabled"; NextEligibleAt = ""; LeasePath = "" }
+    }
+    $group = [string](Get-ResultValue -Result $Policy -Names @("group", "Group") -Default "default")
+    $maxConcurrent = 1
+    [void][int]::TryParse([string](Get-ResultValue -Result $Policy -Names @("max_concurrent", "MaxConcurrent") -Default 1), [ref]$maxConcurrent)
+    $maxConcurrent = [math]::Max(1, [math]::Min(1000, $maxConcurrent))
+    $cohort = Get-EndpointCohort -DeviceIdentity "$group|$DeviceIdentity" -Cohort "cluster"
+    $slot = [int]$cohort % $maxConcurrent
+    $leasePath = [string](Get-ResultValue -Result $Policy -Names @("coordination_path", "CoordinationPath") -Default "")
+    $activeLeases = @()
+    if (-not [string]::IsNullOrWhiteSpace($leasePath) -and (Test-Path -LiteralPath $leasePath -PathType Leaf)) {
+        try {
+            $activeLeases = @((Get-Content -LiteralPath $leasePath -Raw | ConvertFrom-Json -ErrorAction Stop).Leases | Where-Object {
+                $expires = [datetime]::MinValue
+                [datetime]::TryParse([string]$_.ExpiresAt, [ref]$expires) -and $expires -gt $Now
+            })
+        } catch { $activeLeases = @() }
+    }
+    if ($activeLeases.Count -ge $maxConcurrent) {
+        return [PSCustomObject][ordered]@{
+            SchemaVersion = 1; Enabled = $true; Allowed = $false; Status = "Blocked"
+            Group = $group; Slot = $slot; MaxConcurrent = $maxConcurrent; ActiveLeases = $activeLeases.Count
+            Reason = "Cluster reboot concurrency limit is already in use"
+            NextEligibleAt = $Now.AddMinutes(5).ToString("o"); LeasePath = $leasePath
+        }
+    }
+    return [PSCustomObject][ordered]@{
+        SchemaVersion = 1; Enabled = $true; Allowed = $true; Status = "Allowed"
+        Group = $group; Slot = $slot; MaxConcurrent = $maxConcurrent; ActiveLeases = $activeLeases.Count
+        Reason = "Cluster reboot slot is available"; NextEligibleAt = ""; LeasePath = $leasePath
+    }
+}
+
+function Save-StaggeredRebootLease {
+    param(
+        [Parameter(Mandatory = $true)][object]$Decision,
+        [int]$LeaseMinutes = 30,
+        [bool]$DryRunMode = [bool]$script:DryRun
+    )
+    if (-not [bool]$Decision.Enabled -or [string]$Decision.Status -eq "NotConfigured") {
+        return [PSCustomObject]@{ Success = $true; Persisted = $false; Path = ""; Reason = "Coordination is not configured" }
+    }
+    if (-not [bool]$Decision.Allowed) {
+        return [PSCustomObject]@{ Success = $false; Persisted = $false; Path = [string]$Decision.LeasePath; Reason = [string]$Decision.Reason }
+    }
+    if ($DryRunMode -or [string]::IsNullOrWhiteSpace([string]$Decision.LeasePath)) {
+        return [PSCustomObject]@{ Success = $true; Persisted = $false; Path = [string]$Decision.LeasePath; Reason = "Dry run or no shared lease path; reboot decision was recorded in memory" }
+    }
+    try {
+        $directory = Split-Path -Parent ([string]$Decision.LeasePath)
+        if (-not (New-ProtectedDirectory -Path $directory)) { throw "Cluster lease directory could not be protected" }
+        $leases = @()
+        if (Test-Path -LiteralPath $Decision.LeasePath -PathType Leaf) {
+            try { $leases = @((Get-Content -LiteralPath $Decision.LeasePath -Raw | ConvertFrom-Json -ErrorAction Stop).Leases) } catch { $leases = @() }
+        }
+        $now = (Get-Date).ToUniversalTime()
+        $leases = @($leases | Where-Object {
+            $expires = [datetime]::MinValue
+            [datetime]::TryParse([string]$_.ExpiresAt, [ref]$expires) -and $expires.ToUniversalTime() -gt $now
+        })
+        $leases += [ordered]@{ RunId = [string]$script:RunId; ComputerName = [string]$env:COMPUTERNAME; ExpiresAt = $now.AddMinutes([math]::Max(1, $LeaseMinutes)).ToString("o") }
+        $document = [ordered]@{ SchemaVersion = 1; Group = [string]$Decision.Group; Leases = @($leases) }
+        if (-not (Write-ProtectedAtomicJson -Path ([string]$Decision.LeasePath) -Data $document -Depth 12)) { throw $script:LastEvidenceWriteError }
+        return [PSCustomObject]@{ Success = $true; Persisted = $true; Path = [string]$Decision.LeasePath; Reason = "Cluster reboot lease persisted" }
+    } catch {
+        return [PSCustomObject]@{ Success = $false; Persisted = $false; Path = [string]$Decision.LeasePath; Reason = "Cluster reboot lease failed: $($_.Exception.Message)" }
+    }
+}
+
+function Get-PowerPlanState {
+    $result = [ordered]@{ SchemaVersion = 1; Success = $false; ActiveScheme = ""; ActiveName = ""; Reason = "" }
+    try {
+        $output = @(& powercfg.exe /getactivescheme 2>&1)
+        $line = (@($output) | Where-Object { [string]$_ -match "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}" } | Select-Object -First 1)
+        if ($line -match "(?<Guid>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\s*\((?<Name>[^\)]+)\)") {
+            $result.ActiveScheme = $Matches.Guid
+            $result.ActiveName = $Matches.Name
+            $result.Success = $true
+            $result.Reason = "Active power scheme detected"
+        } else { $result.Reason = "powercfg did not return an active scheme" }
+    } catch { $result.Reason = "Power scheme query failed: $($_.Exception.Message)" }
+    return [PSCustomObject]$result
+}
+
+function Set-HighPerformancePowerPlan {
+    param([bool]$DryRunMode = [bool]$script:DryRun)
+    $previous = Get-PowerPlanState
+    $highPerformanceGuid = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"
+    $result = [ordered]@{
+        SchemaVersion = 1; Success = $previous.Success; Changed = $false; DryRun = $DryRunMode
+        PreviousScheme = [string]$previous.ActiveScheme; AppliedScheme = $highPerformanceGuid; Reason = [string]$previous.Reason
+    }
+    if (-not $previous.Success) { return [PSCustomObject]$result }
+    if ($previous.ActiveScheme -eq $highPerformanceGuid) {
+        $result.Reason = "High performance power scheme is already active"
+        return [PSCustomObject]$result
+    }
+    $result.Changed = $true
+    if ($DryRunMode) { $result.Reason = "Would temporarily activate the High performance power scheme"; return [PSCustomObject]$result }
+    try {
+        $process = Start-Process -FilePath "powercfg.exe" -ArgumentList @("/setactive", $highPerformanceGuid) `
+            -Wait -NoNewWindow -PassThru -ErrorAction Stop
+        $result.Success = ($process.ExitCode -eq 0)
+        $result.Reason = if ($result.Success) { "High performance power scheme activated" } else { "powercfg /setactive exited with $($process.ExitCode)" }
+    } catch {
+        $result.Success = $false; $result.Reason = "Power scheme activation failed: $($_.Exception.Message)"
+    }
+    return [PSCustomObject]$result
+}
+
+function Restore-PowerPlan {
+    param(
+        [AllowNull()][object]$State = $script:PowerPlanState,
+        [bool]$DryRunMode = [bool]$script:DryRun
+    )
+    if ($null -eq $State -or -not [bool]$State.Changed -or [string]::IsNullOrWhiteSpace([string]$State.PreviousScheme)) {
+        return [PSCustomObject]@{ Success = $true; Restored = $false; Reason = "No temporary power-plan change requires restoration" }
+    }
+    if ($DryRunMode) {
+        return [PSCustomObject]@{ Success = $true; Restored = $false; Reason = "Dry run did not change the power plan" }
+    }
+    try {
+        $process = Start-Process -FilePath "powercfg.exe" -ArgumentList @("/setactive", [string]$State.PreviousScheme) `
+            -Wait -NoNewWindow -PassThru -ErrorAction Stop
+        return [PSCustomObject]@{ Success = ($process.ExitCode -eq 0); Restored = ($process.ExitCode -eq 0); Reason = if ($process.ExitCode -eq 0) { "Original power scheme restored" } else { "powercfg restore exited with $($process.ExitCode)" } }
+    } catch {
+        return [PSCustomObject]@{ Success = $false; Restored = $false; Reason = "Power scheme restoration failed: $($_.Exception.Message)" }
+    }
+}
+
+function Get-DryRunMutationSnapshot {
+    $files = [ordered]@{}
+    foreach ($path in @($script:StateFile, $script:LockFile, (Join-Path $script:DataPath "WindowsUpdatePrestage.json"), (Join-Path $script:DataPath "WindowsPolicySnapshot.json"))) {
+        $key = [string]$path
+        if (Test-Path -LiteralPath $path -PathType Leaf) {
+            try { $files[$key] = [ordered]@{ Exists = $true; Length = [long](Get-Item -LiteralPath $path).Length; Hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash } } catch { $files[$key] = [ordered]@{ Exists = $true; Length = -1; Hash = "error" } }
+        } else { $files[$key] = [ordered]@{ Exists = $false; Length = 0; Hash = "" } }
+    }
+    $registry = @()
+    foreach ($target in @(
+        @{ Path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU"; Name = "UseWUServer" }
+    )) {
+        try { $registry += Get-RegistryValueSnapshot -Path $target.Path -Name $target.Name } catch { $registry += [ordered]@{ Path = $target.Path; Name = $target.Name; Exists = $false; Error = $_.Exception.Message } }
+    }
+    return [PSCustomObject][ordered]@{ SchemaVersion = 1; Files = $files; Registry = @($registry) }
+}
+
+function Compare-DryRunMutationSnapshot {
+    param(
+        [Parameter(Mandatory = $true)][object]$Before,
+        [Parameter(Mandatory = $true)][object]$After
+    )
+    $changes = [System.Collections.ArrayList]::new()
+    foreach ($path in @($Before.Files.Keys)) {
+        $beforeJson = ($Before.Files[$path] | ConvertTo-Json -Depth 8 -Compress)
+        $afterJson = ($After.Files[$path] | ConvertTo-Json -Depth 8 -Compress)
+        if ($beforeJson -ne $afterJson) { [void]$changes.Add("file:$path") }
+    }
+    $beforeRegistry = @($Before.Registry | ConvertTo-Json -Depth 12 -Compress)
+    $afterRegistry = @($After.Registry | ConvertTo-Json -Depth 12 -Compress)
+    if (($beforeRegistry -join "") -ne ($afterRegistry -join "")) { [void]$changes.Add("registry:WindowsUpdate") }
+    return [PSCustomObject]@{ SchemaVersion = 1; Changed = ($changes.Count -gt 0); Changes = @($changes); Reason = if ($changes.Count) { "Dry-run persistent mutation detected: $($changes -join ', ')" } else { "No tracked persistent system mutation detected" } }
+}
+
+function Get-ConsoleColorCapability {
+    $isWindows = [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
+    $supportsColor = $false
+    try { $supportsColor = $null -ne $Host.UI.RawUI -and $null -ne $Host.UI.RawUI.ForegroundColor } catch { $supportsColor = $false }
+    return [PSCustomObject]@{ SupportsColor = $supportsColor; SupportsVirtualTerminal = ($isWindows -and [int]$PSVersionTable.PSVersion.Major -ge 7); LegacyConsole = ($isWindows -and -not $supportsColor) }
+}
+
+function Write-StageProgress {
+    param(
+        [Parameter(Mandatory = $true)][string]$Stage,
+        [ValidateRange(0, 100)][int]$PercentComplete,
+        [string]$Status = ""
+    )
+    try {
+        Write-Progress -Id 1 -Activity "SystemUpdatePro" -Status "$Stage $Status" -PercentComplete $PercentComplete
+        if ($PercentComplete -ge 100) { Write-Progress -Id 1 -Activity "SystemUpdatePro" -Completed }
+    } catch { }
+}
 
 function Test-InternetConnection {
     param([string[]]$Endpoints = @())
@@ -10472,6 +10812,8 @@ function New-WebhookPayload {
         winget_scopes = @($RunData.WingetScopes)
         rollout_decision = $RunData.RolloutDecision
         windows_update_policy = $RunData.WindowsUpdatePolicy
+        maintenance_decision = $RunData.MaintenanceDecision
+        power_plan_state = $RunData.PowerPlanState
     })
 }
 
@@ -12146,6 +12488,10 @@ $windowsCapability = $null
 $servicingCapability = $null
 $wingetCapability = $null
 
+if ($DryRun) {
+    try { $script:DryRunMutationBaseline = Get-DryRunMutationSnapshot } catch { $script:DryRunMutationBaseline = $null }
+}
+
 try {
     :run do {
         $initializationStart = Get-Date
@@ -12248,6 +12594,7 @@ try {
         }
 
         Write-Log "Running pre-flight checks..." "STEP"
+        Write-StageProgress -Stage "Preflight" -PercentComplete 5 -Status "Checking platform and policy"
         $preflightStart = Get-Date
         $preflightItems = [System.Collections.ArrayList]::new()
 
@@ -12378,6 +12725,21 @@ try {
                 "catalog-fallback:$($script:WindowsUpdatePolicy.CatalogFallback)",
                 "admx-snapshot:$($script:WindowsUpdatePolicy.ADMXSnapshot)"
             )))
+        $script:MaintenanceDecision = Test-MaintenanceWindow -Policy (Get-MaintenanceWindowPolicy -Path ([string]$PolicyPath))
+        [void]$preflightItems.Add((New-UpdateItemResult -Name "Maintenance window" `
+            -Status $(switch ([string]$script:MaintenanceDecision.Status) {
+                "Allowed" { "Succeeded" }
+                "NotConfigured" { "Skipped" }
+                default { "Blocked" }
+            }) -Message ([string]$script:MaintenanceDecision.Reason) `
+            -Evidence @("source:$($script:MaintenanceDecision.Source)", "next:$($script:MaintenanceDecision.NextWindow)")))
+        if (-not [bool]$script:MaintenanceDecision.Allowed) {
+            $maintenanceMessage = "Update execution is blocked by the maintenance window policy: $($script:MaintenanceDecision.Reason)"
+            [void](Add-StageResult (New-StageResult -Name "Preflight" -Status "Failed" -Attempted $preflightItems.Count `
+                -Failed 1 -ProviderCode 2 -Message $maintenanceMessage -Items @($preflightItems) -StartedAt $preflightStart))
+            $script:ExitCode = 2
+            break run
+        }
         $script:RolloutPolicy = Get-RolloutPolicy -Path ([string]$RolloutPolicyPath)
         $deviceIdentity = if (-not [string]::IsNullOrWhiteSpace([string]$sysInfo.SerialNumber)) {
             [string]$sysInfo.SerialNumber
@@ -12512,9 +12874,16 @@ try {
         [void](Add-StageResult (New-StageResult -Name "Preflight" -Status $preflightStatus `
             -Attempted $preflightItems.Count -Message $preflightMessage -Items @($preflightItems) `
             -StartedAt $preflightStart -DurationSeconds ([int]((Get-Date) - $preflightStart).TotalSeconds)))
+        Write-StageProgress -Stage "Preflight" -PercentComplete 25 -Status $preflightMessage
         Write-Host ""
 
         if (-not $script:ContinuationActive) {
+            $powerStart = Get-Date
+            $script:PowerPlanState = Set-HighPerformancePowerPlan -DryRunMode ([bool]$DryRun)
+            $powerStage = ConvertTo-StageResult -Name "PowerManagement" -Provider "powercfg" `
+                -Result @{ Success = $script:PowerPlanState.Success; Message = $script:PowerPlanState.Reason } -StartedAt $powerStart
+            [void](Add-StageResult $powerStage)
+            if ($powerStage.Status -notin @("Succeeded", "Skipped")) { $script:ExitCode = 2 }
             $policySnapshotReady = $true
             $policySnapshotStart = Get-Date
             if ($script:WindowsUpdatePolicy.ADMXSnapshot -and ($RepairWindowsUpdate -or $BypassWSUS)) {
@@ -12673,6 +13042,7 @@ try {
         }
 
         if (Test-ShouldRunContinuationStage -Stage "WindowsUpdate") {
+            Write-StageProgress -Stage "Windows Update" -PercentComplete 45 -Status "Processing policy-approved updates"
             $windowsStart = Get-Date
             if ($SkipWindows) {
                 [void](Add-StageResult (New-StageResult -Name "WindowsUpdate" -Provider "Windows Update" `
@@ -12690,6 +13060,7 @@ try {
                 if ($wuStage.Status -in @("Failed", "Partial")) { $script:ExitCode = 2 }
                 Write-Host ""
             }
+            Write-StageProgress -Stage "Windows Update" -PercentComplete 60 -Status "Completed"
             if (-not (Set-ContinuationCursor -StageCursor "Winget")) {
                 throw "Failed to persist continuation cursor after Windows Update"
             }
@@ -12698,6 +13069,7 @@ try {
         }
 
         if (Test-ShouldRunContinuationStage -Stage "Winget") {
+            Write-StageProgress -Stage "WinGet" -PercentComplete 65 -Status "Processing application updates"
             $wingetStart = Get-Date
             if ($SkipWinget) {
                 [void](Add-StageResult (New-StageResult -Name "Winget" -Provider "WinGet" -Status "Skipped" `
@@ -12718,6 +13090,7 @@ try {
                 if ($wingetStage.Status -in @("Failed", "Partial")) { $script:ExitCode = 2 }
                 Write-Host ""
             }
+            Write-StageProgress -Stage "WinGet" -PercentComplete 75 -Status "Completed"
             if (-not (Set-ContinuationCursor -StageCursor "PackageManagers")) {
                 throw "Failed to persist continuation cursor after WinGet"
             }
@@ -12726,6 +13099,7 @@ try {
         }
 
         if (Test-ShouldRunContinuationStage -Stage "PackageManagers") {
+            Write-StageProgress -Stage "Package managers" -PercentComplete 78 -Status "Processing optional sources"
             $packageStart = Get-Date
             if ($SkipWinget) {
                 [void](Add-StageResult (New-StageResult -Name "PackageManagers" -Provider "Chocolatey/Scoop/StoreEdgeFD/WSL" `
@@ -12739,6 +13113,7 @@ try {
                 if ($packageStage.Status -in @("Failed", "Partial")) { $script:ExitCode = 2 }
                 Write-Host ""
             }
+            Write-StageProgress -Stage "Package managers" -PercentComplete 84 -Status "Completed"
             if (-not (Set-ContinuationCursor -StageCursor "Cleanup")) {
                 throw "Failed to persist continuation cursor after package managers"
             }
@@ -12747,6 +13122,7 @@ try {
         }
 
         if (Test-ShouldRunContinuationStage -Stage "Cleanup") {
+            Write-StageProgress -Stage "Cleanup" -PercentComplete 88 -Status "Finalizing maintenance"
             $cleanupStart = Get-Date
             if (($CleanupAfter -or $ResetComponentBase) -and -not $servicingCapability.Supported) {
                 [void](Add-StageResult (New-StageResult -Name "Cleanup" `
@@ -12764,6 +13140,7 @@ try {
                 [void](Add-StageResult (New-StageResult -Name "Cleanup" -Provider "DISM and cleanmgr" `
                     -Status "Skipped" -Skipped 1 -Message "Cleanup not requested" -StartedAt $cleanupStart))
             }
+            Write-StageProgress -Stage "Cleanup" -PercentComplete 95 -Status "Completed"
             if (-not (Set-ContinuationCursor -StageCursor "Complete")) {
                 throw "Failed to persist completed continuation cursor"
             }
@@ -12785,7 +13162,22 @@ try {
         }
 
         if ($script:RebootRequired -and -not $DryRun -and $Reboot) {
-            if (-not $ContinueAfterReboot -or $script:ContinuationRegistered) {
+            $rebootDecision = Get-StaggeredRebootDecision
+            $leaseResult = Save-StaggeredRebootLease -Decision $rebootDecision
+            [void](Add-StageResult (ConvertTo-StageResult -Name "RebootCoordination" -Provider "Cluster policy" `
+                -Result @{ Success = ($rebootDecision.Allowed -and $leaseResult.Success); Message = "$($rebootDecision.Reason); $($leaseResult.Reason)"; Evidence = @($leaseResult.Path) } `
+                -StartedAt (Get-Date)))
+            if (-not $rebootDecision.Allowed -or -not $leaseResult.Success) {
+                Write-Log "Automatic reboot deferred by cluster coordination: $($rebootDecision.Reason)" "WARNING"
+            } elseif ($Interactive) {
+                $answer = Read-Host "Updates require a reboot. Reboot now? [y/N]"
+                if ($answer -match "^(?i)y(?:es)?$") {
+                    if (-not $ContinueAfterReboot -or $script:ContinuationRegistered) { $shutdownRequested = $true }
+                    else { Write-Log "Automatic reboot cancelled because continuation was not registered" "ERROR" }
+                } else {
+                    Write-Log "Interactive mode deferred the requested reboot" "WARNING"
+                }
+            } elseif (-not $ContinueAfterReboot -or $script:ContinuationRegistered) {
                 $shutdownRequested = $true
             } else {
                 Write-Log "Automatic reboot cancelled because continuation was not registered" "ERROR"
@@ -12872,8 +13264,20 @@ try {
                     "One or more privileged mutations could not be restored or committed"
                 }) -StartedAt $mutationFinalizeStart))
         }
-        if (-not $mutationFinalizeSucceeded) {
+    if (-not $mutationFinalizeSucceeded) {
             $message = "Privileged mutation journal finalization failed"
+            if (-not ($script:Errors -contains $message)) { [void]$script:Errors.Add($message) }
+            $script:ExitCode = 3
+        }
+    }
+
+    if ($null -ne $script:PowerPlanState) {
+        $powerRestoreStart = Get-Date
+        $powerRestore = Restore-PowerPlan -State $script:PowerPlanState -DryRunMode ([bool]$DryRun)
+        [void](Add-StageResult (ConvertTo-StageResult -Name "PowerManagementRestore" -Provider "powercfg" `
+            -Result @{ Success = $powerRestore.Success; Message = $powerRestore.Reason } -StartedAt $powerRestoreStart))
+        if (-not $powerRestore.Success) {
+            $message = "Power plan restoration failed: $($powerRestore.Reason)"
             if (-not ($script:Errors -contains $message)) { [void]$script:Errors.Add($message) }
             $script:ExitCode = 3
         }
@@ -12881,6 +13285,25 @@ try {
 
     if ($lockAcquired) {
         Remove-LockFile
+    }
+
+    if ($DryRun -and $null -ne $script:DryRunMutationBaseline) {
+        try {
+            $dryRunComparison = Compare-DryRunMutationSnapshot -Before $script:DryRunMutationBaseline -After (Get-DryRunMutationSnapshot)
+            [void](Add-StageResult (New-StageResult -Name "DryRunContract" -Provider "SystemUpdatePro mutation guard" `
+                -Status $(if ($dryRunComparison.Changed) { "Failed" } else { "Succeeded" }) `
+                -Attempted 1 -Failed $(if ($dryRunComparison.Changed) { 1 } else { 0 }) `
+                -Message $dryRunComparison.Reason -Items @(
+                    New-UpdateItemResult -Name "Tracked persistent state" `
+                        -Status $(if ($dryRunComparison.Changed) { "Failed" } else { "Succeeded" }) `
+                        -Message $dryRunComparison.Reason -Evidence @($dryRunComparison.Changes)
+                ) -StartedAt (Get-Date)))
+            if ($dryRunComparison.Changed) { $script:ExitCode = 3 }
+        } catch {
+            $message = "Dry-run mutation contract could not be verified: $($_.Exception.Message)"
+            [void]$script:Errors.Add($message)
+            $script:ExitCode = 3
+        }
     }
 
     $completedAt = Get-Date

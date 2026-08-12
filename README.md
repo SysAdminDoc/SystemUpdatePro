@@ -51,6 +51,8 @@ SystemUpdatePro is a fully automated, self-healing PowerShell script that handle
 - **Network and Rollout Gates**: Blocks downloads on known metered links by default, records explicit overrides, assigns deterministic endpoint cohorts, and emits local promote/hold/halt evidence
 - **Windows Update Policy**: Supports feature deferral, wildcard driver allow/deny rules, critical/security-only runs, atomic pre-stage plans, Microsoft Update Catalog fallback, and ADMX policy snapshots
 - **Package Manager Sources**: Auto-detects Chocolatey and Scoop, checks the StoreEdgeFD-backed Microsoft Store source, and limits Flatpak/Snap updates to WSL GUI environments
+- **Execution Controls**: Honors protected or Intune-detected maintenance windows, records deterministic cluster reboot coordination, temporarily selects High performance power mode and restores the original scheme, and exposes stage progress
+- **Dry-Run Contract**: Tracks Windows Update policy, WSUS, pre-stage, lock, and power-plan state before and after preview runs and fails closed if any tracked persistent state changes
 
 ### Enterprise Integration
 - **Event Log**: Writes to Windows Application log for RMM/SIEM visibility
@@ -216,6 +218,9 @@ The standalone command requires administrator privileges, prints the completed a
 
 # Short maintenance window: critical and security updates only
 .\SystemUpdatePro.ps1 -SecurityOnly
+
+# Ask before rebooting after a successful run
+.\SystemUpdatePro.ps1 -Interactive -Reboot
 ```
 
 ---
@@ -257,6 +262,7 @@ The standalone command requires administrator privileges, prints the completed a
 | `-FeatureDeferralDays` | Int | 0 | Defer feature updates until their release age reaches this value (0-3650) |
 | `-SecurityOnly` | Switch | False | Apply only critical/security-classified Windows Updates |
 | `-PreStage` | Switch | False | Download approved Windows Updates and persist an atomic install plan |
+| `-Interactive` | Switch | False | Ask before requesting an automatic reboot |
 | `-Reboot` | Switch | False | Allow automatic reboot if required |
 | `-Force` | Switch | False | Continue non-firmware work despite low disk or pending reboot; never overrides unknown/blocked firmware safety |
 
