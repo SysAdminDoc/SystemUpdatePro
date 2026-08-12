@@ -40,6 +40,10 @@ BeforeAll {
         "Test-LockDocument",
         "Get-AcquisitionManifest",
         "Get-AcquisitionManifestEntry",
+        "Get-DependencyCacheArtifactPath",
+        "Test-DependencyCacheArtifact",
+        "Get-SourceReadiness",
+        "Get-DependencyReadiness",
         "Get-SystemArchitecture",
         "Get-SystemInfo",
         "Get-CapabilityMatrix",
@@ -110,6 +114,19 @@ BeforeAll {
         "Test-FirmwareReadiness",
         "Get-FirmwareUpdatePolicy",
         "New-FirmwareReadinessItem",
+        "Get-NetworkCostState",
+        "Get-DownloadPolicy",
+        "Test-DownloadAllowed",
+        "Get-PolicyDocument",
+        "Get-WingetScopePlan",
+        "ConvertFrom-WingetPackageOutput",
+        "Get-WingetScopeInventory",
+        "Get-WingetPackagePolicy",
+        "Get-WingetPackagePlan",
+        "Get-EndpointCohort",
+        "Get-RolloutPolicy",
+        "Get-RolloutEvidence",
+        "Evaluate-RolloutPromotion",
         "Get-DirectoryPayloadHash",
         "Get-PSModuleInstallPath",
         "Test-InstalledPSModule",
@@ -239,6 +256,18 @@ BeforeAll {
         $script:ResumeStageCursor = ""
         $script:FirmwarePrerequisites = $null
         $script:Version = "4.1.0"
+        $script:Offline = $false
+        $script:DependencyCachePath = Join-Path $stateTestDirectory "Cache"
+        $script:SourceTimeoutSeconds = 30
+        $script:AllowMeteredNetwork = $false
+        $script:PolicyPath = ""
+        $script:RolloutPolicyPath = ""
+        $script:DependencyReadiness = $null
+        $script:DownloadPolicy = $null
+        $script:CurrentSystemInfo = $null
+        $script:WingetScopeResults = @()
+        $script:RolloutDecision = $null
+        $script:PackagePolicy = $null
         $script:AcquisitionManifestVersion = 1
         $script:AcquisitionManifest = Get-AcquisitionManifest
         $script:AcquisitionProvenance = [System.Collections.ArrayList]::new()
@@ -348,6 +377,116 @@ BeforeAll {
                 Source = "HP Image Assistant"; Reason = "HP state"
             }
         }
+    }
+}
+
+Describe "Dependency readiness, scoped packages, and rollout policy" {
+    BeforeEach {
+        Initialize-SystemUpdateProTestState
+        Mock Write-Log {}
+    }
+
+    It "accepts only a matching content-addressed dependency cache artifact" {
+        $payload = [Text.Encoding]::UTF8.GetBytes("verified dependency")
+        $hash = ([BitConverter]::ToString(([Security.Cryptography.SHA256]::Create()).ComputeHash($payload)) -replace "-", "")
+        $artifactDirectory = Join-Path $script:DependencyCachePath "sha256"
+        New-Item -ItemType Directory -Path $artifactDirectory -Force | Out-Null
+        $artifactPath = Join-Path $artifactDirectory $hash
+        [IO.File]::WriteAllBytes($artifactPath, $payload)
+
+        $evidence = Test-DependencyCacheArtifact -Name "Test dependency" -ExpectedSha256 $hash `
+            -CachePath $script:DependencyCachePath
+
+        $evidence.Valid | Should -BeTrue -Because $evidence.Reason
+        $evidence.Status | Should -Be "Ready"
+        $evidence.Path | Should -Be $artifactPath
+    }
+
+    It "never probes the network for an offline cache miss" {
+        Mock Invoke-WebRequest { throw "network must not be contacted" }
+
+        $readiness = Get-SourceReadiness -Name "Offline source" -Uri "https://example.test/package" `
+            -AllowedHosts @("example.test") -ExpectedSha256 ("A" * 64) -OfflineMode $true
+
+        $readiness.Status | Should -Be "Unavailable"
+        $readiness.Ready | Should -BeFalse
+        Should -Invoke Invoke-WebRequest -Times 0 -Exactly
+    }
+
+    It "records an approved source readiness response with its timeout" {
+        Mock Invoke-WebRequest { [PSCustomObject]@{ StatusCode = 204 } }
+
+        $readiness = Get-SourceReadiness -Name "Online source" -Uri "https://example.test/package" `
+            -AllowedHosts @("example.test") -TimeoutSeconds 11
+
+        $readiness.Status | Should -Be "Ready"
+        $readiness.TimeoutSeconds | Should -Be 11
+        $readiness.Host | Should -Be "example.test"
+    }
+
+    It "models SYSTEM scope without claiming unseen user-package success" {
+        $plan = Get-WingetScopePlan -SystemInfo @{ ExecutionContext = "System" }
+
+        @($plan.Scopes | Where-Object Scope -eq "machine").Status | Should -Be "Available"
+        @($plan.Scopes | Where-Object Scope -eq "current-user").Status | Should -Be "Skipped"
+        @($plan.Scopes | Where-Object Scope -eq "other-user").CanUpgrade | Should -BeFalse
+        $plan.SystemClaimsPerUserSuccess | Should -BeFalse
+    }
+
+    It "applies wildcard exclusions, pins, and process conflicts without force-closing" {
+        $policy = [PSCustomObject]@{
+            Exclude = @("Contoso.*")
+            Pins = [ordered]@{ "Fabrikam.App" = "2.0.0" }
+            Conflicts = [ordered]@{
+                "Tailspin.App" = [ordered]@{
+                    processes = @("tailspin")
+                    action = "close-with-deadline"
+                    deadline_minutes = 10
+                }
+            }
+        }
+        $packages = @(
+            @{ Id = "Contoso.Tool"; Name = "Contoso Tool"; Version = "1.0.0"; AvailableVersion = "2.0.0" },
+            @{ Id = "Fabrikam.App"; Name = "Fabrikam"; Version = "1.5.0"; AvailableVersion = "2.1.0" },
+            @{ Id = "Tailspin.App"; Name = "Tailspin"; Version = "1.0.0"; AvailableVersion = "1.1.0" },
+            @{ Id = "Northwind.App"; Name = "Northwind"; Version = "1.0.0"; AvailableVersion = "1.1.0" }
+        )
+
+        $result = Get-WingetPackagePlan -Packages $packages -Policy $policy -RunningProcessNames @("tailspin") `
+            -Scope "current-user"
+
+        @($result.Items | Where-Object Id -eq "Contoso.Tool").Status | Should -Be "Excluded"
+        @($result.Items | Where-Object Id -eq "Fabrikam.App").Status | Should -Be "Pinned"
+        @($result.Items | Where-Object Id -eq "Tailspin.App").Status | Should -Be "Deferred"
+        @($result.Items | Where-Object Id -eq "Northwind.App").Status | Should -Be "Eligible"
+        @($result.Conflicts).Count | Should -Be 1
+    }
+
+    It "blocks known metered downloads unless an explicit override is recorded" {
+        $metered = [PSCustomObject]@{ Status = "Metered"; CostType = "Fixed"; Known = $true; Reason = "fixed" }
+
+        $blocked = Get-DownloadPolicy -NetworkCost $metered -DryRunMode $true
+        $allowed = Get-DownloadPolicy -NetworkCost $metered -AllowOverride $true
+
+        $blocked.Status | Should -Be "Blocked"
+        $blocked.Allowed | Should -BeFalse
+        $allowed.Allowed | Should -BeTrue
+        $allowed.AuditedOverride | Should -BeTrue
+    }
+
+    It "returns deterministic rollout hold, halt, and promote decisions" {
+        $policy = [PSCustomObject]@{
+            Enabled = $true; PercentageStart = 0; PercentageEnd = 100
+            MinimumSuccessCount = 2; MinimumSuccessRate = 0.9; BakeTimeHours = 0
+            EmergencyOverride = $false; Cohort = "pilot"; Reason = "test"
+        }
+        $hold = Evaluate-RolloutPromotion -Policy $policy -Evidence @{ SuccessCount = 1; FailureCount = 0; LastSuccessAt = (Get-Date).ToUniversalTime().ToString("o") } -CohortValue 10
+        $halt = Evaluate-RolloutPromotion -Policy $policy -Evidence @{ SuccessCount = 1; FailureCount = 2; LastSuccessAt = (Get-Date).ToUniversalTime().ToString("o") } -CohortValue 10
+        $promote = Evaluate-RolloutPromotion -Policy $policy -Evidence @{ SuccessCount = 2; FailureCount = 0; LastSuccessAt = (Get-Date).ToUniversalTime().ToString("o") } -CohortValue 10
+
+        $hold.Decision | Should -Be "Hold"
+        $halt.Decision | Should -Be "Halt"
+        $promote.Decision | Should -Be "Promote"
     }
 }
 
@@ -1355,7 +1494,7 @@ Describe "PowerShell 5.1 continuation state machine" {
         $loaded.SchemaVersion | Should -Be 5
         $loaded.Phase | Should -Be "AwaitingReboot"
         $loaded.RunId | Should -Be "11111111-1111-1111-1111-111111111111"
-        $loaded.Parameters.Count | Should -Be 24
+        $loaded.Parameters.Count | Should -Be 30
         $loaded.AcquisitionProvenance.Count | Should -Be 1
         $loaded.AcquisitionProvenance[0].Name | Should -Be "LSUClient"
         $loaded.Parameters.SkipOEM | Should -BeTrue

@@ -4,6 +4,7 @@ All notable changes to SystemUpdatePro will be documented in this file.
 
 ## [Unreleased]
 
+- Added source-specific dependency readiness with bounded origin probes, verified SHA-256 content-addressed offline cache consumption, per-source timeout/proxy evidence, explicit WinGet machine/current-user/other-user scope results, protected package exclusion/pin/conflict planning, audited metered-network download policy, and deterministic local rollout cohort promotion evidence.
 - Added webhook payload schema v2 with deterministic idempotency keys, run/timestamp/stage correlation, report evidence URIs, no-redirect HTTPS transport, bounded transient/429 retry with `Retry-After`, durable per-attempt/terminal records, Slack and legacy connector formatting, and Teams Workflow Adaptive Cards generated from the same contract.
 - Replaced raw webhook command-line input with validated environment/protected-file secret references, added pre-initialization range/path/HTTPS validation, advanced continuation state to schema v5 with v3/v4 migration, retained read-only history as an unelevated early command, and extended redaction across console, transcript, exceptions, reports, history, and diagnostic bundles.
 - Added a standalone, bounded diagnostic/recovery bundle with a schema-versioned SHA-256 manifest, latest run and policy data, runtime/provider capability inventory, redacted transcript and OEM output, Windows Update/USO/CBS/DISM evidence, mutation-journal status, explicit collector errors, atomic protected publication, and deterministic PowerShell 5.1/7 ZIP paths.

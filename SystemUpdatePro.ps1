@@ -81,6 +81,18 @@
     Allow automatic reboot if required
 .PARAMETER Force
     Continue despite non-firmware warnings (pending reboot, low disk); never overrides unknown firmware safety state
+.PARAMETER Offline
+    Disable network acquisition and use only verified content-addressed dependency cache artifacts
+.PARAMETER DependencyCachePath
+    Optional administrator-prefilled content-addressed dependency cache directory
+.PARAMETER SourceTimeoutSeconds
+    Per-origin readiness and dependency acquisition timeout in seconds
+.PARAMETER AllowMeteredNetwork
+    Audited override that permits provider downloads on a known metered connection
+.PARAMETER PolicyPath
+    Optional protected JSON policy containing package, Windows Update, maintenance, and conflict rules
+.PARAMETER RolloutPolicyPath
+    Optional protected JSON policy used for deterministic cohort promotion decisions
 .EXAMPLE
     .\SystemUpdatePro.ps1
     # Standard update: OEM + Windows + Winget
@@ -192,7 +204,39 @@ param(
     [ValidateRange(5, 512)]
     [int]$DiagnosticBundleMaxSizeMB = 50,
     [switch]$Reboot,
-    [switch]$Force
+    [switch]$Force,
+    [switch]$Offline,
+    [ValidateScript({
+        $candidatePath = [string]$_
+        if ([string]::IsNullOrWhiteSpace($candidatePath) -or
+            $candidatePath -notmatch "^[A-Z]:[\\/]" -or
+            $candidatePath -match '[*?"<>|]') {
+            throw "DependencyCachePath must be an absolute local path without wildcards"
+        }
+        return $true
+    })]
+    [string]$DependencyCachePath = "C:\ProgramData\SystemUpdatePro\Cache",
+    [ValidateRange(1, 600)]
+    [int]$SourceTimeoutSeconds = 30,
+    [switch]$AllowMeteredNetwork,
+    [ValidateScript({
+        $candidatePath = [string]$_
+        if (-not [string]::IsNullOrWhiteSpace($candidatePath) -and
+            ($candidatePath -notmatch "^[A-Z]:[\\/]" -or $candidatePath -match '[*?"<>|]')) {
+            throw "PolicyPath must be empty or an absolute local path without wildcards"
+        }
+        return $true
+    })]
+    [string]$PolicyPath = "",
+    [ValidateScript({
+        $candidatePath = [string]$_
+        if (-not [string]::IsNullOrWhiteSpace($candidatePath) -and
+            ($candidatePath -notmatch "^[A-Z]:[\\/]" -or $candidatePath -match '[*?"<>|]')) {
+            throw "RolloutPolicyPath must be empty or an absolute local path without wildcards"
+        }
+        return $true
+    })]
+    [string]$RolloutPolicyPath = ""
 )
 
 # ============================================================================
@@ -203,6 +247,19 @@ $script:Version = "4.1.0"
 $script:ProductName = "SystemUpdatePro"
 $script:WebhookSecretReference = [string]$WebhookSecretReference
 $script:WebhookUrl = ""
+$script:Offline = [bool]$Offline
+$script:DependencyCachePath = [string]$DependencyCachePath
+$script:SourceTimeoutSeconds = [int]$SourceTimeoutSeconds
+$script:AllowMeteredNetwork = [bool]$AllowMeteredNetwork
+$script:PolicyPath = [string]$PolicyPath
+$script:RolloutPolicyPath = [string]$RolloutPolicyPath
+$script:DependencyReadiness = $null
+$script:DownloadPolicy = $null
+$script:CurrentSystemInfo = $null
+$script:WingetScopeResults = @()
+$script:RolloutDecision = $null
+$script:PackagePolicy = $null
+$script:RolloutPolicy = $null
 $script:MaxRetries = [int]$MaxRetries
 $script:EvidenceMaxSizeMB = [int]$EvidenceMaxSizeMB
 $script:RedactionMode = [string]$RedactionMode
@@ -1439,6 +1496,10 @@ function New-RunData {
         MutationRecovery = @($script:MutationEvidence)
         Capabilities     = $script:CapabilityAssessment
         Retention        = $script:RetentionResult
+        DependencyReadiness = $script:DependencyReadiness
+        DownloadPolicy   = $script:DownloadPolicy
+        WingetScopes     = @($script:WingetScopeResults)
+        RolloutDecision  = $script:RolloutDecision
         EvidenceDelivery = @{}
     }
 }
@@ -1566,6 +1627,12 @@ function Get-EffectiveRunParameter {
         RedactionMode      = [string]$RedactionMode
         Reboot             = $Reboot.IsPresent
         Force              = $Force.IsPresent
+        Offline            = $Offline.IsPresent
+        DependencyCachePath = [string]$DependencyCachePath
+        SourceTimeoutSeconds = [int]$SourceTimeoutSeconds
+        AllowMeteredNetwork = $AllowMeteredNetwork.IsPresent
+        PolicyPath          = [string]$PolicyPath
+        RolloutPolicyPath   = [string]$RolloutPolicyPath
     }
 }
 
@@ -1575,7 +1642,9 @@ function Get-ContinuationParameterName {
         "RepairWindowsUpdate", "CleanupAfter", "ResetComponentBase", "ContinueAfterReboot", "DryRun",
         "BackupDrivers", "ShowHistory", "WebhookSecretReference", "HistoryCount", "MaxRetries",
         "MaxUpdatePasses", "MinDiskSpaceGB", "MinFirmwareChargePercent", "LogPath",
-        "LogRetentionDays", "EvidenceMaxSizeMB", "RedactionMode", "Reboot", "Force"
+        "LogRetentionDays", "EvidenceMaxSizeMB", "RedactionMode", "Reboot", "Force",
+        "Offline", "DependencyCachePath", "SourceTimeoutSeconds", "AllowMeteredNetwork",
+        "PolicyPath", "RolloutPolicyPath"
     )
 }
 
@@ -1616,6 +1685,21 @@ function Convert-ContinuationStateSchema {
         }
         $migrated["SchemaVersion"] = 5
         $migrated["_MigrationSourceSchema"] = $migrationSourceSchema
+    }
+    if ($schemaVersion -eq 5 -and $migrated.Parameters -is [System.Collections.IDictionary]) {
+        $defaults = [ordered]@{
+            Offline = $false
+            DependencyCachePath = "C:\ProgramData\SystemUpdatePro\Cache"
+            SourceTimeoutSeconds = 30
+            AllowMeteredNetwork = $false
+            PolicyPath = ""
+            RolloutPolicyPath = ""
+        }
+        foreach ($default in $defaults.GetEnumerator()) {
+            if (-not $migrated.Parameters.Contains($default.Key)) {
+                $migrated.Parameters[$default.Key] = $default.Value
+            }
+        }
     }
     return $migrated
 }
@@ -1777,6 +1861,10 @@ function New-ContinuationState {
         AcquisitionProvenance = @($script:AcquisitionProvenance)
         MutationEvidence = @($script:MutationEvidence)
         Capabilities   = $script:CapabilityAssessment
+        DependencyReadiness = $script:DependencyReadiness
+        DownloadPolicy = $script:DownloadPolicy
+        WingetScopes = @($script:WingetScopeResults)
+        RolloutDecision = $script:RolloutDecision
         Errors         = @($script:Errors)
         Warnings       = @($script:Warnings)
     }
@@ -1811,6 +1899,12 @@ function Import-ContinuationState {
     foreach ($name in $integerNames) {
         Set-Variable -Name $name -Scope Script -Value ([int]$State.Parameters[$name])
     }
+    Set-Variable -Name "Offline" -Scope Script -Value ([switch][bool]$State.Parameters.Offline)
+    Set-Variable -Name "AllowMeteredNetwork" -Scope Script -Value ([switch][bool]$State.Parameters.AllowMeteredNetwork)
+    Set-Variable -Name "SourceTimeoutSeconds" -Scope Script -Value ([int]$State.Parameters.SourceTimeoutSeconds)
+    Set-Variable -Name "DependencyCachePath" -Scope Script -Value ([string]$State.Parameters.DependencyCachePath)
+    Set-Variable -Name "PolicyPath" -Scope Script -Value ([string]$State.Parameters.PolicyPath)
+    Set-Variable -Name "RolloutPolicyPath" -Scope Script -Value ([string]$State.Parameters.RolloutPolicyPath)
     Set-Variable -Name "WebhookSecretReference" -Scope Script `
         -Value ([string]$State.Parameters.WebhookSecretReference)
     Set-Variable -Name "WebhookUrl" -Scope Script -Value ([string]$State.ResolvedWebhookUrl)
@@ -1837,6 +1931,18 @@ function Import-ContinuationState {
     foreach ($message in @($State.Errors)) { [void]$script:Errors.Add([string]$message) }
     $script:Warnings = [System.Collections.ArrayList]::new()
     foreach ($message in @($State.Warnings)) { [void]$script:Warnings.Add([string]$message) }
+    $script:DependencyReadiness = if ($State.Contains("DependencyReadiness")) {
+        ConvertTo-Hashtable -InputObject $State.DependencyReadiness
+    } else { $null }
+    $script:DownloadPolicy = if ($State.Contains("DownloadPolicy")) {
+        ConvertTo-Hashtable -InputObject $State.DownloadPolicy
+    } else { $null }
+    $script:WingetScopeResults = if ($State.Contains("WingetScopes")) {
+        @($State.WingetScopes | ForEach-Object { ConvertTo-Hashtable -InputObject $_ })
+    } else { @() }
+    $script:RolloutDecision = if ($State.Contains("RolloutDecision")) {
+        ConvertTo-Hashtable -InputObject $State.RolloutDecision
+    } else { $null }
     $script:AcquisitionProvenance = [System.Collections.ArrayList]::new()
     foreach ($dependency in @($State.AcquisitionProvenance)) {
         [void]$script:AcquisitionProvenance.Add([PSCustomObject]$dependency)
@@ -1875,6 +1981,10 @@ function Set-ContinuationCursor {
     $script:ContinuationState.AcquisitionProvenance = @($script:AcquisitionProvenance)
     $script:ContinuationState.MutationEvidence = @($script:MutationEvidence)
     $script:ContinuationState.Capabilities = $script:CapabilityAssessment
+    $script:ContinuationState.DependencyReadiness = $script:DependencyReadiness
+    $script:ContinuationState.DownloadPolicy = $script:DownloadPolicy
+    $script:ContinuationState.WingetScopes = @($script:WingetScopeResults)
+    $script:ContinuationState.RolloutDecision = $script:RolloutDecision
     $script:ContinuationState.Errors = @($script:Errors)
     $script:ContinuationState.Warnings = @($script:Warnings)
     $script:ContinuationState.Parameters = Get-EffectiveRunParameter
@@ -2784,6 +2894,10 @@ function Save-UpdateHistory {
             mutation_recovery = @($RunData.MutationRecovery)
             capabilities      = $RunData.Capabilities
             retention         = $RunData.Retention
+            dependency_readiness = $RunData.DependencyReadiness
+            download_policy   = $RunData.DownloadPolicy
+            winget_scopes     = @($RunData.WingetScopes)
+            rollout_decision  = $RunData.RolloutDecision
             evidence_delivery = $RunData.EvidenceDelivery
             parameters        = Protect-EvidenceObject -InputObject (
                 Get-EffectiveRunParameter
@@ -2920,11 +3034,16 @@ function Invoke-DriverBackup {
 # ============================================================================
 
 function Test-InternetConnection {
-    $endpoints = @(
-        "https://www.microsoft.com",
-        "https://download.microsoft.com",
-        "https://www.google.com"
-    )
+    param([string[]]$Endpoints = @())
+
+    $endpoints = if ($Endpoints.Count -gt 0) {
+        @($Endpoints)
+    } else {
+        @(
+            "https://www.microsoft.com",
+            "https://download.microsoft.com"
+        )
+    }
 
     foreach ($url in $endpoints) {
         try {
@@ -3353,12 +3472,70 @@ function New-FirmwareReadinessItem {
 }
 
 function Test-MeteredConnection {
+    return ((Get-NetworkCostState).Status -eq "Metered")
+}
+
+function Get-NetworkCostState {
     try {
         $cost = [Windows.Networking.Connectivity.NetworkInformation, Windows, ContentType=WindowsRuntime]::GetInternetConnectionProfile().GetConnectionCost()
-        return ($cost.NetworkCostType -ne [Windows.Networking.Connectivity.NetworkCostType]::Unrestricted)
+        $costType = [string]$cost.NetworkCostType
+        if ($costType -eq "Unrestricted") {
+            return [PSCustomObject]@{
+                Status = "Unrestricted"; CostType = $costType; Known = $true
+                Reason = "Connection is unrestricted"
+            }
+        }
+        return [PSCustomObject]@{
+            Status = "Metered"; CostType = $costType; Known = $true
+            Reason = "Connection cost is $costType"
+        }
     } catch {
-        return $false
+        return [PSCustomObject]@{
+            Status = "Unknown"; CostType = ""; Known = $false
+            Reason = "Network cost could not be determined: $($_.Exception.Message)"
+        }
     }
+}
+
+function Get-DownloadPolicy {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$NetworkCost,
+        [bool]$AllowOverride = $false,
+        [bool]$DryRunMode = $false
+    )
+
+    $status = "Allowed"
+    $reason = "Network cost policy permits provider downloads"
+    $override = $false
+    if ([string]$NetworkCost.Status -eq "Metered") {
+        if ($AllowOverride) {
+            $override = $true
+            $reason = "Metered-network download policy explicitly overridden by the operator"
+        } else {
+            $status = "Blocked"
+            $reason = "Known metered connection blocks provider downloads; use -AllowMeteredNetwork for an audited override"
+        }
+    } elseif ([string]$NetworkCost.Status -eq "Unknown") {
+        $status = "AllowedWithWarning"
+        $reason = "Network cost is unknown; provider downloads remain allowed and the uncertainty is recorded"
+    }
+    return [PSCustomObject][ordered]@{
+        SchemaVersion = 1
+        Status = $status
+        Allowed = ($status -ne "Blocked")
+        Deferred = ($status -eq "Blocked")
+        DryRun = $DryRunMode
+        AuditedOverride = $override
+        NetworkCost = $NetworkCost
+        Reason = $reason
+        EvaluatedAt = (Get-Date).ToUniversalTime().ToString("o")
+    }
+}
+
+function Test-DownloadAllowed {
+    if ($null -eq $script:DownloadPolicy) { return $true }
+    return [bool]$script:DownloadPolicy.Allowed
 }
 
 function Get-SystemInfo {
@@ -4893,6 +5070,236 @@ function Get-AcquisitionManifestEntry {
     return $script:AcquisitionManifest[$Name]
 }
 
+function Get-DependencyCacheArtifactPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidatePattern("^[A-Fa-f0-9]{64}$")]
+        [string]$ExpectedSha256,
+        [string]$CachePath = ""
+    )
+
+    if ([string]::IsNullOrWhiteSpace($CachePath)) {
+        $CachePath = [string]$script:DependencyCachePath
+    }
+    if ([string]::IsNullOrWhiteSpace($CachePath)) { return $null }
+    try {
+        $root = [IO.Path]::GetFullPath($CachePath).TrimEnd("\", "/")
+        return Join-Path (Join-Path $root "sha256") $ExpectedSha256.ToUpperInvariant()
+    } catch {
+        return $null
+    }
+}
+
+function Test-DependencyCacheArtifact {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+        [Parameter(Mandatory = $true)]
+        [ValidatePattern("^[A-Fa-f0-9]{64}$")]
+        [string]$ExpectedSha256,
+        [string]$PublisherPattern = "",
+        [string]$CachePath = ""
+    )
+
+    $artifactPath = Get-DependencyCacheArtifactPath -ExpectedSha256 $ExpectedSha256 -CachePath $CachePath
+    if ([string]::IsNullOrWhiteSpace($artifactPath)) {
+        return [PSCustomObject]@{
+            Valid = $false; Name = $Name; Path = ""; Sha256 = ""; Publisher = ""; Thumbprint = ""
+            Status = "Unavailable"; Reason = "Dependency cache path is not configured"
+        }
+    }
+    if (-not (Test-Path -LiteralPath $artifactPath -PathType Leaf)) {
+        return [PSCustomObject]@{
+            Valid = $false; Name = $Name; Path = $artifactPath; Sha256 = ""; Publisher = ""; Thumbprint = ""
+            Status = "CacheMiss"; Reason = "No content-addressed artifact matches the expected SHA-256"
+        }
+    }
+
+    try {
+        $verification = Test-AcquiredFile -Path $artifactPath -ExpectedSha256 $ExpectedSha256 `
+            -PublisherPattern $PublisherPattern
+        return [PSCustomObject]@{
+            Valid = [bool]$verification.Valid
+            Name = $Name
+            Path = $artifactPath
+            Sha256 = [string]$verification.Sha256
+            Publisher = [string]$verification.Publisher
+            Thumbprint = [string]$verification.Thumbprint
+            Status = $(if ($verification.Valid) { "Ready" } else { "Rejected" })
+            Reason = [string]$verification.Reason
+        }
+    } catch {
+        return [PSCustomObject]@{
+            Valid = $false; Name = $Name; Path = $artifactPath; Sha256 = ""; Publisher = ""; Thumbprint = ""
+            Status = "Rejected"; Reason = Protect-EvidenceText -Text $_.Exception.Message
+        }
+    }
+}
+
+function Get-SourceReadiness {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+        [Parameter(Mandatory = $true)]
+        [string]$Uri,
+        [Parameter(Mandatory = $true)]
+        [string[]]$AllowedHosts,
+        [string]$ExpectedSha256 = "",
+        [string]$PublisherPattern = "",
+        [bool]$OfflineMode = $false,
+        [string]$CachePath = "",
+        [ValidateRange(1, 600)]
+        [int]$TimeoutSeconds = 30
+    )
+
+    if (-not $PSBoundParameters.ContainsKey("OfflineMode")) {
+        $OfflineMode = [bool]$script:Offline
+    }
+    if (-not $PSBoundParameters.ContainsKey("CachePath")) {
+        $CachePath = [string]$script:DependencyCachePath
+    }
+    if (-not $PSBoundParameters.ContainsKey("TimeoutSeconds") -and [int]$script:SourceTimeoutSeconds -gt 0) {
+        $TimeoutSeconds = [int]$script:SourceTimeoutSeconds
+    }
+
+    $cacheEvidence = $null
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedSha256)) {
+        $cacheEvidence = Test-DependencyCacheArtifact -Name $Name -ExpectedSha256 $ExpectedSha256 `
+            -PublisherPattern $PublisherPattern -CachePath $CachePath
+    }
+    $base = [ordered]@{
+        Name = $Name
+        Uri = $Uri
+        Host = ""
+        Status = "Unknown"
+        Ready = $false
+        Offline = $OfflineMode
+        Cache = $cacheEvidence
+        TimeoutSeconds = $TimeoutSeconds
+        Proxy = "System default"
+        HttpStatus = 0
+        Reason = ""
+        EvaluatedAt = (Get-Date).ToUniversalTime().ToString("o")
+    }
+
+    try {
+        $parsed = [Uri]$Uri
+        $base.Host = $parsed.DnsSafeHost
+    } catch {}
+
+    if (-not (Test-AcquisitionUri -Uri $Uri -AllowedHosts $AllowedHosts)) {
+        $base.Status = "Blocked"
+        $base.Reason = "Source URI is not HTTPS on an approved origin"
+        return [PSCustomObject]$base
+    }
+    if ($cacheEvidence -and $cacheEvidence.Valid -and $OfflineMode) {
+        $base.Status = "OfflineCache"
+        $base.Ready = $true
+        $base.Reason = "Verified content-addressed cache artifact is available; network access is disabled"
+        return [PSCustomObject]$base
+    }
+    if ($OfflineMode) {
+        $base.Status = "Unavailable"
+        $base.Reason = if ($cacheEvidence) {
+            "Offline mode requires a matching verified cache artifact: $($cacheEvidence.Reason)"
+        } else {
+            "Offline mode requires a verified cache artifact"
+        }
+        return [PSCustomObject]$base
+    }
+
+    try {
+        $response = Invoke-WebRequest -Uri $Uri -Method Head -TimeoutSec $TimeoutSeconds `
+            -MaximumRedirection 0 -UseBasicParsing -ErrorAction Stop
+        $base.HttpStatus = [int]$response.StatusCode
+        if ($base.HttpStatus -ge 200 -and $base.HttpStatus -lt 400) {
+            $base.Status = "Ready"
+            $base.Ready = $true
+            $base.Reason = "Approved origin responded to a bounded readiness probe"
+        } else {
+            $base.Status = "Unavailable"
+            $base.Reason = "Approved origin returned HTTP $($base.HttpStatus)"
+        }
+    } catch {
+        $statusCode = 0
+        try {
+            if ($null -ne $_.Exception.Response) { $statusCode = [int]$_.Exception.Response.StatusCode }
+        } catch {}
+        $base.HttpStatus = $statusCode
+        $base.Status = "Unavailable"
+        $base.Reason = "Source readiness probe failed after $TimeoutSeconds seconds: $(Protect-EvidenceText -Text $_.Exception.Message)"
+    }
+    return [PSCustomObject]$base
+}
+
+function Get-DependencyReadiness {
+    param(
+        [string[]]$Names = @(),
+        [string]$CachePath = "",
+        [bool]$OfflineMode = $false,
+        [ValidateRange(1, 600)]
+        [int]$TimeoutSeconds = 30
+    )
+
+    if ($Names.Count -eq 0) {
+        $Names = @("PSWindowsUpdate", "WinGet", "LSUClient", "DellCommandUpdate", "HPIA")
+    }
+    $sources = [System.Collections.ArrayList]::new()
+    $providers = [ordered]@{}
+    foreach ($name in $Names) {
+        $spec = Get-AcquisitionManifestEntry -Name $name
+        $providerSources = [System.Collections.ArrayList]::new()
+        $sourceSpecs = @([ordered]@{
+            Name = [string]$spec.Name
+            Uri = [string]$spec.Uri
+            AllowedHosts = @($spec.AllowedHosts)
+            Sha256 = [string]$spec.Sha256
+            PublisherPattern = [string]$spec.PublisherPattern
+        })
+        if ($name -eq "WinGet") {
+            $sourceSpecs += [ordered]@{
+                Name = "WinGet dependency bundle"
+                Uri = [string]$spec.DependencyBundle.Uri
+                AllowedHosts = @($spec.DependencyBundle.AllowedHosts)
+                Sha256 = [string]$spec.DependencyBundle.Sha256
+                PublisherPattern = [string]$spec.PublisherPattern
+            }
+            $sourceSpecs += [ordered]@{
+                Name = "WinGet license"
+                Uri = [string]$spec.License.Uri
+                AllowedHosts = @($spec.License.AllowedHosts)
+                Sha256 = [string]$spec.License.Sha256
+                PublisherPattern = ""
+            }
+        }
+        foreach ($sourceSpec in $sourceSpecs) {
+            $source = Get-SourceReadiness -Name ([string]$sourceSpec.Name) `
+                -Uri ([string]$sourceSpec.Uri) -AllowedHosts @($sourceSpec.AllowedHosts) `
+                -ExpectedSha256 ([string]$sourceSpec.Sha256) `
+                -PublisherPattern ([string]$sourceSpec.PublisherPattern) `
+                -OfflineMode $OfflineMode -CachePath $CachePath -TimeoutSeconds $TimeoutSeconds
+            [void]$providerSources.Add($source)
+            [void]$sources.Add($source)
+        }
+        $providers[$name] = [ordered]@{
+            Name = $name
+            Status = if (@($providerSources | Where-Object { -not $_.Ready }).Count -eq 0) { "Ready" } else { "Unavailable" }
+            Sources = @($providerSources)
+            Reason = @($providerSources | Where-Object { -not $_.Ready } | ForEach-Object { $_.Reason }) -join "; "
+        }
+    }
+    return [PSCustomObject][ordered]@{
+        SchemaVersion = 1
+        EvaluatedAt = (Get-Date).ToUniversalTime().ToString("o")
+        Mode = if ($OfflineMode) { "Offline" } else { "Online" }
+        CachePath = [string]$CachePath
+        TimeoutSeconds = $TimeoutSeconds
+        Ready = (@($sources | Where-Object { -not $_.Ready }).Count -eq 0)
+        Sources = @($sources)
+        Providers = $providers
+    }
+}
+
 function Get-SystemArchitecture {
     $architecture = [string]$env:PROCESSOR_ARCHITEW6432
     if ([string]::IsNullOrWhiteSpace($architecture)) {
@@ -5051,7 +5458,11 @@ function Invoke-VerifiedDownload {
         [Parameter(Mandatory = $true)]
         [string]$DestinationPath,
         [string]$PublisherPattern = "",
-        [int]$MaximumRedirects = 8
+        [int]$MaximumRedirects = 8,
+        [bool]$OfflineMode = $false,
+        [string]$CachePath = "",
+        [ValidateRange(1, 600)]
+        [int]$TimeoutSeconds = 30
     )
 
     if (-not (Test-AcquisitionUri -Uri $Uri -AllowedHosts $AllowedHosts)) {
@@ -5066,6 +5477,33 @@ function Invoke-VerifiedDownload {
         New-Item -ItemType Directory -Path $destinationDirectory -Force -ErrorAction Stop | Out-Null
     }
 
+    if ([string]::IsNullOrWhiteSpace($CachePath)) {
+        $CachePath = [string]$script:DependencyCachePath
+    }
+    $cacheArtifact = Test-DependencyCacheArtifact -Name $Name -ExpectedSha256 $ExpectedSha256 `
+        -PublisherPattern $PublisherPattern -CachePath $CachePath
+    if ($cacheArtifact.Valid) {
+        try {
+            [IO.File]::Copy($cacheArtifact.Path, $DestinationPath, $false)
+            $cachedVerification = Test-AcquiredFile -Path $DestinationPath -ExpectedSha256 $ExpectedSha256 `
+                -PublisherPattern $PublisherPattern
+            if (-not $cachedVerification.Valid) {
+                throw "$Name cache copy failed verification: $($cachedVerification.Reason)"
+            }
+            $cachedVerification.Path = $DestinationPath
+            return $cachedVerification
+        } catch {
+            Remove-Item -LiteralPath $DestinationPath -Force -ErrorAction SilentlyContinue
+            if ($OfflineMode) { throw }
+        }
+    }
+    if ($OfflineMode) {
+        throw "$Name is unavailable in offline mode: $($cacheArtifact.Reason)"
+    }
+    if (-not (Test-DownloadAllowed)) {
+        throw "$Name was deferred by the network download policy: $($script:DownloadPolicy.Reason)"
+    }
+
     $partialPath = "$DestinationPath.partial.$([guid]::NewGuid().ToString('N'))"
     $handler = $null
     $client = $null
@@ -5077,7 +5515,7 @@ function Invoke-VerifiedDownload {
         $handler = New-Object System.Net.Http.HttpClientHandler
         $handler.AllowAutoRedirect = $false
         $client = New-Object System.Net.Http.HttpClient($handler)
-        $client.Timeout = [TimeSpan]::FromMinutes(15)
+        $client.Timeout = [TimeSpan]::FromSeconds($TimeoutSeconds)
         $client.DefaultRequestHeaders.UserAgent.ParseAdd("SystemUpdatePro/$($script:Version)")
 
         $currentUri = [Uri]$Uri
@@ -5220,6 +5658,439 @@ function Remove-SystemUpdateProTemporaryDirectory {
 # ============================================================================
 # WINGET MANAGEMENT
 # ============================================================================
+
+function Get-PolicyDocument {
+    param([string]$Path = "")
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return [ordered]@{ SchemaVersion = 1 }
+    }
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "Policy file does not exist: $Path"
+    }
+    $access = Test-EvidencePathAccess -Path $Path
+    if (-not $access.Valid) {
+        throw "Policy file ACL is not trusted: $($access.Reason)"
+    }
+    $read = Read-ProtectedJsonFile -Path $Path
+    if (-not $read.Success) { throw "Policy file could not be read: $($read.Error)" }
+    $document = ConvertTo-Hashtable -InputObject $read.Data
+    if ($document -isnot [System.Collections.IDictionary]) {
+        throw "Policy file root must be a JSON object"
+    }
+    if ($document.Contains("schema_version") -and [int]$document.schema_version -ne 1) {
+        throw "Unsupported policy schema version"
+    }
+    return $document
+}
+
+function Get-WingetScopePlan {
+    param(
+        [AllowNull()][System.Collections.IDictionary]$SystemInfo = $null,
+        [bool]$WingetAvailable = $true
+    )
+
+    if ($null -eq $SystemInfo) {
+        $SystemInfo = $script:CurrentSystemInfo
+    }
+    if ($null -eq $SystemInfo) {
+        $SystemInfo = @{ ExecutionContext = "Unknown" }
+    }
+    $context = [string]$SystemInfo.ExecutionContext
+    $scopes = [System.Collections.ArrayList]::new()
+    $machineStatus = if ($WingetAvailable -and $context -in @("AdministratorUser", "System")) {
+        "Available"
+    } elseif (-not $WingetAvailable) { "Unavailable" } else { "Skipped" }
+    [void]$scopes.Add([ordered]@{
+        Scope = "machine"
+        Status = $machineStatus
+        CanUpgrade = ($machineStatus -eq "Available")
+        User = ""
+        Reason = switch ($machineStatus) {
+            "Available" { "Machine scope can be serviced by the elevated engine" }
+            "Unavailable" { "WinGet is not available for machine scope" }
+            default { "Execution context is not approved for machine scope" }
+        }
+    })
+    $userStatus = if (-not $WingetAvailable) { "Unavailable" } elseif ($context -eq "AdministratorUser") {
+        "Available"
+    } elseif ($context -eq "System") { "Skipped" } else { "Unavailable" }
+    [void]$scopes.Add([ordered]@{
+        Scope = "current-user"
+        Status = $userStatus
+        CanUpgrade = ($userStatus -eq "Available")
+        User = if ($userStatus -eq "Available") { [string]$env:USERNAME } else { "" }
+        Reason = switch ($userStatus) {
+            "Available" { "Current administrator user's scope is visible to this process" }
+            "Skipped" { "SYSTEM cannot safely claim visibility of a per-user package scope" }
+            default { "No authenticated user scope is available" }
+        }
+    })
+    [void]$scopes.Add([ordered]@{
+        Scope = "other-user"
+        Status = "Skipped"
+        CanUpgrade = $false
+        User = ""
+        Reason = "Other user profiles require a separately authenticated non-elevating session helper"
+    })
+    return [PSCustomObject][ordered]@{
+        SchemaVersion = 1
+        ExecutionContext = $context
+        Scopes = @($scopes)
+        SystemClaimsPerUserSuccess = ($context -eq "AdministratorUser")
+        Reason = if ($context -eq "System") {
+            "SYSTEM results are limited to machine scope; unseen per-user packages remain explicitly skipped"
+        } else {
+            "Machine and current-user scopes are modeled independently"
+        }
+    }
+}
+
+function ConvertFrom-WingetPackageOutput {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object[]]$Output
+    )
+
+    $text = (@($Output) | ForEach-Object { [string]$_ }) -join "`n"
+    $jsonStart = $text.IndexOf("{")
+    if ($jsonStart -lt 0) { $jsonStart = $text.IndexOf("[") }
+    if ($jsonStart -ge 0) {
+        try {
+            $parsed = ConvertTo-Hashtable -InputObject ($text.Substring($jsonStart) | ConvertFrom-Json -ErrorAction Stop)
+            $candidateItems = if ($parsed -is [System.Collections.IDictionary] -and $parsed.Contains("packages")) {
+                @($parsed.packages)
+            } else { @($parsed) }
+            if ($candidateItems.Count -gt 0) { return @($candidateItems) }
+        } catch {}
+    }
+    $items = [System.Collections.ArrayList]::new()
+    foreach ($line in @($Output)) {
+        $value = [string]$line
+        if ($value -notmatch "\S" -or $value -match "^(Name|Name\s+Id|[-\\|])" -or
+            $value -match "(?i)(upgrades available|no installed package)" ) { continue }
+        $columns = @($value -split "\s{2,}" | Where-Object { $_ -match "\S" })
+        if ($columns.Count -ge 2 -and $columns[1] -match "^[A-Za-z0-9][A-Za-z0-9_.-]*$") {
+            [void]$items.Add([ordered]@{
+                Name = [string]$columns[0]
+                Id = [string]$columns[1]
+                Version = if ($columns.Count -ge 3) { [string]$columns[2] } else { "" }
+                AvailableVersion = if ($columns.Count -ge 4) { [string]$columns[3] } else { "" }
+                Source = if ($columns.Count -ge 5) { [string]$columns[4] } else { "" }
+            })
+        }
+    }
+    return @($items)
+}
+
+function Get-WingetScopeInventory {
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("machine", "current-user", "other-user")]
+        [string]$Scope,
+        [AllowNull()][System.Collections.IDictionary]$SystemInfo = $null
+    )
+
+    $plan = Get-WingetScopePlan -SystemInfo $SystemInfo
+    $scopePlan = @($plan.Scopes | Where-Object { $_.Scope -eq $Scope })[0]
+    if ($null -eq $scopePlan) {
+        return [PSCustomObject]@{ SchemaVersion = 1; Scope = $Scope; Status = "Unavailable"; Items = @(); ExitCode = $null; Reason = "Scope is not modeled" }
+    }
+    if (-not $scopePlan.CanUpgrade) {
+        return [PSCustomObject]@{
+            SchemaVersion = 1; Scope = $Scope; Status = [string]$scopePlan.Status
+            Items = @(); ExitCode = $null; Reason = [string]$scopePlan.Reason
+        }
+    }
+    try {
+        $arguments = @("list", "--scope", $(if ($Scope -eq "current-user") { "user" } else { $Scope }),
+            "--accept-source-agreements", "--disable-interactivity")
+        $output = @(& winget @arguments 2>&1)
+        $exitCode = $LASTEXITCODE
+        $items = if ($exitCode -eq 0) { ConvertFrom-WingetPackageOutput -Output $output } else { @() }
+        return [PSCustomObject]@{
+            SchemaVersion = 1; Scope = $Scope
+            Status = if ($exitCode -eq 0) { "Ready" } else { "Unavailable" }
+            Items = @($items); ExitCode = $exitCode
+            Reason = if ($exitCode -eq 0) { "Scope inventory completed" } else { "WinGet scope inventory exited with $exitCode" }
+        }
+    } catch {
+        return [PSCustomObject]@{
+            SchemaVersion = 1; Scope = $Scope; Status = "Unavailable"; Items = @(); ExitCode = $null
+            Reason = "WinGet scope inventory failed: $(Protect-EvidenceText -Text $_.Exception.Message)"
+        }
+    }
+}
+
+function Get-WingetPackagePolicy {
+    param(
+        [string]$Path = "",
+        [string]$ExcludePath = ""
+    )
+
+    $policy = [ordered]@{
+        SchemaVersion = 1
+        Exclude = [System.Collections.ArrayList]::new()
+        Pins = [ordered]@{}
+        Conflicts = [ordered]@{}
+        Sources = @()
+        Errors = [System.Collections.ArrayList]::new()
+    }
+    try {
+        $document = Get-PolicyDocument -Path $Path
+        if ($document.Contains("winget") -and $document.winget -is [System.Collections.IDictionary]) {
+            $document = $document.winget
+        }
+        foreach ($pattern in @($document.exclude)) { if (-not [string]::IsNullOrWhiteSpace([string]$pattern)) { [void]$policy.Exclude.Add([string]$pattern) } }
+        if ($document.Contains("pins") -and $document.pins -is [System.Collections.IDictionary]) {
+            foreach ($key in $document.pins.Keys) { $policy.Pins[[string]$key] = [string]$document.pins[$key] }
+        }
+        if ($document.Contains("conflicts") -and $document.conflicts -is [System.Collections.IDictionary]) {
+            foreach ($key in $document.conflicts.Keys) { $policy.Conflicts[[string]$key] = ConvertTo-Hashtable -InputObject $document.conflicts[$key] }
+        }
+        if (-not [string]::IsNullOrWhiteSpace($Path)) { $policy.Sources += "policy:$Path" }
+    } catch {
+        [void]$policy.Errors.Add((Protect-EvidenceText -Text $_.Exception.Message))
+    }
+    if ([string]::IsNullOrWhiteSpace($ExcludePath)) {
+        $ExcludePath = Join-Path $script:DataPath "winget-exclude.txt"
+    }
+    if (Test-Path -LiteralPath $ExcludePath -PathType Leaf) {
+        try {
+            foreach ($line in @(Get-Content -LiteralPath $ExcludePath -ErrorAction Stop)) {
+                $pattern = ([string]$line).Trim()
+                if ($pattern -and $pattern -notmatch "^#") { [void]$policy.Exclude.Add($pattern) }
+            }
+            $policy.Sources += "exclude-file:$ExcludePath"
+        } catch {
+            [void]$policy.Errors.Add((Protect-EvidenceText -Text $_.Exception.Message))
+        }
+    }
+    $policy.Exclude = @($policy.Exclude | Select-Object -Unique)
+    return [PSCustomObject]$policy
+}
+
+function Get-WingetPackagePlan {
+    param(
+        [AllowEmptyCollection()][object[]]$Packages = @(),
+        [AllowNull()][object]$Policy = $null,
+        [string[]]$RunningProcessNames = @(),
+        [string]$Scope = "machine"
+    )
+
+    if ($null -eq $Policy) { $Policy = Get-WingetPackagePolicy }
+    $planned = [System.Collections.ArrayList]::new()
+    foreach ($package in @($Packages)) {
+        $id = [string](Get-ResultValue -Result $package -Names @("Id", "id", "PackageIdentifier") -Default "")
+        $name = [string](Get-ResultValue -Result $package -Names @("Name", "name") -Default $id)
+        $current = [string](Get-ResultValue -Result $package -Names @("Version", "version", "InstalledVersion") -Default "")
+        $available = [string](Get-ResultValue -Result $package -Names @("AvailableVersion", "available_version", "LatestVersion") -Default "")
+        $source = [string](Get-ResultValue -Result $package -Names @("Source", "source") -Default "")
+        $item = [ordered]@{
+            Scope = $Scope; Id = $id; Name = $name; CurrentVersion = $current
+            AvailableVersion = $available; Source = $source; Status = "Eligible"
+            Reason = "Package is eligible for unattended upgrade"; Conflict = $false
+            Deadline = ""; PinnedVersion = ""
+        }
+        $excluded = @($Policy.Exclude | Where-Object { $id -like [string]$_ -or $name -like [string]$_ }).Count -gt 0
+        if ($excluded) {
+            $item.Status = "Excluded"; $item.Reason = "Matched a wildcard package exclusion"
+        } elseif ($Policy.Pins -is [System.Collections.IDictionary] -and $Policy.Pins.Contains($id)) {
+            $pin = [string]$Policy.Pins[$id]
+            $item.PinnedVersion = $pin
+            $currentVersion = ConvertTo-SafeVersion -Value $current
+            $pinVersion = ConvertTo-SafeVersion -Value $pin
+            if ($null -eq $currentVersion -or $null -eq $pinVersion -or $currentVersion -lt $pinVersion) {
+                $item.Status = "Pinned"; $item.Reason = "Upgrade would cross the administrator's maximum pinned version"
+            } elseif ($null -ne (ConvertTo-SafeVersion -Value $available) -and
+                (ConvertTo-SafeVersion -Value $available) -gt $pinVersion) {
+                $item.Status = "Pinned"; $item.Reason = "Available version exceeds the administrator's maximum pinned version"
+            }
+        }
+        if ($item.Status -eq "Eligible" -and $Policy.Conflicts -is [System.Collections.IDictionary]) {
+            $conflictRule = $null
+            if ($Policy.Conflicts.Contains($id)) { $conflictRule = $Policy.Conflicts[$id] }
+            elseif ($Policy.Conflicts.Contains($name)) { $conflictRule = $Policy.Conflicts[$name] }
+            if ($null -ne $conflictRule) {
+                $processes = @()
+                if ($conflictRule -is [System.Collections.IDictionary]) {
+                    if ($conflictRule.Contains("processes")) { $processes += @($conflictRule.processes) }
+                    if ($conflictRule.Contains("Processes")) { $processes += @($conflictRule.Processes) }
+                }
+                $matched = @($processes | Where-Object { $RunningProcessNames -contains [string]$_ })
+                if ($matched.Count -gt 0) {
+                    $item.Conflict = $true
+                    $action = [string]$conflictRule.action
+                    if ([string]::IsNullOrWhiteSpace($action)) { $action = [string]$conflictRule.Action }
+                    if ($action -eq "close-with-deadline") {
+                        $minutes = 15
+                        [void][int]::TryParse([string]$conflictRule.deadline_minutes, [ref]$minutes)
+                        $item.Status = "Deferred"
+                        $item.Deadline = (Get-Date).AddMinutes([math]::Max(1, $minutes)).ToUniversalTime().ToString("o")
+                        $item.Reason = "Conflict requires a user-session deadline; unattended execution will not force-close the process"
+                    } elseif ($action -eq "skip") {
+                        $item.Status = "Skipped"; $item.Reason = "Configured conflicting process is running"
+                    } else {
+                        $item.Status = "Deferred"; $item.Reason = "Configured conflicting process is running; package was deferred"
+                    }
+                }
+            }
+        }
+        [void]$planned.Add([PSCustomObject]$item)
+    }
+    return [PSCustomObject][ordered]@{
+        SchemaVersion = 1; Scope = $Scope; EvaluatedAt = (Get-Date).ToUniversalTime().ToString("o")
+        Items = @($planned)
+        Eligible = @($planned | Where-Object Status -eq "Eligible")
+        Skipped = @($planned | Where-Object Status -in @("Excluded", "Skipped", "Pinned"))
+        Deferred = @($planned | Where-Object Status -eq "Deferred")
+        Conflicts = @($planned | Where-Object Conflict)
+    }
+}
+
+function Get-EndpointCohort {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$DeviceIdentity,
+        [string]$Cohort = "default"
+    )
+
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [Text.Encoding]::UTF8.GetBytes("$Cohort|$DeviceIdentity")
+        $digest = $sha.ComputeHash($bytes)
+        $value = [BitConverter]::ToUInt32($digest, 0)
+        return [int]($value % 100)
+    } finally { $sha.Dispose() }
+}
+
+function Get-RolloutPolicy {
+    param([string]$Path = "")
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return [PSCustomObject][ordered]@{
+            SchemaVersion = 1; Enabled = $false; Cohort = "default"; PercentageStart = 0; PercentageEnd = 100
+            MinimumSuccessCount = 0; MinimumSuccessRate = 1.0; BakeTimeHours = 0; Deadline = ""
+            EmergencyOverride = $false; Approved = @{}; Reason = "No rollout policy configured"
+        }
+    }
+    try {
+        $document = Get-PolicyDocument -Path $Path
+        $rollout = if ($document.Contains("rollout")) { $document.rollout } else { $document }
+        $start = 0; $end = 100; $minimumCount = 1; $minimumRate = 1.0; $bakeHours = 0
+        [void][int]::TryParse([string]$rollout.percentage_start, [ref]$start)
+        [void][int]::TryParse([string]$rollout.percentage_end, [ref]$end)
+        [void][int]::TryParse([string]$rollout.minimum_success_count, [ref]$minimumCount)
+        [void][double]::TryParse([string]$rollout.minimum_success_rate, [ref]$minimumRate)
+        [void][int]::TryParse([string]$rollout.bake_time_hours, [ref]$bakeHours)
+        return [PSCustomObject][ordered]@{
+            SchemaVersion = 1; Enabled = $true
+            Cohort = if ($rollout.cohort) { [string]$rollout.cohort } else { "default" }
+            PercentageStart = [math]::Max(0, [math]::Min(99, $start))
+            PercentageEnd = [math]::Max(1, [math]::Min(100, $end))
+            MinimumSuccessCount = [math]::Max(0, $minimumCount)
+            MinimumSuccessRate = [math]::Max(0.0, [math]::Min(1.0, $minimumRate))
+            BakeTimeHours = [math]::Max(0, $bakeHours)
+            Deadline = [string]$rollout.deadline
+            EmergencyOverride = [bool]$rollout.emergency_override
+            Approved = if ($rollout.approved) { ConvertTo-Hashtable -InputObject $rollout.approved } else { @{} }
+            Reason = "Rollout policy loaded from protected local evidence"
+        }
+    } catch {
+        return [PSCustomObject][ordered]@{
+            SchemaVersion = 1; Enabled = $false; Cohort = "default"; PercentageStart = 0; PercentageEnd = 0
+            MinimumSuccessCount = 0; MinimumSuccessRate = 1.0; BakeTimeHours = 0; Deadline = ""
+            EmergencyOverride = $false; Approved = @{}; Reason = Protect-EvidenceText -Text $_.Exception.Message
+            Error = $true
+        }
+    }
+}
+
+function Get-RolloutEvidence {
+    param([AllowEmptyCollection()][object[]]$HistoryEntries = @())
+
+    $successEntries = @($HistoryEntries | Where-Object {
+        [string]$_.status -in @("Succeeded", "SucceededRebootRequired")
+    })
+    $failureEntries = @($HistoryEntries | Where-Object {
+        [string]$_.status -in @("Partial", "Failed")
+    })
+    $lastSuccess = @($successEntries | Sort-Object timestamp -Descending | Select-Object -First 1)
+    return [PSCustomObject][ordered]@{
+        SchemaVersion = 1
+        SuccessCount = $successEntries.Count
+        FailureCount = $failureEntries.Count
+        LastSuccessAt = if ($lastSuccess.Count -gt 0) { [string]$lastSuccess[0].timestamp } else { "" }
+        SampleCount = $successEntries.Count + $failureEntries.Count
+        Source = "local update history"
+    }
+}
+
+function Evaluate-RolloutPromotion {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Policy,
+        [Parameter(Mandatory = $true)]
+        [object]$Evidence,
+        [int]$CohortValue = 0,
+        [bool]$EmergencyOverride = $false
+    )
+
+    $reasons = [System.Collections.ArrayList]::new()
+    if (-not [bool]$Policy.Enabled) {
+        return [PSCustomObject][ordered]@{
+            SchemaVersion = 1; Decision = "NotConfigured"; CohortValue = $CohortValue
+            SuccessCount = 0; FailureCount = 0; SuccessRate = 0.0; Reasons = @([string]$Policy.Reason)
+            AuditedOverride = $false; EvaluatedAt = (Get-Date).ToUniversalTime().ToString("o")
+        }
+    }
+    if ($CohortValue -lt [int]$Policy.PercentageStart -or $CohortValue -ge [int]$Policy.PercentageEnd) {
+        [void]$reasons.Add("Endpoint cohort value $CohortValue is outside the assigned rollout range")
+        return [PSCustomObject][ordered]@{
+            SchemaVersion = 1; Decision = "Hold"; CohortValue = $CohortValue
+            SuccessCount = [int]$Evidence.SuccessCount; FailureCount = [int]$Evidence.FailureCount
+            SuccessRate = 0.0; Reasons = @($reasons); AuditedOverride = $false
+            EvaluatedAt = (Get-Date).ToUniversalTime().ToString("o")
+        }
+    }
+    if ($EmergencyOverride -or [bool]$Policy.EmergencyOverride) {
+        [void]$reasons.Add("Emergency override was explicitly recorded by the administrator")
+        return [PSCustomObject][ordered]@{
+            SchemaVersion = 1; Decision = "Promote"; CohortValue = $CohortValue
+            SuccessCount = [int]$Evidence.SuccessCount; FailureCount = [int]$Evidence.FailureCount
+            SuccessRate = 1.0; Reasons = @($reasons); AuditedOverride = $true
+            EvaluatedAt = (Get-Date).ToUniversalTime().ToString("o")
+        }
+    }
+    $successCount = [int]$Evidence.SuccessCount
+    $failureCount = [int]$Evidence.FailureCount
+    $total = $successCount + $failureCount
+    $rate = if ($total -gt 0) { [double]$successCount / $total } else { 0.0 }
+    if ($failureCount -gt 0 -and $rate -lt [double]$Policy.MinimumSuccessRate) {
+        [void]$reasons.Add("Observed success rate $([math]::Round($rate * 100, 2))% is below the required $([math]::Round([double]$Policy.MinimumSuccessRate * 100, 2))%")
+        $decision = "Halt"
+    } elseif ($successCount -lt [int]$Policy.MinimumSuccessCount) {
+        [void]$reasons.Add("Waiting for at least $($Policy.MinimumSuccessCount) successful endpoint result(s)")
+        $decision = "Hold"
+    } else {
+        $lastSuccess = [datetime]::MinValue
+        [void][datetime]::TryParse([string]$Evidence.LastSuccessAt, [ref]$lastSuccess)
+        if ($lastSuccess -eq [datetime]::MinValue -or
+            ((Get-Date).ToUniversalTime() - $lastSuccess.ToUniversalTime()).TotalHours -lt [double]$Policy.BakeTimeHours) {
+            [void]$reasons.Add("Bake time has not elapsed")
+            $decision = "Hold"
+        } else {
+            [void]$reasons.Add("Success count, rate, and bake-time requirements passed")
+            $decision = "Promote"
+        }
+    }
+    return [PSCustomObject][ordered]@{
+        SchemaVersion = 1; Decision = $decision; CohortValue = $CohortValue
+        SuccessCount = $successCount; FailureCount = $failureCount; SuccessRate = $rate
+        Reasons = @($reasons); AuditedOverride = $false
+        EvaluatedAt = (Get-Date).ToUniversalTime().ToString("o")
+    }
+}
 
 function Get-WingetTrustEvidence {
     $spec = Get-AcquisitionManifestEntry -Name "WinGet"
@@ -5384,9 +6255,13 @@ function Invoke-WingetUpgradeAll {
         Success = $false; RebootRequired = $false
         UpdateCount = 0; Available = 0; Attempted = 0; Installed = 0; Failed = 0; Skipped = 0
         ExitCode = $null; HResult = $null; Items = @(); Evidence = @(); Message = ""
+        ScopeResults = @(); Plans = [System.Collections.ArrayList]::new(); Policy = $null
     }
 
     Write-Log "========== WINGET UPGRADE ALL ==========" "HEADER"
+
+    $policy = Get-WingetPackagePolicy -Path ([string]$script:PolicyPath)
+    $result.Policy = $policy
 
     if (-not (Test-WingetInstalled)) {
         if (-not (Install-Winget)) {
@@ -5397,9 +6272,23 @@ function Invoke-WingetUpgradeAll {
         }
     }
 
+    $scopePlan = Get-WingetScopePlan -SystemInfo $script:CurrentSystemInfo -WingetAvailable $true
+    $result.ScopeResults = @($scopePlan.Scopes)
+    $script:WingetScopeResults = @($scopePlan.Scopes)
+    if (-not (Test-DownloadAllowed)) {
+        $result.Success = $true
+        $result.Skipped = 1
+        $result.Message = "WinGet deferred by network download policy: $($script:DownloadPolicy.Reason)"
+        $result.Evidence = @("download-policy:$($script:DownloadPolicy.Status)")
+        Write-Log $result.Message "WARNING"
+        return $result
+    }
+
     try {
-        # Update sources
-        & winget source update --disable-interactivity 2>&1 | Out-Null
+        # Source refresh mutates WinGet state, so never perform it during a dry run.
+        if (-not $DryRun) {
+            & winget source update --disable-interactivity 2>&1 | Out-Null
+        }
 
         if ($DryRun) {
             Write-Log "Checking for available winget upgrades..." "INFO"
@@ -5433,6 +6322,46 @@ function Invoke-WingetUpgradeAll {
         }
 
         Write-Log "Running winget upgrade --all..." "INFO"
+
+        $hasPackagePolicy = @($policy.Exclude).Count -gt 0 -or
+            ($policy.Pins -is [System.Collections.IDictionary] -and $policy.Pins.Count -gt 0) -or
+            ($policy.Conflicts -is [System.Collections.IDictionary] -and $policy.Conflicts.Count -gt 0)
+        if ($hasPackagePolicy) {
+            $runningProcesses = @(Get-Process -ErrorAction SilentlyContinue | ForEach-Object { [string]$_.ProcessName })
+            $policyItems = [System.Collections.ArrayList]::new()
+            foreach ($scope in @($scopePlan.Scopes | Where-Object CanUpgrade)) {
+                $inventory = Get-WingetScopeInventory -Scope ([string]$scope.Scope) -SystemInfo $script:CurrentSystemInfo
+                $plan = Get-WingetPackagePlan -Packages @($inventory.Items) -Policy $policy `
+                    -RunningProcessNames $runningProcesses -Scope ([string]$scope.Scope)
+                [void]$result.Plans.Add($plan)
+                foreach ($planItem in @($plan.Items)) {
+                    [void]$policyItems.Add((New-UpdateItemResult -Name ([string]$planItem.Name) `
+                        -Id ([string]$planItem.Id) `
+                        -Status $(if ($planItem.Status -eq "Eligible") { "Attempted" } elseif ($planItem.Status -eq "Deferred") { "Skipped" } else { "Skipped" }) `
+                        -Message ([string]$planItem.Reason) `
+                        -Evidence @("scope:$($planItem.Scope)", "policy-status:$($planItem.Status)")))
+                }
+                foreach ($eligible in @($plan.Eligible)) {
+                    $arguments = @("upgrade", "--id", [string]$eligible.Id, "--silent",
+                        "--accept-package-agreements", "--accept-source-agreements", "--disable-interactivity",
+                        "--scope", $(if ($scope.Scope -eq "current-user") { "user" } else { "machine" }))
+                    $process = Start-Process -FilePath "winget" -ArgumentList $arguments -Wait -NoNewWindow -PassThru
+                    $result.Attempted++
+                    if ($process.ExitCode -in @(0, -1978335189)) {
+                        $result.Installed++
+                        $result.UpdateCount++
+                    } else {
+                        $result.Failed++
+                    }
+                }
+            }
+            $result.Items = @($policyItems)
+            $result.Skipped = @($policyItems | Where-Object { $_.Skipped }).Count
+            $result.Success = ($result.Failed -eq 0)
+            $result.Message = "WinGet policy plan completed: $($result.Installed) installed, $($result.Skipped) skipped/deferred"
+            $script:WingetUpdateCount = $result.Installed
+            return $result
+        }
 
         $wingetArgs = @(
             "upgrade", "--all", "--silent",
@@ -8512,6 +9441,10 @@ function New-WebhookPayload {
         mutation_recovery = @($RunData.MutationRecovery)
         capabilities = $RunData.Capabilities
         retention = $RunData.Retention
+        dependency_readiness = $RunData.DependencyReadiness
+        download_policy = $RunData.DownloadPolicy
+        winget_scopes = @($RunData.WingetScopes)
+        rollout_decision = $RunData.RolloutDecision
     })
 }
 
@@ -10292,6 +11225,7 @@ try {
         $preflightItems = [System.Collections.ArrayList]::new()
 
         $sysInfo = Get-SystemInfo
+        $script:CurrentSystemInfo = $sysInfo
         Add-SensitiveEvidenceValue -Value ([string]$sysInfo.SerialNumber)
         Write-Log "System: $($sysInfo.Manufacturer) $($sysInfo.Model)" "INFO"
         Write-Log "OS: $($sysInfo.OSName) (Build $($sysInfo.OSBuild))" "DEBUG"
@@ -10362,12 +11296,70 @@ try {
                 )))
         }
 
-        if (Test-InternetConnection) {
-            [void]$preflightItems.Add((New-UpdateItemResult -Name "Internet connectivity" -Status "Succeeded"))
-        } else {
-            Write-Log "No internet connection" "WARNING"
-            [void]$preflightItems.Add((New-UpdateItemResult -Name "Internet connectivity" -Status "Warning" -Message "No internet connection detected"))
+        $dependencyNames = [System.Collections.ArrayList]::new()
+        if (-not $SkipWindows) { [void]$dependencyNames.Add("PSWindowsUpdate") }
+        if (-not $SkipWinget) { [void]$dependencyNames.Add("WinGet") }
+        if (-not $SkipOEM -and $oemCapabilityName) {
+            [void]$dependencyNames.Add($(switch ($oemCapabilityName) {
+                "Dell" { "DellCommandUpdate" }
+                "Lenovo" { "LSUClient" }
+                "HP" { "HPIA" }
+            }))
         }
+        $dependencyNameArray = @($dependencyNames | ForEach-Object { [string]$_ })
+        $script:DependencyReadiness = Get-DependencyReadiness -Names $dependencyNameArray `
+            -CachePath $DependencyCachePath -OfflineMode $Offline -TimeoutSeconds $SourceTimeoutSeconds
+        foreach ($source in @($script:DependencyReadiness.Sources)) {
+            $sourceStatus = if ($source.Ready) { "Succeeded" } else { "Warning" }
+            [void]$preflightItems.Add((New-UpdateItemResult -Name "Dependency source: $($source.Name)" `
+                -Status $sourceStatus -Message ([string]$source.Reason) `
+                -Evidence @("status:$($source.Status)", "host:$($source.Host)", "timeout:$($source.TimeoutSeconds)")))
+        }
+        if ($Offline) {
+            [void]$preflightItems.Add((New-UpdateItemResult -Name "Network connectivity" -Status "Skipped" `
+                -Message "Offline mode is active; only verified content-addressed cache artifacts may be consumed"))
+        } else {
+            $internetEndpoints = @($script:DependencyReadiness.Sources | ForEach-Object { [string]$_.Uri })
+            if (Test-InternetConnection -Endpoints $internetEndpoints) {
+                [void]$preflightItems.Add((New-UpdateItemResult -Name "Internet connectivity" -Status "Succeeded"))
+            } else {
+                Write-Log "No configured dependency origin is reachable" "WARNING"
+                [void]$preflightItems.Add((New-UpdateItemResult -Name "Internet connectivity" -Status "Warning" `
+                    -Message "No configured dependency origin responded to the readiness probe"))
+            }
+        }
+
+        $networkCost = Get-NetworkCostState
+        $script:DownloadPolicy = Get-DownloadPolicy -NetworkCost $networkCost `
+            -AllowOverride $AllowMeteredNetwork -DryRunMode $DryRun
+        $downloadItemStatus = switch ([string]$script:DownloadPolicy.Status) {
+            "Allowed" { "Succeeded" }
+            "AllowedWithWarning" { "Warning" }
+            default { "Blocked" }
+        }
+        [void]$preflightItems.Add((New-UpdateItemResult -Name "Provider download policy" `
+            -Status $downloadItemStatus -Message ([string]$script:DownloadPolicy.Reason) `
+            -Evidence @("network-cost:$($networkCost.Status)", "audited-override:$($script:DownloadPolicy.AuditedOverride)", "dry-run:$DryRun")))
+
+        $script:PackagePolicy = Get-WingetPackagePolicy -Path ([string]$PolicyPath)
+        $script:RolloutPolicy = Get-RolloutPolicy -Path ([string]$RolloutPolicyPath)
+        $deviceIdentity = if (-not [string]::IsNullOrWhiteSpace([string]$sysInfo.SerialNumber)) {
+            [string]$sysInfo.SerialNumber
+        } else { [string]$env:COMPUTERNAME }
+        $cohortValue = Get-EndpointCohort -DeviceIdentity $deviceIdentity -Cohort ([string]$script:RolloutPolicy.Cohort)
+        $historyForRollout = Read-UpdateHistory
+        $rolloutEvidence = Get-RolloutEvidence -HistoryEntries $(if ($null -ne $historyForRollout) {
+            @($historyForRollout.entries)
+        } else { @() })
+        $script:RolloutDecision = Evaluate-RolloutPromotion -Policy $script:RolloutPolicy `
+            -Evidence $rolloutEvidence -CohortValue $cohortValue
+        [void]$preflightItems.Add((New-UpdateItemResult -Name "Progressive rollout policy" `
+            -Status $(switch ([string]$script:RolloutDecision.Decision) {
+                "Promote" { "Succeeded" }
+                "NotConfigured" { "Skipped" }
+                default { "Warning" }
+            }) -Message ((@($script:RolloutDecision.Reasons) -join "; ")) `
+            -Evidence @("decision:$($script:RolloutDecision.Decision)", "cohort:$cohortValue")))
 
         $disk = Test-DiskSpace -MinGB $MinDiskSpaceGB
         Write-Log $disk.Message "DEBUG"

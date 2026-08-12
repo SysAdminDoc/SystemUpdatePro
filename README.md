@@ -45,6 +45,9 @@ SystemUpdatePro is a fully automated, self-healing PowerShell script that handle
 - **Protected Evidence Store**: Uses write-through atomic replacement, last-known-good recovery, corrupt-file quarantine, verified SYSTEM/Administrators ACLs, and configurable secret/serial redaction
 - **Diagnostic Bundle**: Produces one bounded, hash-manifested, fully redacted archive of the latest run, provider output, Windows servicing evidence, and recovery status
 - **Validated Inputs and Secret References**: Rejects unsafe ranges, paths, and endpoints before initialization; webhook secrets resolve from environment or protected-file references instead of process arguments
+- **Source-Specific Readiness and Offline Cache**: Probes only enabled provider origins with bounded timeouts, records proxy/source failures, and consumes administrator-prefilled SHA-256 content-addressed artifacts when `-Offline` is used
+- **Scoped Package Policy**: Models WinGet machine, current-user, other-user, unavailable, and skipped scopes; applies wildcard exclusions, version pins, and process-conflict deferrals without force-closing user applications
+- **Network and Rollout Gates**: Blocks downloads on known metered links by default, records explicit overrides, assigns deterministic endpoint cohorts, and emits local promote/hold/halt evidence
 
 ### Enterprise Integration
 - **Event Log**: Writes to Windows Application log for RMM/SIEM visibility
@@ -195,6 +198,15 @@ The standalone command requires administrator privileges, prints the completed a
 
 # Kitchen sink: backup drivers, dry run with an RMM-provided webhook secret
 .\SystemUpdatePro.ps1 -DryRun -BackupDrivers -WebhookSecretReference "env:SYSTEMUPDATEPRO_WEBHOOK_URL"
+
+# Offline servicing from an administrator-prefilled SHA-256 cache
+.\SystemUpdatePro.ps1 -Offline -DependencyCachePath "C:\ProgramData\SystemUpdatePro\Cache"
+
+# Apply protected package/conflict/pin policy and a local rollout policy
+.\SystemUpdatePro.ps1 -PolicyPath "C:\ProgramData\SystemUpdatePro\policy.json" -RolloutPolicyPath "C:\ProgramData\SystemUpdatePro\rollout.json"
+
+# Explicitly permit provider downloads on a known metered connection
+.\SystemUpdatePro.ps1 -AllowMeteredNetwork
 ```
 
 ---
@@ -227,6 +239,12 @@ The standalone command requires administrator privileges, prints the completed a
 | `-RedactionMode` | Enum | SecretsAndSerials | `Secrets` or `SecretsAndSerials` for persisted evidence |
 | `-CreateDiagnosticBundle` | Switch | False | Create a diagnostic/recovery ZIP from the latest local evidence, then exit |
 | `-DiagnosticBundleMaxSizeMB` | Int | 50 | Hard archive-size ceiling (5-512 MB) |
+| `-Offline` | Switch | False | Disable network acquisition and use only verified cache artifacts |
+| `-DependencyCachePath` | String | C:\ProgramData\SystemUpdatePro\Cache | Content-addressed dependency cache root |
+| `-SourceTimeoutSeconds` | Int | 30 | Timeout for each configured dependency-origin readiness probe |
+| `-AllowMeteredNetwork` | Switch | False | Audited override for the known-metered download policy |
+| `-PolicyPath` | String | (none) | Protected JSON package policy: exclusions, pins, and process conflicts |
+| `-RolloutPolicyPath` | String | (none) | Protected JSON local cohort/promotion policy |
 | `-Reboot` | Switch | False | Allow automatic reboot if required |
 | `-Force` | Switch | False | Continue non-firmware work despite low disk or pending reboot; never overrides unknown/blocked firmware safety |
 
@@ -289,6 +307,8 @@ Get-EventLog -LogName Application -Source "SystemUpdatePro" -Newest 10
 | `C:\ProgramData\SystemUpdatePro\DriverBackups\` | Driver backup snapshots (last 3 kept) |
 | `C:\ProgramData\SystemUpdatePro\Bundles\` | Protected diagnostic/recovery ZIP archives |
 | `C:\ProgramData\SystemUpdatePro\WebhookDeliveries\` | Atomic per-run webhook attempt and terminal-status records |
+| `C:\ProgramData\SystemUpdatePro\Cache\sha256\` | Optional administrator-prefilled content-addressed dependency artifacts |
+| `C:\ProgramData\SystemUpdatePro\winget-exclude.txt` | Optional wildcard WinGet exclusion list |
 | `C:\ProgramData\SystemUpdatePro\webhook.json` | Optional operator-provisioned webhook config (SYSTEM/Administrators ACL required) |
 | `C:\ProgramData\SystemUpdatePro\HPIA\` | HP Image Assistant installation |
 
