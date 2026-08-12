@@ -21,6 +21,7 @@
     - HTML summary report generation
     - Versioned, retryable webhook notifications (Slack, Teams Workflows, generic)
     - Driver backup before OEM updates
+    - Automatic throttled System Restore point creation and DISM driver rollback
     - Update history tracking with JSON log
     - Bounded, redacted diagnostic and recovery archives
 
@@ -51,6 +52,8 @@
     Preview available updates without installing anything
 .PARAMETER BackupDrivers
     Export current drivers before installing OEM/driver updates
+.PARAMETER RollbackDrivers
+    Restore the newest protected driver backup with DISM and skip forward-update stages
 .PARAMETER ShowHistory
     Display update history from previous runs
 .PARAMETER WebhookSecretReference
@@ -158,6 +161,7 @@ param(
     [switch]$ContinueAfterReboot,
     [switch]$DryRun,
     [switch]$BackupDrivers,
+    [switch]$RollbackDrivers,
     [switch]$ShowHistory,
     [ValidateScript({
         if ([string]::IsNullOrWhiteSpace([string]$_)) { return $true }
@@ -270,6 +274,7 @@ $script:FeatureDeferralDays = [int]$FeatureDeferralDays
 $script:SecurityOnly = [bool]$SecurityOnly
 $script:PreStage = [bool]$PreStage
 $script:Interactive = [bool]$Interactive
+$script:RollbackDrivers = [bool]$RollbackDrivers
 $script:DependencyReadiness = $null
 $script:DownloadPolicy = $null
 $script:CurrentSystemInfo = $null
@@ -286,7 +291,7 @@ $script:EvidenceMaxSizeMB = [int]$EvidenceMaxSizeMB
 $script:RedactionMode = [string]$RedactionMode
 $script:EventLogSource = "SystemUpdatePro"
 $script:ResultSchemaVersion = 1
-$script:StateSchemaVersion = 7
+$script:StateSchemaVersion = 8
 $script:CapabilitySchemaVersion = 1
 $script:HistorySchemaVersion = 2
 $script:LockSchemaVersion = 1
@@ -1466,7 +1471,7 @@ function Get-RunExitCode {
     $partialStages = @($Stages | Where-Object { $_.Status -eq "Partial" })
     if ($failedStages.Count -gt 0 -or $partialStages.Count -gt 0) {
         $successfulWork = @($Stages | Where-Object {
-            $_.Name -in @("OEM", "WindowsUpdate", "Winget", "PackageManagers", "DriverBackup", "WindowsUpdateRepair", "Cleanup", "Continuation") -and
+            $_.Name -in @("OEM", "WindowsUpdate", "Winget", "PackageManagers", "DriverBackup", "DriverRollback", "WindowsUpdateRepair", "Cleanup", "Continuation") -and
             ($_.Status -eq "Succeeded" -or $_.Installed -gt 0)
         }).Count
         if ($successfulWork -gt 0) { return 2 }
@@ -1644,6 +1649,7 @@ function Get-EffectiveRunParameter {
         ContinueAfterReboot = $ContinueAfterReboot.IsPresent
         DryRun             = $DryRun.IsPresent
         BackupDrivers      = $BackupDrivers.IsPresent
+        RollbackDrivers    = $RollbackDrivers.IsPresent
         ShowHistory        = $false
         WebhookSecretReference = [string]$WebhookSecretReference
         HistoryCount       = [int]$HistoryCount
@@ -1674,7 +1680,7 @@ function Get-ContinuationParameterName {
     return @(
         "SkipOEM", "SkipWindows", "SkipWinget", "IncludeBIOS", "BypassWSUS",
         "RepairWindowsUpdate", "CleanupAfter", "ResetComponentBase", "ContinueAfterReboot", "DryRun",
-        "BackupDrivers", "ShowHistory", "WebhookSecretReference", "HistoryCount", "MaxRetries",
+        "BackupDrivers", "RollbackDrivers", "ShowHistory", "WebhookSecretReference", "HistoryCount", "MaxRetries",
         "MaxUpdatePasses", "MinDiskSpaceGB", "MinFirmwareChargePercent", "LogPath",
         "LogRetentionDays", "EvidenceMaxSizeMB", "RedactionMode", "Reboot", "Force",
         "Offline", "DependencyCachePath", "SourceTimeoutSeconds", "AllowMeteredNetwork",
@@ -1753,6 +1759,14 @@ function Convert-ContinuationStateSchema {
             $migrated.Parameters["Interactive"] = $false
         }
         $migrated["SchemaVersion"] = 7
+        $schemaVersion = 7
+        $migrated["_MigrationSourceSchema"] = $migrationSourceSchema
+    }
+    if ($schemaVersion -eq 7 -and $migrated.Parameters -is [System.Collections.IDictionary]) {
+        if (-not $migrated.Parameters.Contains("RollbackDrivers")) {
+            $migrated.Parameters["RollbackDrivers"] = $false
+        }
+        $migrated["SchemaVersion"] = 8
         $migrated["_MigrationSourceSchema"] = $migrationSourceSchema
     }
     return $migrated
@@ -1943,7 +1957,7 @@ function Import-ContinuationState {
     $switchNames = @(
         "SkipOEM", "SkipWindows", "SkipWinget", "IncludeBIOS", "BypassWSUS",
         "RepairWindowsUpdate", "CleanupAfter", "ResetComponentBase", "ContinueAfterReboot", "DryRun",
-        "BackupDrivers", "ShowHistory", "Reboot", "Force", "SecurityOnly", "PreStage", "Interactive"
+        "BackupDrivers", "RollbackDrivers", "ShowHistory", "Reboot", "Force", "SecurityOnly", "PreStage", "Interactive"
     )
     $integerNames = @(
         "HistoryCount", "MaxRetries", "MaxUpdatePasses", "MinDiskSpaceGB",
@@ -3057,6 +3071,236 @@ function Show-UpdateHistory {
 }
 
 # ============================================================================
+# SYSTEM RESTORE AND DRIVER ROLLBACK
+# ============================================================================
+
+function Get-RestorePointThrottleMinutes {
+    param(
+        [string]$RegistryPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore"
+    )
+
+    $defaultMinutes = 1440
+    try {
+        $configured = [int](Get-ItemProperty -LiteralPath $RegistryPath `
+            -Name "SystemRestorePointCreationFrequency" -ErrorAction Stop).SystemRestorePointCreationFrequency
+        if ($configured -ge 0 -and $configured -le 525600) {
+            return $configured
+        }
+    } catch { }
+    return $defaultMinutes
+}
+
+function Invoke-RestorePointIfNeeded {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSUseShouldProcessForStateChangingFunctions", "", Justification = "Creates one throttled System Restore point through the Windows restore-point provider.")]
+    param(
+        [string]$RunId = [string]$script:RunId,
+        [bool]$DryRunMode = [bool]$script:DryRun
+    )
+
+    $markerPath = Join-Path $script:DataPath "restore_point.json"
+    $throttleMinutes = Get-RestorePointThrottleMinutes
+    $result = [ordered]@{
+        SchemaVersion = 1
+        Success = $false
+        Status = "Failed"
+        Created = $false
+        Attempted = 0
+        Installed = 0
+        Failed = 0
+        Skipped = 0
+        DryRun = $DryRunMode
+        ThrottleMinutes = $throttleMinutes
+        CreatedAt = ""
+        Path = $markerPath
+        Reason = ""
+        Evidence = @()
+    }
+
+    $lastCreatedAt = $null
+    if (Test-Path -LiteralPath $markerPath -PathType Leaf) {
+        try {
+            $markerRead = Read-ProtectedJsonFile -Path $markerPath
+            $marker = if ($markerRead.Success) { $markerRead.Data } else { $null }
+            if ($null -ne $marker -and -not [string]::IsNullOrWhiteSpace([string]$marker.CreatedAt)) {
+                $lastCreatedAt = [datetime]::Parse([string]$marker.CreatedAt).ToUniversalTime()
+            }
+        } catch { }
+    }
+    if ($null -eq $lastCreatedAt) {
+        try {
+            $restorePointCommand = Get-Command -Name "Get-ComputerRestorePoint" -ErrorAction SilentlyContinue
+            if ($null -ne $restorePointCommand) {
+                foreach ($restorePoint in @(Get-ComputerRestorePoint -ErrorAction Stop)) {
+                    try {
+                        $candidate = [datetime]$restorePoint.CreationTime
+                        if ($null -eq $lastCreatedAt -or $candidate -gt $lastCreatedAt) {
+                            $lastCreatedAt = $candidate.ToUniversalTime()
+                        }
+                    } catch { }
+                }
+            }
+        } catch { }
+    }
+
+    if ($null -ne $lastCreatedAt -and $throttleMinutes -gt 0) {
+        $ageMinutes = ((Get-Date).ToUniversalTime() - $lastCreatedAt).TotalMinutes
+        if ($ageMinutes -ge 0 -and $ageMinutes -lt $throttleMinutes) {
+            $result.Success = $true
+            $result.Status = "Skipped"
+            $result.Skipped = 1
+            $result.CreatedAt = $lastCreatedAt.ToString("o")
+            $result.Reason = "System Restore point creation is throttled for another $([math]::Ceiling($throttleMinutes - $ageMinutes)) minute(s)"
+            $result.Evidence = @("last-created:$($lastCreatedAt.ToString('o'))", "throttle-minutes:$throttleMinutes")
+            return [PSCustomObject]$result
+        }
+    }
+
+    if ($DryRunMode) {
+        $result.Success = $true
+        $result.Status = "Skipped"
+        $result.Skipped = 1
+        $result.Reason = "Dry run would create a System Restore point before update work"
+        $result.Evidence = @("throttle-minutes:$throttleMinutes", "marker:$markerPath")
+        return [PSCustomObject]$result
+    }
+
+    $checkpointCommand = Get-Command -Name "Checkpoint-Computer" -ErrorAction SilentlyContinue
+    if ($null -eq $checkpointCommand) {
+        $result.Success = $true
+        $result.Status = "Skipped"
+        $result.Skipped = 1
+        $result.Reason = "System Restore point provider is unavailable on this Windows installation"
+        return [PSCustomObject]$result
+    }
+
+    try {
+        Checkpoint-Computer -Description "SystemUpdatePro $RunId" `
+            -RestorePointType "MODIFY_SETTINGS" -ErrorAction Stop
+        $createdAt = (Get-Date).ToUniversalTime()
+        $markerData = [ordered]@{
+            SchemaVersion = 1
+            RunId = $RunId
+            CreatedAt = $createdAt.ToString("o")
+            ThrottleMinutes = $throttleMinutes
+        }
+        if (-not (Write-ProtectedAtomicJson -Path $markerPath -Data $markerData -Depth 8)) {
+            throw "Restore point marker could not be persisted: $script:LastEvidenceWriteError"
+        }
+        $result.Success = $true
+        $result.Status = "Succeeded"
+        $result.Created = $true
+        $result.Attempted = 1
+        $result.CreatedAt = $createdAt.ToString("o")
+        $result.Reason = "System Restore point created before update work"
+        $result.Evidence = @("marker:$markerPath", "throttle-minutes:$throttleMinutes")
+    } catch {
+        $result.Failed = 1
+        $result.Reason = "System Restore point creation failed: $($_.Exception.Message)"
+    }
+    return [PSCustomObject]$result
+}
+
+function Get-LatestDriverBackupPath {
+    param(
+        [string]$BackupRoot = (Join-Path $script:DataPath "DriverBackups")
+    )
+
+    try {
+        if (-not (Test-Path -LiteralPath $BackupRoot -PathType Container)) { return "" }
+        $candidate = @(Get-ChildItem -LiteralPath $BackupRoot -Directory -Force -ErrorAction Stop |
+            Where-Object { $_.Name -match "^Backup_\d{8}_\d{6}$" } |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1)
+        if ($candidate.Count -eq 0) { return "" }
+        return [string]$candidate[0].FullName
+    } catch {
+        return ""
+    }
+}
+
+function Invoke-DriverRollback {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSUseShouldProcessForStateChangingFunctions", "", Justification = "Restores only a protected, explicitly selected driver backup through DISM.")]
+    param(
+        [string]$BackupPath = "",
+        [bool]$DryRunMode = [bool]$script:DryRun
+    )
+
+    $result = [ordered]@{
+        SchemaVersion = 1
+        Success = $false
+        Status = "Failed"
+        Path = ""
+        Command = ""
+        Attempted = 0
+        Installed = 0
+        Failed = 0
+        Skipped = 0
+        RebootRequired = $false
+        DryRun = $DryRunMode
+        Reason = ""
+        Evidence = @()
+    }
+    $approvedRoot = [IO.Path]::GetFullPath((Join-Path $script:DataPath "DriverBackups")).TrimEnd("\", "/")
+    try {
+        $selectedPath = if ([string]::IsNullOrWhiteSpace($BackupPath)) {
+            Get-LatestDriverBackupPath -BackupRoot $approvedRoot
+        } else {
+            [IO.Path]::GetFullPath($BackupPath).TrimEnd("\", "/")
+        }
+        if ([string]::IsNullOrWhiteSpace($selectedPath)) {
+            throw "No protected driver backup is available"
+        }
+        if (-not $selectedPath.StartsWith("$approvedRoot$([IO.Path]::DirectorySeparatorChar)", [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Driver rollback path must remain under the protected DriverBackups directory"
+        }
+        if (-not (Test-Path -LiteralPath $selectedPath -PathType Container)) {
+            throw "Driver backup path does not exist: $selectedPath"
+        }
+        $infFiles = @(Get-ChildItem -LiteralPath $selectedPath -Recurse -File -Filter "*.inf" -ErrorAction Stop)
+        if ($infFiles.Count -eq 0) {
+            throw "Driver backup contains no INF packages"
+        }
+        $result.Path = $selectedPath
+        $result.Attempted = $infFiles.Count
+        $result.Command = "dism.exe /Online /Add-Driver /Driver:$selectedPath /Recurse"
+        if ($DryRunMode) {
+            $result.Success = $true
+            $result.Status = "Skipped"
+            $result.Skipped = 1
+            $result.Reason = "Dry run would restore $($infFiles.Count) driver package(s) from the newest protected backup"
+            $result.Evidence = @("driver-count:$($infFiles.Count)", "command:$($result.Command)")
+            return [PSCustomObject]$result
+        }
+
+        $dismCommand = Get-Command -Name "dism.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+        $dismPath = if ($null -ne $dismCommand) { [string]$dismCommand.Source } else { Join-Path $env:SystemRoot "System32\dism.exe" }
+        if (-not (Test-Path -LiteralPath $dismPath -PathType Leaf)) {
+            throw "DISM executable was not found"
+        }
+        $commandResult = Invoke-CapturedCommand -FilePath $dismPath -ArgumentList @(
+            "/Online", "/Add-Driver", "/Driver:$selectedPath", "/Recurse"
+        ) -TimeoutSeconds 900
+        $exitCode = [int]$commandResult.ExitCode
+        $result.RebootRequired = ($exitCode -eq 3010 -or [string]$commandResult.StandardOutput -match "(?i)restart|reboot")
+        $result.Success = ($exitCode -in @(0, 3010))
+        $result.Status = if ($result.Success) { "Succeeded" } else { "Failed" }
+        if ($result.Success) {
+            $result.Reason = "DISM restored $($infFiles.Count) driver package(s) from the protected backup"
+        } else {
+            $result.Failed = 1
+            $detail = if (-not [string]::IsNullOrWhiteSpace([string]$commandResult.StandardError)) {
+                [string]$commandResult.StandardError
+            } else { "exit code $exitCode" }
+            $result.Reason = "DISM driver rollback failed: $detail"
+        }
+        $result.Evidence = @("exit-code:$exitCode", "driver-count:$($infFiles.Count)", "command:$($result.Command)")
+    } catch {
+        $result.Failed = [math]::Max(1, [int]$result.Failed)
+        $result.Reason = "Driver rollback failed: $($_.Exception.Message)"
+    }
+    return [PSCustomObject]$result
+}
+
+# ============================================================================
 # DRIVER BACKUP
 # ============================================================================
 
@@ -3069,7 +3313,7 @@ function Invoke-DriverBackup {
 
     try {
         if ($DryRun) {
-            Write-Log "Would export drivers via Export-WindowsDriver to $backupDir" "INFO"
+            Write-Log "Would export drivers via DISM /Online /Export-Driver (or Export-WindowsDriver fallback) to $backupDir" "INFO"
             # Count installed third-party drivers for dry-run info
             try {
                 $driverCount = @(Get-WindowsDriver -Online -ErrorAction SilentlyContinue | Where-Object { $_.OriginalFileName -notmatch '\\windows\\' }).Count
@@ -3084,7 +3328,18 @@ function Invoke-DriverBackup {
             throw "Driver backup directory could not be protected"
         }
 
-        Export-WindowsDriver -Online -Destination $backupDir -ErrorAction Stop | Out-Null
+        $dismCommand = Get-Command -Name "dism.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -ne $dismCommand) {
+            $dismPath = [string]$dismCommand.Source
+            $exportResult = Invoke-CapturedCommand -FilePath $dismPath -ArgumentList @(
+                "/Online", "/Export-Driver", "/Destination:$backupDir"
+            ) -TimeoutSeconds 900
+            if ([int]$exportResult.ExitCode -notin @(0, 3010)) {
+                throw "DISM driver export failed with exit code $($exportResult.ExitCode)"
+            }
+        } else {
+            Export-WindowsDriver -Online -Destination $backupDir -ErrorAction Stop | Out-Null
+        }
 
         $driverFiles = @(Get-ChildItem -Path $backupDir -Recurse -File -ErrorAction SilentlyContinue)
         $totalSizeMB = [math]::Round(($driverFiles | Measure-Object -Property Length -Sum).Sum / 1MB, 1)
@@ -3365,7 +3620,7 @@ function Restore-PowerPlan {
 
 function Get-DryRunMutationSnapshot {
     $files = [ordered]@{}
-    foreach ($path in @($script:StateFile, $script:LockFile, (Join-Path $script:DataPath "WindowsUpdatePrestage.json"), (Join-Path $script:DataPath "WindowsPolicySnapshot.json"))) {
+    foreach ($path in @($script:StateFile, $script:LockFile, (Join-Path $script:DataPath "WindowsUpdatePrestage.json"), (Join-Path $script:DataPath "WindowsPolicySnapshot.json"), (Join-Path $script:DataPath "restore_point.json"))) {
         $key = [string]$path
         if (Test-Path -LiteralPath $path -PathType Leaf) {
             try { $files[$key] = [ordered]@{ Exists = $true; Length = [long](Get-Item -LiteralPath $path).Length; Hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash } } catch { $files[$key] = [ordered]@{ Exists = $true; Length = -1; Hash = "error" } }
@@ -13003,6 +13258,17 @@ try {
         Write-Host ""
 
         if (-not $script:ContinuationActive) {
+            $restorePointStart = Get-Date
+            $restorePointResult = Invoke-RestorePointIfNeeded -RunId $script:RunId `
+                -DryRunMode ([bool]$DryRun)
+            $restorePointStage = ConvertTo-StageResult -Name "RestorePoint" `
+                -Provider "System Restore" -Result $restorePointResult -StartedAt $restorePointStart
+            [void](Add-StageResult $restorePointStage)
+            if ($restorePointStage.Status -eq "Failed") {
+                $script:ExitCode = 2
+                Write-Log $restorePointStage.Message "WARNING"
+            }
+
             $powerStart = Get-Date
             $script:PowerPlanState = Set-HighPerformancePowerPlan -DryRunMode ([bool]$DryRun)
             $powerStage = ConvertTo-StageResult -Name "PowerManagement" -Provider "powercfg" `
@@ -13063,8 +13329,24 @@ try {
                     -Status "Skipped" -Skipped 1 -Message "WSUS bypass not requested" -StartedAt $wsusStart))
             }
 
+            $rollbackStart = Get-Date
+            if ($RollbackDrivers) {
+                $rollbackResult = Invoke-DriverRollback -DryRunMode ([bool]$DryRun)
+                $rollbackStage = ConvertTo-StageResult -Name "DriverRollback" `
+                    -Provider "DISM" -Result $rollbackResult -StartedAt $rollbackStart
+                [void](Add-StageResult $rollbackStage)
+                if ($rollbackStage.Status -eq "Failed") {
+                    $script:ExitCode = 3
+                    Write-Log $rollbackStage.Message "ERROR"
+                }
+            }
+
             $backupStart = Get-Date
-            if ($BackupDrivers -and -not $SkipOEM -and -not $servicingCapability.Supported) {
+            if ($RollbackDrivers) {
+                [void](Add-StageResult (New-StageResult -Name "DriverBackup" `
+                    -Provider "Export-WindowsDriver" -Status "Skipped" -Skipped 1 `
+                    -Message "Driver backup skipped while -RollbackDrivers is active" -StartedAt $backupStart))
+            } elseif ($BackupDrivers -and -not $SkipOEM -and -not $servicingCapability.Supported) {
                 [void](Add-StageResult (New-StageResult -Name "DriverBackup" `
                     -Provider "Export-WindowsDriver" -Status "Skipped" -Skipped 1 `
                     -Message $servicingCapability.Reason -StartedAt $backupStart))
@@ -13083,7 +13365,10 @@ try {
             }
 
             $oemStart = Get-Date
-            if ($SkipOEM) {
+            if ($RollbackDrivers) {
+                [void](Add-StageResult (New-StageResult -Name "OEM" -Provider "OEM" -Status "Skipped" `
+                    -Skipped 1 -Message "OEM updates skipped while -RollbackDrivers is active" -StartedAt $oemStart))
+            } elseif ($SkipOEM) {
                 [void](Add-StageResult (New-StageResult -Name "OEM" -Provider "OEM" -Status "Skipped" `
                     -Skipped 1 -Message "OEM updates skipped by -SkipOEM; remove -SkipOEM to request firmware or OEM drivers" `
                     -StartedAt $oemStart))
@@ -13169,7 +13454,10 @@ try {
         if (Test-ShouldRunContinuationStage -Stage "WindowsUpdate") {
             Write-StageProgress -Stage "Windows Update" -PercentComplete 45 -Status "Processing policy-approved updates"
             $windowsStart = Get-Date
-            if ($SkipWindows) {
+            if ($RollbackDrivers) {
+                [void](Add-StageResult (New-StageResult -Name "WindowsUpdate" -Provider "Windows Update" `
+                    -Status "Skipped" -Skipped 1 -Message "Windows Update skipped while -RollbackDrivers is active" -StartedAt $windowsStart))
+            } elseif ($SkipWindows) {
                 [void](Add-StageResult (New-StageResult -Name "WindowsUpdate" -Provider "Windows Update" `
                     -Status "Skipped" -Skipped 1 -Message "Windows Update skipped by run configuration" -StartedAt $windowsStart))
             } elseif (-not $windowsCapability.Supported) {
@@ -13196,7 +13484,10 @@ try {
         if (Test-ShouldRunContinuationStage -Stage "Winget") {
             Write-StageProgress -Stage "WinGet" -PercentComplete 65 -Status "Processing application updates"
             $wingetStart = Get-Date
-            if ($SkipWinget) {
+            if ($RollbackDrivers) {
+                [void](Add-StageResult (New-StageResult -Name "Winget" -Provider "WinGet" `
+                    -Status "Skipped" -Skipped 1 -Message "WinGet skipped while -RollbackDrivers is active" -StartedAt $wingetStart))
+            } elseif ($SkipWinget) {
                 [void](Add-StageResult (New-StageResult -Name "Winget" -Provider "WinGet" -Status "Skipped" `
                     -Skipped 1 -Message "WinGet skipped by run configuration" -StartedAt $wingetStart))
             } elseif (-not $wingetCapability.Supported) {
@@ -13226,7 +13517,11 @@ try {
         if (Test-ShouldRunContinuationStage -Stage "PackageManagers") {
             Write-StageProgress -Stage "Package managers" -PercentComplete 78 -Status "Processing optional sources"
             $packageStart = Get-Date
-            if ($SkipWinget) {
+            if ($RollbackDrivers) {
+                [void](Add-StageResult (New-StageResult -Name "PackageManagers" `
+                    -Provider "Chocolatey/Scoop/StoreEdgeFD/WSL" -Status "Skipped" -Skipped 1 `
+                    -Message "Package managers skipped while -RollbackDrivers is active" -StartedAt $packageStart))
+            } elseif ($SkipWinget) {
                 [void](Add-StageResult (New-StageResult -Name "PackageManagers" -Provider "Chocolatey/Scoop/StoreEdgeFD/WSL" `
                     -Status "Skipped" -Skipped 1 -Message "Additional package managers skipped with -SkipWinget" -StartedAt $packageStart))
             } else {
@@ -13249,7 +13544,10 @@ try {
         if (Test-ShouldRunContinuationStage -Stage "Cleanup") {
             Write-StageProgress -Stage "Cleanup" -PercentComplete 88 -Status "Finalizing maintenance"
             $cleanupStart = Get-Date
-            if (($CleanupAfter -or $ResetComponentBase) -and -not $servicingCapability.Supported) {
+            if ($RollbackDrivers) {
+                [void](Add-StageResult (New-StageResult -Name "Cleanup" -Provider "DISM and cleanmgr" `
+                    -Status "Skipped" -Skipped 1 -Message "Cleanup skipped while -RollbackDrivers is active" -StartedAt $cleanupStart))
+            } elseif (($CleanupAfter -or $ResetComponentBase) -and -not $servicingCapability.Supported) {
                 [void](Add-StageResult (New-StageResult -Name "Cleanup" `
                     -Provider "DISM and cleanmgr" -Status "Skipped" -Skipped 1 `
                     -Message $servicingCapability.Reason -StartedAt $cleanupStart))

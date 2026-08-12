@@ -40,6 +40,7 @@ SystemUpdatePro is a fully automated, self-healing PowerShell script that handle
 - **Pending Reboot Detection**: Checks 5 different sources for pending reboots
 - **DryRun Mode**: Preview all available updates without installing anything
 - **Driver Backup**: Export current drivers before installing updates for rollback capability
+- **Restore and Rollback Safety**: Creates a throttled System Restore point before each run and supports protected DISM driver rollback with `-RollbackDrivers`
 - **Verified Dependencies**: Restricts downloads and redirects to approved HTTPS origins, checks hashes and publishers before execution, enforces safe version floors, and never changes PowerShell Gallery trust
 - **Capability Matrix**: Gates each provider by Windows build/edition, Server/Core, architecture, PowerShell runtime, execution context, and verified provider version
 - **Privileged Mutation Recovery**: Atomically journals exact registry, service, cache, and scheduled-task before-images; startup rolls back interrupted runs before allowing new changes
@@ -143,7 +144,12 @@ cd SystemUpdatePro
 
 # Backup drivers + include BIOS updates
 .\SystemUpdatePro.ps1 -BackupDrivers -IncludeBIOS -Reboot
+
+# Restore the newest protected backup and skip forward-update stages
+.\SystemUpdatePro.ps1 -RollbackDrivers
 ```
+
+Driver exports use DISM `/Online /Export-Driver` when available and are retained under `C:\ProgramData\SystemUpdatePro\DriverBackups`. `-RollbackDrivers` selects the newest `Backup_yyyyMMdd_HHmmss` directory and invokes DISM `/Online /Add-Driver /Recurse`; use `-DryRun -RollbackDrivers` to inspect the plan without changing the driver store.
 
 ### Webhook Notifications
 ```powershell
@@ -241,6 +247,7 @@ The standalone command requires administrator privileges, prints the completed a
 | `-ContinueAfterReboot` | Switch | False | Resume update stages after reboot with the original run settings (maximum 3 attempts) |
 | `-DryRun` | Switch | False | Preview updates without installing |
 | `-BackupDrivers` | Switch | False | Export current drivers before updating |
+| `-RollbackDrivers` | Switch | False | Restore the newest protected driver export with DISM and skip forward-update stages |
 | `-ShowHistory` | Switch | False | Display previous update run history |
 | `-WebhookSecretReference` | String | (none) | `env:VARIABLE_NAME` or `file:C:\path\config.json`; the resolved value must be HTTPS |
 | `-HistoryCount` | Int | 10 | Number of history entries to show (1-100) |
@@ -343,6 +350,7 @@ Get-EventLog -LogName Application -Source "SystemUpdatePro" -Newest 10
 | `C:\ProgramData\SystemUpdatePro\Journals\` | Protected, run-scoped privileged-mutation recovery journals |
 | `C:\ProgramData\SystemUpdatePro\update_history.json` | Update history log (last 100 runs) |
 | `C:\ProgramData\SystemUpdatePro\DriverBackups\` | Driver backup snapshots (last 3 kept) |
+| `C:\ProgramData\SystemUpdatePro\restore_point.json` | Protected marker for the latest tool-created System Restore point and throttle window |
 | `C:\ProgramData\SystemUpdatePro\Bundles\` | Protected diagnostic/recovery ZIP archives |
 | `C:\ProgramData\SystemUpdatePro\WebhookDeliveries\` | Atomic per-run webhook attempt and terminal-status records |
 | `C:\ProgramData\SystemUpdatePro\Cache\sha256\` | Optional administrator-prefilled content-addressed dependency artifacts |
@@ -515,8 +523,10 @@ Register-ScheduledTask -TaskName "SystemUpdatePro Weekly" -Action $action -Trigg
 |     +-- OEM/model/tool + disk/power/charge/BitLocker gate    |
 |     +-- Metered connection warning                           |
 |                                                              |
-|  2. DRIVER BACKUP (if -BackupDrivers)                        |
-|     +-- Export-WindowsDriver to backup directory             |
+|  2. RESTORE / DRIVER SAFETY                                  |
+|     +-- Create a throttled System Restore point              |
+|     +-- Export drivers with DISM /Export-Driver if requested |
+|     +-- Or restore the newest backup with -RollbackDrivers   |
 |     +-- Auto-cleanup old backups (keep 3)                    |
 |                                                              |
 |  3. WINDOWS UPDATE REPAIR (if -RepairWindowsUpdate)          |

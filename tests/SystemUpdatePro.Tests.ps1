@@ -129,6 +129,11 @@ BeforeAll {
         "Compare-DryRunMutationSnapshot",
         "Get-ConsoleColorCapability",
         "Write-StageProgress",
+        "Get-RestorePointThrottleMinutes",
+        "Invoke-RestorePointIfNeeded",
+        "Get-LatestDriverBackupPath",
+        "Invoke-DriverRollback",
+        "Invoke-DriverBackup",
         "Get-WingetScopePlan",
         "ConvertFrom-WingetPackageOutput",
         "Get-WingetScopeInventory",
@@ -274,7 +279,7 @@ BeforeAll {
         $script:OEMUpdates = [System.Collections.ArrayList]::new()
         $script:WindowsUpdates = [System.Collections.ArrayList]::new()
         $script:WingetUpdates = [System.Collections.ArrayList]::new()
-        $script:StateSchemaVersion = 7
+        $script:StateSchemaVersion = 8
         $script:MaxContinuationAttempts = 3
         $script:RunStartedAt = Get-Date
         $stateTestDirectory = Join-Path $TestDrive ([guid]::NewGuid().ToString("N"))
@@ -302,6 +307,7 @@ BeforeAll {
         $script:SecurityOnly = $false
         $script:PreStage = $false
         $script:Interactive = $false
+        $script:RollbackDrivers = $false
         $script:DependencyReadiness = $null
         $script:DownloadPolicy = $null
         $script:CurrentSystemInfo = $null
@@ -1204,14 +1210,14 @@ Describe "Protected local evidence store" {
 
         $loaded = Get-State
 
-        $loaded.SchemaVersion | Should -Be 7
+        $loaded.SchemaVersion | Should -Be 8
         $loaded.Parameters.EvidenceMaxSizeMB | Should -Be 512
         $loaded.Parameters.RedactionMode | Should -Be "SecretsAndSerials"
         $loaded.Parameters.WebhookSecretReference | Should -Be ""
         $loaded.ResolvedWebhookUrl | Should -Be "https://example.invalid/legacy-secret"
         $loaded.Contains("_MigrationSourceSchema") | Should -BeFalse
         ((Get-Content -LiteralPath $script:StateFile -Raw | ConvertFrom-Json).SchemaVersion) |
-            Should -Be 7
+            Should -Be 8
     }
 
     It "migrates and redacts legacy history without leaving sensitive backup data" {
@@ -1704,10 +1710,10 @@ Describe "PowerShell 5.1 continuation state machine" {
         if (-not $secondSave) { throw "Second atomic save failed: $script:LastStateError" }
         $loaded = Get-State
 
-        $loaded.SchemaVersion | Should -Be 7
+        $loaded.SchemaVersion | Should -Be 8
         $loaded.Phase | Should -Be "AwaitingReboot"
         $loaded.RunId | Should -Be "11111111-1111-1111-1111-111111111111"
-        $loaded.Parameters.Count | Should -Be 34
+        $loaded.Parameters.Count | Should -Be 35
         $loaded.AcquisitionProvenance.Count | Should -Be 1
         $loaded.AcquisitionProvenance[0].Name | Should -Be "LSUClient"
         $loaded.Parameters.SkipOEM | Should -BeTrue
@@ -2532,6 +2538,80 @@ Describe "Explicit component cleanup safety" {
 
         $report | Should -Match "Component rollback"
         $report | Should -Match "Disabled by irreversible /ResetBase"
+    }
+}
+
+Describe "Restore point and driver rollback safety" {
+    BeforeEach {
+        Initialize-SystemUpdateProTestState
+    }
+
+    It "plans a restore point without persistence during a dry run" {
+        $script:DryRun = [switch]$true
+
+        $result = Invoke-RestorePointIfNeeded -RunId "restore-dry-run" -DryRunMode $true
+
+        $result.Success | Should -BeTrue
+        $result.Status | Should -Be "Skipped"
+        $result.Reason | Should -Match "Dry run"
+        Test-Path -LiteralPath $result.Path | Should -BeFalse
+    }
+
+    It "honors the configured restore point throttle from the registry" {
+        $markerPath = Join-Path $script:DataPath "restore_point.json"
+        Write-ProtectedAtomicJson -Path $markerPath -Data ([ordered]@{
+            SchemaVersion = 1
+            RunId = "previous-run"
+            CreatedAt = (Get-Date).ToUniversalTime().AddMinutes(-5).ToString("o")
+            ThrottleMinutes = 1440
+        }) | Should -BeTrue
+        Mock Get-ItemProperty {
+            [PSCustomObject]@{ SystemRestorePointCreationFrequency = 1440 }
+        } -ParameterFilter { $Name -eq "SystemRestorePointCreationFrequency" }
+
+        $result = Invoke-RestorePointIfNeeded -RunId "throttled-run" -DryRunMode $false
+
+        $result.Success | Should -BeTrue
+        $result.Status | Should -Be "Skipped"
+        $result.Reason | Should -Match "throttled"
+    }
+
+    It "plans the newest protected driver backup without invoking DISM in a dry run" {
+        $backupRoot = Join-Path $script:DataPath "DriverBackups"
+        $backupPath = Join-Path $backupRoot "Backup_20260812_080000"
+        New-Item -ItemType Directory -Path $backupPath -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $backupPath "oem1.inf") -Value "[Version]"
+        $script:DryRun = [switch]$true
+
+        $result = Invoke-DriverRollback -DryRunMode $true
+
+        $result.Success | Should -BeTrue
+        $result.Status | Should -Be "Skipped"
+        $result.Attempted | Should -Be 1
+        $result.Reason | Should -Match "would restore"
+    }
+
+    It "treats DISM restart-required driver restoration as success" {
+        $backupRoot = Join-Path $script:DataPath "DriverBackups"
+        $backupPath = Join-Path $backupRoot "Backup_20260812_080001"
+        New-Item -ItemType Directory -Path $backupPath -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $backupPath "oem1.inf") -Value "[Version]"
+        Mock Get-Command {
+            [PSCustomObject]@{ Source = "dism.exe" }
+        } -ParameterFilter { $Name -eq "dism.exe" }
+        Mock Test-Path { $true } -ParameterFilter { $LiteralPath -eq "dism.exe" }
+        Mock Invoke-CapturedCommand {
+            [PSCustomObject]@{ ExitCode = 3010; StandardOutput = "A restart is required"; StandardError = "" }
+        }
+
+        $result = Invoke-DriverRollback -DryRunMode $false
+
+        $result.Success | Should -BeTrue
+        $result.Status | Should -Be "Succeeded"
+        $result.RebootRequired | Should -BeTrue
+        Should -Invoke Invoke-CapturedCommand -Times 1 -Exactly -ParameterFilter {
+            $ArgumentList -contains "/Online" -and $ArgumentList -contains "/Add-Driver"
+        }
     }
 }
 
