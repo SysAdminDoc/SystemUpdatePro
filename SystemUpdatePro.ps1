@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    SystemUpdatePro v4.1.0 - Enterprise Multi-OEM System Update Utility
+    SystemUpdatePro v4.2.0 - Enterprise Multi-OEM System Update Utility
 .DESCRIPTION
     Bulletproof MSP-grade unattended update tool with self-healing capabilities.
 
@@ -132,7 +132,7 @@
     .\SystemUpdatePro.ps1 -SkipOEM -CleanupAfter
     # Windows + Winget only, cleanup after
 .NOTES
-    Version: 4.1.0
+    Version: 4.2.0
     Requires: Administrator, PowerShell 5.1+, and a supported provider capability
 
     EXIT CODES:
@@ -260,7 +260,7 @@ param(
 # SCRIPT CONFIGURATION
 # ============================================================================
 
-$script:Version = "4.1.0"
+$script:Version = "4.2.0"
 $script:ProductName = "SystemUpdatePro"
 $script:WebhookSecretReference = [string]$WebhookSecretReference
 $script:WebhookUrl = ""
@@ -3089,6 +3089,8 @@ function Show-UpdateHistory {
 # ============================================================================
 
 function Get-RestorePointThrottleMinutes {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSUseSingularNouns", "", Justification = "Uses the Windows System Restore policy's minute-based throttle terminology.")]
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSAvoidUsingEmptyCatchBlock", "", Justification = "Registry policy is optional; an unavailable policy falls back to the documented default.")]
     param(
         [string]$RegistryPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore"
     )
@@ -3106,6 +3108,7 @@ function Get-RestorePointThrottleMinutes {
 
 function Invoke-RestorePointIfNeeded {
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSUseShouldProcessForStateChangingFunctions", "", Justification = "Creates one throttled System Restore point through the Windows restore-point provider.")]
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSAvoidUsingEmptyCatchBlock", "", Justification = "Optional restore-point telemetry failures must not prevent the guarded fallback path.")]
     param(
         [string]$RunId = [string]$script:RunId,
         [bool]$DryRunMode = [bool]$script:DryRun
@@ -3133,10 +3136,26 @@ function Invoke-RestorePointIfNeeded {
     $lastCreatedAt = $null
     if (Test-Path -LiteralPath $markerPath -PathType Leaf) {
         try {
-            $markerRead = Read-ProtectedJsonFile -Path $markerPath
-            $marker = if ($markerRead.Success) { $markerRead.Data } else { $null }
-            if ($null -ne $marker -and -not [string]::IsNullOrWhiteSpace([string]$marker.CreatedAt)) {
-                $lastCreatedAt = [datetime]::Parse([string]$marker.CreatedAt).ToUniversalTime()
+            $marker = try {
+                ConvertTo-Hashtable -InputObject (Get-Content -LiteralPath $markerPath -Raw | ConvertFrom-Json -ErrorAction Stop)
+            } catch {
+                $markerRead = Read-ProtectedJsonFile -Path $markerPath
+                if ($markerRead.Success) { $markerRead.Data } else { $null }
+            }
+            $markerCreatedValue = if ($marker -is [System.Collections.IDictionary]) {
+                $marker["CreatedAt"]
+            } else { $marker.CreatedAt }
+            if ($markerCreatedValue -is [datetime]) {
+                $markerDate = [datetime]$markerCreatedValue
+                $lastCreatedAt = if ($markerDate.Kind -eq [DateTimeKind]::Unspecified) {
+                    [datetime]::SpecifyKind($markerDate, [DateTimeKind]::Utc)
+                } else { $markerDate.ToUniversalTime() }
+            } elseif (-not [string]::IsNullOrWhiteSpace([string]$markerCreatedValue)) {
+                $lastCreatedAt = [datetimeoffset]::Parse(
+                    [string]$markerCreatedValue,
+                    [Globalization.CultureInfo]::InvariantCulture,
+                    [Globalization.DateTimeStyles]::RoundtripKind
+                ).UtcDateTime
             }
         } catch { }
     }
@@ -3377,6 +3396,7 @@ function Invoke-DriverBackup {
 
 function Invoke-SystemHealthCheck {
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSUseShouldProcessForStateChangingFunctions", "", Justification = "Runs read-only DISM, SFC, and bounded CBS evidence checks.")]
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSAvoidUsingEmptyCatchBlock", "", Justification = "Unavailable diagnostic evidence is represented as Unknown in the health contract.")]
     param(
         [ValidateSet("PreRun", "PostRun")][string]$Phase = "PreRun",
         [ValidateRange(1, 900)][int]$TimeoutSeconds = 120
@@ -3544,6 +3564,8 @@ function Get-ParallelUpdateSafety {
 
 function Invoke-ParallelReadOnlyPlans {
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSUseShouldProcessForStateChangingFunctions", "", Justification = "Runs two explicitly supplied read-only plan scriptblocks in isolated runspaces.")]
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSUseSingularNouns", "", Justification = "The function executes the two plan contracts as a single parallel operation.")]
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSAvoidUsingEmptyCatchBlock", "", Justification = "Runspace cleanup and optional function serialization failures are isolated before returning the plan contract.")]
     param(
         [Parameter(Mandatory = $true)][scriptblock]$OEMPlan,
         [Parameter(Mandatory = $true)][scriptblock]$WindowsPlan
@@ -4007,10 +4029,10 @@ function Compare-DryRunMutationSnapshot {
 }
 
 function Get-ConsoleColorCapability {
-    $isWindows = [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
+    $windowsPlatform = [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
     $supportsColor = $false
     try { $supportsColor = $null -ne $Host.UI.RawUI -and $null -ne $Host.UI.RawUI.ForegroundColor } catch { $supportsColor = $false }
-    return [PSCustomObject]@{ SupportsColor = $supportsColor; SupportsVirtualTerminal = ($isWindows -and [int]$PSVersionTable.PSVersion.Major -ge 7); LegacyConsole = ($isWindows -and -not $supportsColor) }
+    return [PSCustomObject]@{ SupportsColor = $supportsColor; SupportsVirtualTerminal = ($windowsPlatform -and [int]$PSVersionTable.PSVersion.Major -ge 7); LegacyConsole = ($windowsPlatform -and -not $supportsColor) }
 }
 
 function Write-StageProgress {
@@ -11442,6 +11464,7 @@ function New-StructuredEventLogXml {
 
 function Write-PrometheusMetrics {
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSUseShouldProcessForStateChangingFunctions", "", Justification = "Writes an explicitly scoped Prometheus textfile artifact.")]
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSUseSingularNouns", "", Justification = "Prometheus uses the standard plural metrics artifact terminology.")]
     param(
         [Parameter(Mandatory = $true)][hashtable]$RunData,
         [string]$Path = (Join-Path $script:DataPath "metrics.prom"),

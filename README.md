@@ -6,7 +6,7 @@
   <img src="https://img.shields.io/badge/PowerShell-5.1+-blue?logo=powershell&logoColor=white" alt="PowerShell 5.1+">
   <img src="https://img.shields.io/badge/Windows-10%20|%2011%20|%20Server-0078D6?logo=windows&logoColor=white" alt="Windows">
   <img src="https://img.shields.io/badge/License-MIT-green" alt="License">
-  <img src="https://img.shields.io/badge/Version-4.1.0-orange" alt="Version">
+  <img src="https://img.shields.io/badge/Version-4.2.0-orange" alt="Version">
 </p>
 
 **Enterprise-grade, bulletproof system update utility for MSPs and IT professionals.**
@@ -67,6 +67,7 @@ SystemUpdatePro is a fully automated, self-healing PowerShell script that handle
 - **Webhook Notifications**: Send a versioned, idempotent completion contract to Slack, Teams Workflows/Adaptive Cards, legacy Teams connectors, or a generic HTTPS endpoint with durable retry evidence
 - **Observability Contracts**: Includes Azure Monitor/Sentinel-friendly webhook data, an atomic Prometheus textfile at `C:\ProgramData\SystemUpdatePro\metrics.prom`, and parseable XML payloads in Application event log messages
 - **Update History**: Schema-versioned JSON history with stage/item outcomes, provider codes, platform/provider capabilities, dependency provenance, and evidence-delivery status
+- **PowerShell Module Package**: Import the signed-layout module manifest and invoke the same script from an isolated child PowerShell process for RMM-safe exit-code handling
 
 ---
 
@@ -76,6 +77,17 @@ SystemUpdatePro is a fully automated, self-healing PowerShell script that handle
 - **PowerShell**: Windows PowerShell 5.1 or PowerShell 7
 - **Privileges**: Administrator user or `NT AUTHORITY\SYSTEM`
 - **Network**: Access to the enabled providers' approved origins
+
+### Module package
+
+The repository includes a PowerShell Gallery-compatible manifest and launcher. After installing the package, pass the script switches through the isolated module command:
+
+```powershell
+Import-Module SystemUpdatePro
+Invoke-SystemUpdatePro -ArgumentList '-DryRun', '-SkipOEM'
+```
+
+The launcher preserves the script's exit code and keeps the module session alive after the entry point completes.
 
 ### Automated capability contract
 
@@ -515,7 +527,7 @@ Register-ScheduledTask -TaskName "SystemUpdatePro Weekly" -Action $action -Trigg
 
 ```
 +-------------------------------------------------------------+
-|                  SystemUpdatePro v4.1.0                      |
+|                  SystemUpdatePro v4.2.0                      |
 +-------------------------------------------------------------+
 |                                                              |
 |  1. PRE-FLIGHT CHECKS                                       |

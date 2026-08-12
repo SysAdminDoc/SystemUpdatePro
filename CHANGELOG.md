@@ -2,7 +2,7 @@
 
 All notable changes to SystemUpdatePro will be documented in this file.
 
-## [Unreleased]
+## [v4.2.0] - 2026-08-12
 
 - Added fail-closed ASUS, Acer, MSI, Surface, Framework, Panasonic, and Intel/AMD/NVIDIA GPU provider plans with signed local updater execution and public-source evidence.
 - Added policy-driven Windows Update selection with feature deferral, wildcard driver allow/deny rules, security-only mode, atomic pre-stage plans, Microsoft Update Catalog fallback, and protected ADMX snapshots; added Chocolatey, Scoop, StoreEdgeFD, Flatpak, and Snap source planning.
@@ -11,6 +11,7 @@ All notable changes to SystemUpdatePro will be documented in this file.
 - Added automatic System Restore point throttling, DISM `/Export-Driver` backups, and protected newest-backup rollback through `-RollbackDrivers`.
 - Added bounded pre/post servicing-health checks using CBS.log, DISM `/CheckHealth`, and SFC `/verifyonly`, with failure only on a proven healthy-to-degraded regression.
 - Added an isolated read-only parallel planning path for OEM and Windows Update discovery in dry-run mode, with explicit safety gates and serial fallback for mutating workflows.
+- Added a PowerShell Gallery-compatible module manifest and isolated launcher that preserves script exit codes without terminating the importing session.
 - Added source-specific dependency readiness with bounded origin probes, verified SHA-256 content-addressed offline cache consumption, per-source timeout/proxy evidence, explicit WinGet machine/current-user/other-user scope results, protected package exclusion/pin/conflict planning, audited metered-network download policy, and deterministic local rollout cohort promotion evidence.
 - Added webhook payload schema v2 with deterministic idempotency keys, run/timestamp/stage correlation, report evidence URIs, no-redirect HTTPS transport, bounded transient/429 retry with `Retry-After`, durable per-attempt/terminal records, Slack and legacy connector formatting, and Teams Workflow Adaptive Cards generated from the same contract.
 - Replaced raw webhook command-line input with validated environment/protected-file secret references, added pre-initialization range/path/HTTPS validation, advanced continuation state to schema v5 with v3/v4 migration, retained read-only history as an unelevated early command, and extended redaction across console, transcript, exceptions, reports, history, and diagnostic bundles.
@@ -25,7 +26,7 @@ All notable changes to SystemUpdatePro will be documented in this file.
 - Normalized OEM, Windows Update, and WinGet outcomes into a schema-versioned stage/item result contract with truthful totals, provider exit/HRESULT evidence, aligned process exit codes, and exactly-once terminal report/history/Event Log/webhook attempts.
 - Redesigned HTML reports as responsive operations dashboards with encoded data, clear update-channel states, device inventory, exception guidance, and print styles.
 
-## [v4.1.0] - %Y->- (HEAD -> main, tag: v4.1.0, origin/main)
+## [v4.1.0]
 
 - Added: Add project icon to README
 - v4.1.0 - DryRun mode, HTML reports, webhook notifications, driver backup, update history

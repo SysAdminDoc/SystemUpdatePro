@@ -301,7 +301,7 @@ BeforeAll {
         $script:ContinuationState = $null
         $script:ResumeStageCursor = ""
         $script:FirmwarePrerequisites = $null
-        $script:Version = "4.1.0"
+        $script:Version = "4.2.0"
         $script:Offline = $false
         $script:DependencyCachePath = Join-Path $stateTestDirectory "Cache"
         $script:SourceTimeoutSeconds = 30
@@ -1346,7 +1346,7 @@ Describe "Redacted diagnostic and recovery bundle" {
             return [ordered]@{
                 schema_version = 1
                 product = "SystemUpdatePro"
-                product_version = "4.1.0"
+                product_version = "4.2.0"
                 system = @{
                     serial_number = "SERIAL-DIAGNOSTIC-123"
                     os_build = "26100"
