@@ -158,6 +158,9 @@ BeforeAll {
         "Get-HPIAPath",
         "Install-HPIA",
         "Invoke-HPUpdate",
+        "Get-GPUProviderPlan",
+        "Get-AdditionalOEMProviderPlan",
+        "Invoke-AdditionalOEMUpdate",
         "Get-RegistryValueSnapshot",
         "Test-MutationRegistryTarget",
         "ConvertTo-RegistryValueKind",
@@ -487,6 +490,57 @@ Describe "Dependency readiness, scoped packages, and rollout policy" {
         $hold.Decision | Should -Be "Hold"
         $halt.Decision | Should -Be "Halt"
         $promote.Decision | Should -Be "Promote"
+    }
+}
+
+Describe "Additional OEM and GPU provider plans" {
+    BeforeEach {
+        Initialize-SystemUpdateProTestState
+        Mock Write-Log {}
+    }
+
+    It "selects the ASUS adapter for an ASUS system without claiming an uninstalled tool" {
+        $plans = @(Get-AdditionalOEMProviderPlan -SystemInfo @{
+            Manufacturer = "ASUSTeK COMPUTER INC."; Model = "ROG Zephyrus"
+        })
+
+        $plans.Provider | Should -Contain "ASUS"
+        $asus = @($plans | Where-Object Provider -eq "ASUS")[0]
+        $asus.Category | Should -Be "OEM"
+        $asus.SourceUri | Should -Match "asus.com"
+        $asus.Status | Should -BeIn @("Ready", "AcquisitionRequired")
+    }
+
+    It "maps GPU inventory to one plan per supported vendor" {
+        $plans = @(Get-GPUProviderPlan -VideoControllers @(
+            @{ Name = "NVIDIA GeForce RTX 4060" },
+            @{ Name = "NVIDIA GeForce RTX 4060" },
+            @{ Name = "Intel(R) UHD Graphics" }
+        ))
+
+        @($plans).Count | Should -Be 2
+        @($plans | Where-Object Provider -eq "NVIDIA").Count | Should -Be 1
+        @($plans | Where-Object Provider -eq "Intel").Count | Should -Be 1
+        $plans.SourceUri | Should -Not -Contain "http://"
+    }
+
+    It "reports missing vendor tools as skipped and never invokes a network shell" {
+        $script:DryRun = [switch]$true
+        Mock Get-AdditionalOEMProviderPlan {
+            @([PSCustomObject][ordered]@{
+                Provider = "Framework"; Category = "OEM"; DisplayName = "Framework firmware"
+                SourceUri = "https://knowledgebase.frame.work/"
+                CandidatePaths = @(); ExecutablePath = ""; Arguments = @()
+                Status = "AcquisitionRequired"; Applicable = $true; Reason = "No approved updater"
+            })
+        }
+
+        $result = Invoke-AdditionalOEMUpdate -SystemInfo @{ Manufacturer = "Framework"; Model = "13" }
+
+        $result.Success | Should -BeTrue
+        $result.Skipped | Should -Be 1
+        $result.Items[0].Status | Should -Be "Skipped"
+        Should -Invoke Get-AdditionalOEMProviderPlan -Times 1 -Exactly
     }
 }
 

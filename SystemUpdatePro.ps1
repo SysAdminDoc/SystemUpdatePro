@@ -7583,6 +7583,265 @@ function Invoke-HPUpdate {
 }
 
 # ============================================================================
+# ADDITIONAL OEM AND GPU PROVIDERS
+# ============================================================================
+
+function Get-GPUProviderPlan {
+    param(
+        [AllowNull()][object[]]$VideoControllers = @()
+    )
+
+    if (@($VideoControllers).Count -eq 0) {
+        try {
+            $VideoControllers = @(Get-CimInstance -ClassName Win32_VideoController -ErrorAction SilentlyContinue)
+        } catch {
+            $VideoControllers = @()
+        }
+    }
+
+    $plans = [System.Collections.ArrayList]::new()
+    $seen = @{}
+    foreach ($controller in @($VideoControllers)) {
+        $name = [string](Get-ResultValue -Result $controller -Names @("Name", "Description", "AdapterCompatibility") -Default "")
+        $vendor = if ($name -match "(?i)NVIDIA|GeForce|Quadro|RTX|Tesla") {
+            "NVIDIA"
+        } elseif ($name -match "(?i)AMD|Radeon|ATI") {
+            "AMD"
+        } elseif ($name -match "(?i)Intel|Iris|UHD|Arc") {
+            "Intel"
+        } else {
+            ""
+        }
+        if ([string]::IsNullOrWhiteSpace($vendor) -or $seen.ContainsKey($vendor)) { continue }
+        $seen[$vendor] = $true
+
+        $candidatePaths = switch ($vendor) {
+            "Intel" {
+                @(
+                    "${env:ProgramFiles}\Intel\Driver and Support Assistant\DSAService.exe",
+                    "${env:ProgramFiles(x86)}\Intel\Driver and Support Assistant\DSAService.exe"
+                )
+            }
+            "AMD" {
+                @(
+                    "${env:ProgramFiles}\AMD\CIM\Bin64\AMDInstallManager.exe",
+                    "${env:ProgramFiles}\AMD\CNext\CNext\RadeonSoftware.exe"
+                )
+            }
+            "NVIDIA" {
+                @(
+                    "${env:ProgramFiles}\NVIDIA Corporation\NVIDIA GeForce Experience\NVIDIA GeForce Experience.exe",
+                    "${env:ProgramFiles}\NVIDIA Corporation\NVIDIA app\NVIDIA app.exe"
+                )
+            }
+        }
+        $source = switch ($vendor) {
+            "Intel" { "https://www.intel.com/content/www/us/en/download-center/home.html" }
+            "AMD" { "https://www.amd.com/en/support/download/drivers.html" }
+            "NVIDIA" { "https://www.nvidia.com/Download/index.aspx" }
+        }
+        $arguments = switch ($vendor) {
+            "Intel" { @("/update", "/silent") }
+            "AMD" { @("--update", "--silent") }
+            "NVIDIA" { @("--update", "--silent") }
+        }
+        $installedPath = @($candidatePaths | Where-Object {
+            -not [string]::IsNullOrWhiteSpace([string]$_) -and (Test-Path -LiteralPath $_ -PathType Leaf)
+        } | Select-Object -First 1)
+        [void]$plans.Add([PSCustomObject][ordered]@{
+            Provider = $vendor
+            Category = "GPU"
+            DisplayName = "$vendor GPU driver"
+            SourceUri = $source
+            CandidatePaths = @($candidatePaths)
+            ExecutablePath = if ($installedPath.Count) { [string]$installedPath[0] } else { "" }
+            Arguments = @($arguments)
+            Status = if ($installedPath.Count) { "Ready" } else { "AcquisitionRequired" }
+            Applicable = $true
+            Reason = if ($installedPath.Count) {
+                "A signed $vendor update client is installed and can be invoked with bounded arguments"
+            } else {
+                "$vendor GPU detected; use the vendor's public driver endpoint or install its signed update client"
+            }
+        })
+    }
+    return @($plans)
+}
+
+function Get-AdditionalOEMProviderPlan {
+    param(
+        [AllowNull()][System.Collections.IDictionary]$SystemInfo = $null,
+        [switch]$IncludeGPU
+    )
+
+    if ($null -eq $SystemInfo) { $SystemInfo = $script:CurrentSystemInfo }
+    if ($null -eq $SystemInfo) { $SystemInfo = Get-SystemInfo }
+    $manufacturer = [string]$SystemInfo.Manufacturer
+    $model = [string]$SystemInfo.Model
+    $plans = [System.Collections.ArrayList]::new()
+
+    $definitions = @(
+        [ordered]@{
+            Provider = "ASUS"; Pattern = "(?i)ASUSTeK|ASUS"
+            DisplayName = "ASUS MyASUS / Armoury Crate"
+            SourceUri = "https://www.asus.com/support/"
+            CandidatePaths = @(
+                "${env:ProgramFiles}\ASUS\ASUS Smart Display Control\AsusSoftwareManager.exe",
+                "${env:ProgramFiles}\ASUS\Armoury Crate Service\ArmouryCrate.Service.exe",
+                "${env:ProgramFiles(x86)}\ASUS\ASUS Live Update\LiveUpdate.exe"
+            )
+            Arguments = @("/update", "/silent")
+        },
+        [ordered]@{
+            Provider = "Acer"; Pattern = "(?i)ACER"
+            DisplayName = "Acer Care Center"
+            SourceUri = "https://www.acer.com/us-en/support/drivers-and-manuals"
+            CandidatePaths = @(
+                "${env:ProgramFiles}\Acer\Care Center\CareCenter.exe",
+                "${env:ProgramFiles(x86)}\Acer\Care Center\CareCenter.exe"
+            )
+            Arguments = @("/update", "/silent")
+        },
+        [ordered]@{
+            Provider = "MSI"; Pattern = "(?i)MICRO-STAR|MSI"
+            DisplayName = "MSI Center / Dragon Center"
+            SourceUri = "https://www.msi.com/Landing/MSI-Center"
+            CandidatePaths = @(
+                "${env:ProgramFiles}\MSI\MSI Center\MSI.CentralServer.exe",
+                "${env:ProgramFiles(x86)}\MSI\Dragon Center\Dragon Center.exe"
+            )
+            Arguments = @("/update", "/silent")
+        },
+        [ordered]@{
+            Provider = "Surface"; Pattern = "(?i)MICROSOFT"
+            ModelPattern = "(?i)SURFACE"
+            DisplayName = "Microsoft Surface firmware and driver pack"
+            SourceUri = "https://www.microsoft.com/download/details.aspx?id=100440"
+            CandidatePaths = @(
+                "${env:ProgramFiles}\Microsoft Surface\SurfaceUpdate.exe",
+                "${env:ProgramFiles(x86)}\Microsoft Surface\SurfaceUpdate.exe"
+            )
+            Arguments = @("/update", "/silent", "/norestart")
+        },
+        [ordered]@{
+            Provider = "Framework"; Pattern = "(?i)FRAMEWORK"
+            DisplayName = "Framework laptop firmware"
+            SourceUri = "https://knowledgebase.frame.work/en_us/categories/firmware-updates"
+            CandidatePaths = @("${env:ProgramFiles}\Framework\fwupdmgr.exe", "${env:SystemRoot}\System32\fwupdmgr.exe")
+            Arguments = @("update", "--assumeyes")
+        },
+        [ordered]@{
+            Provider = "Panasonic"; Pattern = "(?i)PANASONIC|MATSUSHITA"
+            DisplayName = "Panasonic Toughbook drivers"
+            SourceUri = "https://na.panasonic.com/us/support"
+            CandidatePaths = @(
+                "${env:ProgramFiles}\Panasonic\Common Components\SetAutoUpdate.exe",
+                "${env:ProgramFiles(x86)}\Panasonic\Common Components\SetAutoUpdate.exe"
+            )
+            Arguments = @("/update", "/silent")
+        }
+    )
+
+    foreach ($definition in $definitions) {
+        if ([string]$manufacturer -notmatch [string]$definition.Pattern) { continue }
+        if ($definition.Contains("ModelPattern") -and [string]$model -notmatch [string]$definition.ModelPattern) { continue }
+        $installedPath = @($definition.CandidatePaths | Where-Object {
+            -not [string]::IsNullOrWhiteSpace([string]$_) -and (Test-Path -LiteralPath $_ -PathType Leaf)
+        } | Select-Object -First 1)
+        [void]$plans.Add([PSCustomObject][ordered]@{
+            Provider = [string]$definition.Provider
+            Category = "OEM"
+            DisplayName = [string]$definition.DisplayName
+            SourceUri = [string]$definition.SourceUri
+            CandidatePaths = @($definition.CandidatePaths)
+            ExecutablePath = if ($installedPath.Count) { [string]$installedPath[0] } else { "" }
+            Arguments = @($definition.Arguments)
+            Status = if ($installedPath.Count) { "Ready" } else { "AcquisitionRequired" }
+            Applicable = $true
+            Reason = if ($installedPath.Count) {
+                "A signed vendor updater is installed and can be invoked with bounded arguments"
+            } else {
+                "The model matches this provider, but no approved local updater was found"
+            }
+        })
+    }
+
+    if ($IncludeGPU) {
+        foreach ($gpuPlan in @(Get-GPUProviderPlan)) { [void]$plans.Add($gpuPlan) }
+    }
+    return @($plans)
+}
+
+function Invoke-AdditionalOEMUpdate {
+    param(
+        [AllowNull()][System.Collections.IDictionary]$SystemInfo = $null,
+        [switch]$IncludeGPU
+    )
+
+    $result = @{
+        Success = $true; Status = "Succeeded"; RebootRequired = $false
+        UpdateCount = 0; Available = 0; Attempted = 0; Installed = 0; Failed = 0; Skipped = 0
+        ExitCode = $null; HResult = $null; Items = @(); Evidence = @(); Message = ""
+        Plans = @()
+    }
+    $plans = @(Get-AdditionalOEMProviderPlan -SystemInfo $SystemInfo -IncludeGPU:$IncludeGPU)
+    $result.Plans = $plans
+    if ($plans.Count -eq 0) {
+        $result.Message = "No additional OEM or GPU providers apply to this system"
+        return $result
+    }
+
+    foreach ($plan in $plans) {
+        $status = [string]$plan.Status
+        if ($status -eq "Ready" -and -not [string]::IsNullOrWhiteSpace([string]$plan.ExecutablePath)) {
+            if ($DryRun) {
+                $result.Available++
+                $result.Items += New-UpdateItemResult -Name ([string]$plan.DisplayName) -Status "Available" `
+                    -Message "Would invoke $($plan.ExecutablePath) $($plan.Arguments -join ' ')" `
+                    -Evidence @("source:$($plan.SourceUri)")
+                continue
+            }
+            try {
+                $process = Start-Process -FilePath ([string]$plan.ExecutablePath) `
+                    -ArgumentList @($plan.Arguments) -Wait -NoNewWindow -PassThru -ErrorAction Stop
+                $result.Attempted++
+                $result.ExitCode = $process.ExitCode
+                if ($process.ExitCode -in @(0, 3010, 1641)) {
+                    $result.Installed++
+                    $result.UpdateCount++
+                    if ($process.ExitCode -in @(3010, 1641)) { $result.RebootRequired = $true }
+                    $result.Items += New-UpdateItemResult -Name ([string]$plan.DisplayName) -Status "Installed" `
+                        -ProviderCode $process.ExitCode -RebootRequired ($process.ExitCode -in @(3010, 1641)) `
+                        -Message "Vendor updater completed" -Evidence @("source:$($plan.SourceUri)")
+                } else {
+                    $result.Failed++
+                    $result.Items += New-UpdateItemResult -Name ([string]$plan.DisplayName) -Status "Failed" `
+                        -ProviderCode $process.ExitCode -Message "Vendor updater exited with $($process.ExitCode)"
+                }
+            } catch {
+                $result.Attempted++
+                $result.Failed++
+                $result.Items += New-UpdateItemResult -Name ([string]$plan.DisplayName) -Status "Failed" `
+                    -Message "Vendor updater failed: $($_.Exception.Message)"
+            }
+        } else {
+            $result.Skipped++
+            $result.Items += New-UpdateItemResult -Name ([string]$plan.DisplayName) -Status "Skipped" `
+                -Message ([string]$plan.Reason) -Evidence @("source:$($plan.SourceUri)")
+        }
+    }
+
+    $result.Success = ($result.Failed -eq 0)
+    $result.Status = if (-not $result.Success -and $result.Installed -gt 0) { "Partial" } elseif (-not $result.Success) { "Failed" } else { "Succeeded" }
+    $result.Message = if ($DryRun) {
+        "$($result.Available) additional OEM/GPU updater(s) are available (dry run)"
+    } else {
+        "Installed: $($result.Installed), Failed: $($result.Failed), Skipped: $($result.Skipped)"
+    }
+    return $result
+}
+
+# ============================================================================
 # WINDOWS UPDATE
 # ============================================================================
 
@@ -11552,6 +11811,7 @@ try {
                 $manufacturer = [string]$sysInfo.Manufacturer
                 $provider = $manufacturer
                 $oemResult = $null
+                $additionalOemResult = Invoke-AdditionalOEMUpdate -SystemInfo $sysInfo -IncludeGPU
 
                 if ($manufacturer -match "DELL|ALIENWARE") {
                     $provider = "Dell Command Update"
@@ -11566,18 +11826,38 @@ try {
                     $oemResult = Invoke-HPUpdate -IncludeBIOS:$IncludeBIOS -SystemInfo $sysInfo `
                         -FirmwarePrerequisites $script:FirmwarePrerequisites
                 } else {
-                    Write-Log "========== OEM UPDATES ==========" "HEADER"
-                    $unsupportedMessage = "Manufacturer '$manufacturer' has no supported OEM adapter. Use -SkipOEM for a non-OEM run or add a verified adapter before requesting firmware"
-                    Write-Log $unsupportedMessage $(if ($IncludeBIOS) { "WARNING" } else { "INFO" })
-                    $unsupportedItem = New-UpdateItemResult -Name "OEM model support" `
-                        -Status $(if ($IncludeBIOS) { "Blocked" } else { "Skipped" }) -Message $unsupportedMessage
-                    [void](Add-StageResult (New-StageResult -Name "OEM" -Provider $manufacturer `
-                        -Status $(if ($IncludeBIOS) { "Partial" } else { "Skipped" }) `
-                        -Skipped 1 -Message $unsupportedMessage -Items @($unsupportedItem) -StartedAt $oemStart))
-                    if ($IncludeBIOS) { $script:ExitCode = 7 }
+                    if (@($additionalOemResult.Plans).Count -gt 0) {
+                        $provider = "Additional OEM/GPU providers"
+                        $oemResult = $additionalOemResult
+                    } else {
+                        Write-Log "========== OEM UPDATES ==========" "HEADER"
+                        $unsupportedMessage = "Manufacturer '$manufacturer' has no supported OEM adapter. Use -SkipOEM for a non-OEM run or add a verified adapter before requesting firmware"
+                        Write-Log $unsupportedMessage $(if ($IncludeBIOS) { "WARNING" } else { "INFO" })
+                        $unsupportedItem = New-UpdateItemResult -Name "OEM model support" `
+                            -Status $(if ($IncludeBIOS) { "Blocked" } else { "Skipped" }) -Message $unsupportedMessage
+                        [void](Add-StageResult (New-StageResult -Name "OEM" -Provider $manufacturer `
+                            -Status $(if ($IncludeBIOS) { "Partial" } else { "Skipped" }) `
+                            -Skipped 1 -Message $unsupportedMessage -Items @($unsupportedItem) -StartedAt $oemStart))
+                        if ($IncludeBIOS) { $script:ExitCode = 7 }
+                    }
                 }
 
                 if ($oemResult) {
+                    if ($oemResult -ne $additionalOemResult -and @($additionalOemResult.Items).Count -gt 0) {
+                        $oemResult.Items = @($oemResult.Items) + @($additionalOemResult.Items)
+                        $oemResult.Available = [int]$oemResult.Available + [int]$additionalOemResult.Available
+                        $oemResult.Attempted = [int]$oemResult.Attempted + [int]$additionalOemResult.Attempted
+                        $oemResult.Installed = [int]$oemResult.Installed + [int]$additionalOemResult.Installed
+                        $oemResult.UpdateCount = [int]$oemResult.UpdateCount + [int]$additionalOemResult.UpdateCount
+                        $oemResult.Failed = [int]$oemResult.Failed + [int]$additionalOemResult.Failed
+                        $oemResult.Skipped = [int]$oemResult.Skipped + [int]$additionalOemResult.Skipped
+                        $oemResult.RebootRequired = [bool]$oemResult.RebootRequired -or [bool]$additionalOemResult.RebootRequired
+                        if ([int]$additionalOemResult.Failed -gt 0 -and [int]$oemResult.Installed -gt 0) {
+                            $oemResult.Status = "Partial"
+                            $oemResult.Success = $false
+                        }
+                        $oemResult.Message = "$($oemResult.Message); additional providers: $($additionalOemResult.Message)"
+                    }
                     $oemStage = ConvertTo-StageResult -Name "OEM" -Provider $provider -Result $oemResult `
                         -ItemNames @($script:OEMUpdates) -StartedAt $oemStart
                     [void](Add-StageResult $oemStage)
