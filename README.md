@@ -11,7 +11,7 @@
 
 **Enterprise-grade, bulletproof system update utility for MSPs and IT professionals.**
 
-SystemUpdatePro is a fully automated, self-healing PowerShell script that handles OEM driver/BIOS updates (Dell, Lenovo, HP), Windows Updates, and application updates via Winget---all without user interaction.
+SystemUpdatePro is a fully automated, self-healing PowerShell script that handles OEM driver/BIOS updates, Windows Updates, and application updates via WinGet and installed package managers---all without user interaction.
 
 ---
 
@@ -23,7 +23,8 @@ SystemUpdatePro is a fully automated, self-healing PowerShell script that handle
 | Dell / Alienware | Dell Command Update CLI 5.7.0+ | Exact WinGet package + publisher verification |
 | Lenovo | LSUClient PowerShell Module 1.8.1 | Exact SHA-256 package |
 | HP | HP Image Assistant 5.3.3+ | SHA-256 + HP publisher verification |
-| Other | Windows Update + Winget only | N/A |
+| ASUS, Acer, MSI, Surface, Framework, Panasonic | Signed local vendor updater when present; public source recorded when acquisition is required | Fail-closed detection and bounded arguments |
+| Intel / AMD / NVIDIA GPU | Vendor update client when present; public installer endpoint recorded otherwise | One plan per detected GPU vendor |
 
 ### Self-Healing Capabilities
 - **WinGet Auto-Install**: Installs the pinned Microsoft App Installer bundle with its signed, architecture-specific dependencies
@@ -48,6 +49,8 @@ SystemUpdatePro is a fully automated, self-healing PowerShell script that handle
 - **Source-Specific Readiness and Offline Cache**: Probes only enabled provider origins with bounded timeouts, records proxy/source failures, and consumes administrator-prefilled SHA-256 content-addressed artifacts when `-Offline` is used
 - **Scoped Package Policy**: Models WinGet machine, current-user, other-user, unavailable, and skipped scopes; applies wildcard exclusions, version pins, and process-conflict deferrals without force-closing user applications
 - **Network and Rollout Gates**: Blocks downloads on known metered links by default, records explicit overrides, assigns deterministic endpoint cohorts, and emits local promote/hold/halt evidence
+- **Windows Update Policy**: Supports feature deferral, wildcard driver allow/deny rules, critical/security-only runs, atomic pre-stage plans, Microsoft Update Catalog fallback, and ADMX policy snapshots
+- **Package Manager Sources**: Auto-detects Chocolatey and Scoop, checks the StoreEdgeFD-backed Microsoft Store source, and limits Flatpak/Snap updates to WSL GUI environments
 
 ### Enterprise Integration
 - **Event Log**: Writes to Windows Application log for RMM/SIEM visibility
@@ -207,6 +210,12 @@ The standalone command requires administrator privileges, prints the completed a
 
 # Explicitly permit provider downloads on a known metered connection
 .\SystemUpdatePro.ps1 -AllowMeteredNetwork
+
+# Defer recent feature updates and only download approved updates for a later window
+.\SystemUpdatePro.ps1 -FeatureDeferralDays 30 -PreStage
+
+# Short maintenance window: critical and security updates only
+.\SystemUpdatePro.ps1 -SecurityOnly
 ```
 
 ---
@@ -245,12 +254,34 @@ The standalone command requires administrator privileges, prints the completed a
 | `-AllowMeteredNetwork` | Switch | False | Audited override for the known-metered download policy |
 | `-PolicyPath` | String | (none) | Protected JSON package policy: exclusions, pins, and process conflicts |
 | `-RolloutPolicyPath` | String | (none) | Protected JSON local cohort/promotion policy |
+| `-FeatureDeferralDays` | Int | 0 | Defer feature updates until their release age reaches this value (0-3650) |
+| `-SecurityOnly` | Switch | False | Apply only critical/security-classified Windows Updates |
+| `-PreStage` | Switch | False | Download approved Windows Updates and persist an atomic install plan |
 | `-Reboot` | Switch | False | Allow automatic reboot if required |
 | `-Force` | Switch | False | Continue non-firmware work despite low disk or pending reboot; never overrides unknown/blocked firmware safety |
 
 `-CleanupAfter` never uses `/ResetBase`. The separate `-ResetComponentBase` switch is intentionally high risk and also requests cleanup, so it does not need to be combined with `-CleanupAfter`. Use `-DryRun -ResetComponentBase` to preview the exact DISM command and rollback impact. Temporary Disk Cleanup `StateFlags0100` registry values are restored after each run, and restoration or `cleanmgr` failures are reported as partial cleanup.
 
 Firmware is excluded by default. With `-IncludeBIOS`, Dell Command Update, LSUClient, or HP Image Assistant must first complete an applicability scan for the detected model. Disk, AC, charge, or BitLocker query failures remain `Unknown` and block firmware even with `-Force`; non-firmware OEM updates may continue. Active BitLocker is accepted only for Dell's documented `-autoSuspendBitLocker=enable` path. Lenovo and HP require protection to be suspended beforehand.
+
+Windows Update policy can also be supplied under the protected `windows_update` object in `-PolicyPath`:
+
+```json
+{
+  "schema_version": 1,
+  "windows_update": {
+    "feature_deferral_days": 30,
+    "driver_allow": ["NVIDIA*", "Intel*"],
+    "driver_deny": ["*Preview*"],
+    "security_only": false,
+    "pre_stage": false,
+    "catalog_fallback": true,
+    "admx_snapshot": true
+  }
+}
+```
+
+Drivers are blocked unless an allow pattern matches; deny patterns take precedence. Pre-stage plans and ADMX snapshots are protected under `C:\ProgramData\SystemUpdatePro` and are never persisted during `-DryRun`.
 
 Elevated dependencies are defined in one in-script acquisition manifest. WinGet 1.29.280, PSWindowsUpdate 2.2.1.5, LSUClient 1.8.1, Dell Command Update 5.7.0, and HPIA 5.3.6 are pinned to their approved origins and digests. A valid newer installed WinGet, Dell CLI, or HP Image Assistant is accepted only when it meets the recorded minimum and publisher contract. Dell update execution also requires a signed Inventory Collector 13.8.0 or later. PowerShell modules are loaded by their verified versioned manifest path, so an unverified higher version cannot take precedence.
 

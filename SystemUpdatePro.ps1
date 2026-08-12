@@ -93,6 +93,12 @@
     Optional protected JSON policy containing package, Windows Update, maintenance, and conflict rules
 .PARAMETER RolloutPolicyPath
     Optional protected JSON policy used for deterministic cohort promotion decisions
+.PARAMETER FeatureDeferralDays
+    Keep feature updates deferred until their release age reaches this number of days
+.PARAMETER SecurityOnly
+    Only apply updates classified as critical or security updates
+.PARAMETER PreStage
+    Download approved Windows Updates and persist an install plan for a later run
 .EXAMPLE
     .\SystemUpdatePro.ps1
     # Standard update: OEM + Windows + Winget
@@ -236,7 +242,11 @@ param(
         }
         return $true
     })]
-    [string]$RolloutPolicyPath = ""
+    [string]$RolloutPolicyPath = "",
+    [ValidateRange(0, 3650)]
+    [int]$FeatureDeferralDays = 0,
+    [switch]$SecurityOnly,
+    [switch]$PreStage
 )
 
 # ============================================================================
@@ -253,6 +263,9 @@ $script:SourceTimeoutSeconds = [int]$SourceTimeoutSeconds
 $script:AllowMeteredNetwork = [bool]$AllowMeteredNetwork
 $script:PolicyPath = [string]$PolicyPath
 $script:RolloutPolicyPath = [string]$RolloutPolicyPath
+$script:FeatureDeferralDays = [int]$FeatureDeferralDays
+$script:SecurityOnly = [bool]$SecurityOnly
+$script:PreStage = [bool]$PreStage
 $script:DependencyReadiness = $null
 $script:DownloadPolicy = $null
 $script:CurrentSystemInfo = $null
@@ -260,12 +273,13 @@ $script:WingetScopeResults = @()
 $script:RolloutDecision = $null
 $script:PackagePolicy = $null
 $script:RolloutPolicy = $null
+$script:WindowsUpdatePolicy = $null
 $script:MaxRetries = [int]$MaxRetries
 $script:EvidenceMaxSizeMB = [int]$EvidenceMaxSizeMB
 $script:RedactionMode = [string]$RedactionMode
 $script:EventLogSource = "SystemUpdatePro"
 $script:ResultSchemaVersion = 1
-$script:StateSchemaVersion = 5
+$script:StateSchemaVersion = 6
 $script:CapabilitySchemaVersion = 1
 $script:HistorySchemaVersion = 2
 $script:LockSchemaVersion = 1
@@ -1440,7 +1454,7 @@ function Get-RunExitCode {
     $partialStages = @($Stages | Where-Object { $_.Status -eq "Partial" })
     if ($failedStages.Count -gt 0 -or $partialStages.Count -gt 0) {
         $successfulWork = @($Stages | Where-Object {
-            $_.Name -in @("OEM", "WindowsUpdate", "Winget", "DriverBackup", "WindowsUpdateRepair", "Cleanup", "Continuation") -and
+            $_.Name -in @("OEM", "WindowsUpdate", "Winget", "PackageManagers", "DriverBackup", "WindowsUpdateRepair", "Cleanup", "Continuation") -and
             ($_.Status -eq "Succeeded" -or $_.Installed -gt 0)
         }).Count
         if ($successfulWork -gt 0) { return 2 }
@@ -1500,6 +1514,7 @@ function New-RunData {
         DownloadPolicy   = $script:DownloadPolicy
         WingetScopes     = @($script:WingetScopeResults)
         RolloutDecision  = $script:RolloutDecision
+        WindowsUpdatePolicy = $script:WindowsUpdatePolicy
         EvidenceDelivery = @{}
     }
 }
@@ -1633,6 +1648,9 @@ function Get-EffectiveRunParameter {
         AllowMeteredNetwork = $AllowMeteredNetwork.IsPresent
         PolicyPath          = [string]$PolicyPath
         RolloutPolicyPath   = [string]$RolloutPolicyPath
+        FeatureDeferralDays = [int]$FeatureDeferralDays
+        SecurityOnly        = $SecurityOnly.IsPresent
+        PreStage            = $PreStage.IsPresent
     }
 }
 
@@ -1644,7 +1662,7 @@ function Get-ContinuationParameterName {
         "MaxUpdatePasses", "MinDiskSpaceGB", "MinFirmwareChargePercent", "LogPath",
         "LogRetentionDays", "EvidenceMaxSizeMB", "RedactionMode", "Reboot", "Force",
         "Offline", "DependencyCachePath", "SourceTimeoutSeconds", "AllowMeteredNetwork",
-        "PolicyPath", "RolloutPolicyPath"
+        "PolicyPath", "RolloutPolicyPath", "FeatureDeferralDays", "SecurityOnly", "PreStage"
     )
 }
 
@@ -1684,6 +1702,7 @@ function Convert-ContinuationStateSchema {
             $migrated["ResolvedWebhookUrl"] = $legacyWebhookUrl
         }
         $migrated["SchemaVersion"] = 5
+        $schemaVersion = 5
         $migrated["_MigrationSourceSchema"] = $migrationSourceSchema
     }
     if ($schemaVersion -eq 5 -and $migrated.Parameters -is [System.Collections.IDictionary]) {
@@ -1700,6 +1719,17 @@ function Convert-ContinuationStateSchema {
                 $migrated.Parameters[$default.Key] = $default.Value
             }
         }
+        if (-not $migrated.Parameters.Contains("FeatureDeferralDays")) {
+            $migrated.Parameters["FeatureDeferralDays"] = 0
+        }
+        if (-not $migrated.Parameters.Contains("SecurityOnly")) {
+            $migrated.Parameters["SecurityOnly"] = $false
+        }
+        if (-not $migrated.Parameters.Contains("PreStage")) {
+            $migrated.Parameters["PreStage"] = $false
+        }
+        $migrated["SchemaVersion"] = 6
+        $migrated["_MigrationSourceSchema"] = $migrationSourceSchema
     }
     return $migrated
 }
@@ -1721,7 +1751,7 @@ function Test-ContinuationState {
     if ([string]$State.Phase -notin @("Registering", "AwaitingReboot", "Running")) {
         return & $failure "Invalid continuation phase"
     }
-    if ([string]$State.StageCursor -notin @("WindowsUpdate", "Winget", "Cleanup", "Complete")) {
+    if ([string]$State.StageCursor -notin @("WindowsUpdate", "Winget", "PackageManagers", "Cleanup", "Complete")) {
         return & $failure "Invalid continuation stage cursor"
     }
 
@@ -1865,6 +1895,7 @@ function New-ContinuationState {
         DownloadPolicy = $script:DownloadPolicy
         WingetScopes = @($script:WingetScopeResults)
         RolloutDecision = $script:RolloutDecision
+        WindowsUpdatePolicy = $script:WindowsUpdatePolicy
         Errors         = @($script:Errors)
         Warnings       = @($script:Warnings)
     }
@@ -1886,11 +1917,11 @@ function Import-ContinuationState {
     $switchNames = @(
         "SkipOEM", "SkipWindows", "SkipWinget", "IncludeBIOS", "BypassWSUS",
         "RepairWindowsUpdate", "CleanupAfter", "ResetComponentBase", "ContinueAfterReboot", "DryRun",
-        "BackupDrivers", "ShowHistory", "Reboot", "Force"
+        "BackupDrivers", "ShowHistory", "Reboot", "Force", "SecurityOnly", "PreStage"
     )
     $integerNames = @(
         "HistoryCount", "MaxRetries", "MaxUpdatePasses", "MinDiskSpaceGB",
-        "MinFirmwareChargePercent", "LogRetentionDays", "EvidenceMaxSizeMB"
+        "MinFirmwareChargePercent", "LogRetentionDays", "EvidenceMaxSizeMB", "FeatureDeferralDays"
     )
 
     foreach ($name in $switchNames) {
@@ -1943,6 +1974,9 @@ function Import-ContinuationState {
     $script:RolloutDecision = if ($State.Contains("RolloutDecision")) {
         ConvertTo-Hashtable -InputObject $State.RolloutDecision
     } else { $null }
+    $script:WindowsUpdatePolicy = if ($State.Contains("WindowsUpdatePolicy")) {
+        ConvertTo-Hashtable -InputObject $State.WindowsUpdatePolicy
+    } else { $null }
     $script:AcquisitionProvenance = [System.Collections.ArrayList]::new()
     foreach ($dependency in @($State.AcquisitionProvenance)) {
         [void]$script:AcquisitionProvenance.Add([PSCustomObject]$dependency)
@@ -1970,7 +2004,7 @@ function Import-ContinuationState {
 function Set-ContinuationCursor {
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSUseShouldProcessForStateChangingFunctions", "", Justification = "Updates the run-owned continuation state snapshot.")]
     param(
-        [ValidateSet("WindowsUpdate", "Winget", "Cleanup", "Complete")]
+        [ValidateSet("WindowsUpdate", "Winget", "PackageManagers", "Cleanup", "Complete")]
         [string]$StageCursor
     )
 
@@ -1985,6 +2019,7 @@ function Set-ContinuationCursor {
     $script:ContinuationState.DownloadPolicy = $script:DownloadPolicy
     $script:ContinuationState.WingetScopes = @($script:WingetScopeResults)
     $script:ContinuationState.RolloutDecision = $script:RolloutDecision
+    $script:ContinuationState.WindowsUpdatePolicy = $script:WindowsUpdatePolicy
     $script:ContinuationState.Errors = @($script:Errors)
     $script:ContinuationState.Warnings = @($script:Warnings)
     $script:ContinuationState.Parameters = Get-EffectiveRunParameter
@@ -1993,12 +2028,12 @@ function Set-ContinuationCursor {
 
 function Test-ShouldRunContinuationStage {
     param(
-        [ValidateSet("WindowsUpdate", "Winget", "Cleanup")]
+        [ValidateSet("WindowsUpdate", "Winget", "PackageManagers", "Cleanup")]
         [string]$Stage
     )
 
     if (-not $script:ContinuationActive) { return $true }
-    $order = @("WindowsUpdate", "Winget", "Cleanup", "Complete")
+    $order = @("WindowsUpdate", "Winget", "PackageManagers", "Cleanup", "Complete")
     $cursorIndex = [array]::IndexOf($order, $script:ResumeStageCursor)
     $stageIndex = [array]::IndexOf($order, $Stage)
     return ($stageIndex -ge $cursorIndex)
@@ -2898,6 +2933,7 @@ function Save-UpdateHistory {
             download_policy   = $RunData.DownloadPolicy
             winget_scopes     = @($RunData.WingetScopes)
             rollout_decision  = $RunData.RolloutDecision
+            windows_update_policy = $RunData.WindowsUpdatePolicy
             evidence_delivery = $RunData.EvidenceDelivery
             parameters        = Protect-EvidenceObject -InputObject (
                 Get-EffectiveRunParameter
@@ -6390,6 +6426,220 @@ function Invoke-WingetUpgradeAll {
     return $result
 }
 
+function Get-PackageManagerAvailability {
+    $managers = [System.Collections.ArrayList]::new()
+    foreach ($name in @("choco", "scoop")) {
+        $command = Get-Command $name -ErrorAction SilentlyContinue | Select-Object -First 1
+        [void]$managers.Add([PSCustomObject][ordered]@{
+            Name = switch ($name) { "choco" { "Chocolatey" }; "scoop" { "Scoop" } }
+            CommandName = $name
+            Path = if ($command) { [string]$command.Source } else { "" }
+            Version = if ($command) { [string]$command.Version } else { "" }
+            Status = if ($command) { "Ready" } else { "Unavailable" }
+            Reason = if ($command) { "Package manager command is installed" } else { "$name is not installed" }
+        })
+    }
+    return @($managers)
+}
+
+function Get-WingetStoreSourceAvailability {
+    if (-not (Test-WingetInstalled)) {
+        return [PSCustomObject]@{ Available = $false; Source = ""; Status = "Unavailable"; Reason = "WinGet is not installed" }
+    }
+    try {
+        $output = @(& winget source list --disable-interactivity 2>&1)
+        $exitCode = $LASTEXITCODE
+        $storeLine = @($output | Where-Object { [string]$_ -match "(?i)StoreEdgeFD|msstore|Microsoft Store" }) | Select-Object -First 1
+        if ($exitCode -eq 0 -and $storeLine) {
+            return [PSCustomObject]@{ Available = $true; Source = "msstore"; Status = "Ready"; Reason = "StoreEdgeFD-backed Microsoft Store source is registered" }
+        }
+        return [PSCustomObject]@{ Available = $false; Source = "msstore"; Status = "Unavailable"; Reason = "StoreEdgeFD/msstore source is not registered" }
+    } catch {
+        return [PSCustomObject]@{ Available = $false; Source = "msstore"; Status = "Unavailable"; Reason = "WinGet source inventory failed: $($_.Exception.Message)" }
+    }
+}
+
+function Invoke-WingetStoreUpgrade {
+    $result = @{
+        Success = $true; Status = "Skipped"; RebootRequired = $false
+        Available = 0; Attempted = 0; Installed = 0; Failed = 0; Skipped = 0
+        ExitCode = $null; HResult = $null; Items = @(); Evidence = @(); Message = ""
+    }
+    $source = Get-WingetStoreSourceAvailability
+    if (-not $source.Available) {
+        $result.Skipped = 1
+        $result.Items += New-UpdateItemResult -Name "Microsoft Store (StoreEdgeFD)" -Status "Skipped" -Message $source.Reason
+        $result.Message = $source.Reason
+        return $result
+    }
+    if (-not (Test-DownloadAllowed)) {
+        $result.Skipped = 1
+        $result.Items += New-UpdateItemResult -Name "Microsoft Store (StoreEdgeFD)" -Status "Skipped" `
+            -Message "Store upgrades deferred by the provider download policy"
+        $result.Message = "StoreEdgeFD upgrade deferred by network policy"
+        return $result
+    }
+    try {
+        $arguments = @("upgrade", "--all", "--source", [string]$source.Source, "--silent",
+            "--accept-package-agreements", "--accept-source-agreements", "--disable-interactivity")
+        if ($DryRun) {
+            $output = @(& winget @arguments 2>&1)
+            $result.ExitCode = $LASTEXITCODE
+            $result.Available = @($output | Where-Object { [string]$_ -match "\S" -and [string]$_ -notmatch "(?i)no applicable|source|Name|^-+" }).Count
+            $result.Success = ($result.ExitCode -in @(0, -1978335189))
+            if (-not $result.Success) { $result.Failed = 1 }
+            $result.Items += New-UpdateItemResult -Name "Microsoft Store (StoreEdgeFD)" `
+                -Status $(if ($result.Success) { "Available" } else { "Failed" }) `
+                -ProviderCode $result.ExitCode -Message "StoreEdgeFD source queried without installation"
+            $result.Message = "$($result.Available) StoreEdgeFD upgrade result line(s) available (dry run)"
+            return $result
+        }
+        $process = Start-Process -FilePath "winget" -ArgumentList $arguments `
+            -Wait -NoNewWindow -PassThru -ErrorAction Stop
+        $result.Attempted = 1
+        $result.ExitCode = $process.ExitCode
+        $result.Success = ($process.ExitCode -in @(0, -1978335189))
+        if ($result.Success) { $result.Installed = 1; $result.UpdateCount = 1 } else { $result.Failed = 1 }
+        $result.Status = if ($result.Success) { "Succeeded" } else { "Failed" }
+        $result.Items += New-UpdateItemResult -Name "Microsoft Store (StoreEdgeFD)" `
+            -Status $(if ($result.Success) { "Installed" } else { "Failed" }) -ProviderCode $result.ExitCode
+        $result.Message = "StoreEdgeFD upgrade completed with exit $($result.ExitCode)"
+    } catch {
+        $result.Success = $false; $result.Status = "Failed"; $result.Failed = 1
+        $result.Message = "StoreEdgeFD upgrade failed: $($_.Exception.Message)"
+        $result.Items += New-UpdateItemResult -Name "Microsoft Store (StoreEdgeFD)" -Status "Failed" -Message $result.Message
+    }
+    return $result
+}
+
+function Get-WSLPackageManagerPlan {
+    $inWsl = -not [string]::IsNullOrWhiteSpace([string]$env:WSL_DISTRO_NAME)
+    $gui = $inWsl -and (-not [string]::IsNullOrWhiteSpace([string]$env:DISPLAY) -or
+        -not [string]::IsNullOrWhiteSpace([string]$env:WAYLAND_DISPLAY))
+    $plans = [System.Collections.ArrayList]::new()
+    foreach ($name in @("flatpak", "snap")) {
+        $command = if ($gui) { Get-Command $name -ErrorAction SilentlyContinue | Select-Object -First 1 } else { $null }
+        [void]$plans.Add([PSCustomObject][ordered]@{
+            Name = $name; Path = if ($command) { [string]$command.Source } else { "" }
+            Status = if (-not $inWsl) { "Skipped" } elseif (-not $gui) { "Skipped" } elseif ($command) { "Ready" } else { "Unavailable" }
+            Reason = if (-not $inWsl) { "Flatpak and Snap are limited to WSL GUI environments" } elseif (-not $gui) { "WSL GUI display variables are not present" } elseif ($command) { "$name is available in the WSL GUI environment" } else { "$name is not installed in the WSL GUI environment" }
+        })
+    }
+    return @($plans)
+}
+
+function Invoke-WSLPackageManagerUpdates {
+    $result = @{
+        Success = $true; Status = "Skipped"; RebootRequired = $false
+        Available = 0; Attempted = 0; Installed = 0; Failed = 0; Skipped = 0
+        ExitCode = $null; HResult = $null; Items = @(); Evidence = @(); Message = ""
+    }
+    foreach ($plan in @(Get-WSLPackageManagerPlan)) {
+        if ($plan.Status -ne "Ready") {
+            $result.Skipped++
+            $result.Items += New-UpdateItemResult -Name "WSL $($plan.Name)" -Status "Skipped" -Message $plan.Reason
+            continue
+        }
+        try {
+            $arguments = if ($plan.Name -eq "flatpak") { @("update", "-y") } else { @("refresh") }
+            if ($DryRun) {
+                $probeArguments = if ($plan.Name -eq "flatpak") { @("update", "--assumeno") } else { @("refresh", "--list") }
+                $output = @(& ([string]$plan.Path) @probeArguments 2>&1)
+                $result.Available += @($output | Where-Object { [string]$_ -match "\S" }).Count
+                $result.Items += New-UpdateItemResult -Name "WSL $($plan.Name)" -Status "Available" -Message "WSL GUI package source queried"
+                continue
+            }
+            $output = @(& ([string]$plan.Path) @arguments 2>&1)
+            $exitCode = $LASTEXITCODE
+            $result.Attempted++
+            $result.ExitCode = $exitCode
+            if ($exitCode -eq 0) {
+                $result.Installed++
+                $result.Items += New-UpdateItemResult -Name "WSL $($plan.Name)" -Status "Installed" -ProviderCode $exitCode
+            } else {
+                $result.Failed++
+                $result.Items += New-UpdateItemResult -Name "WSL $($plan.Name)" -Status "Failed" -ProviderCode $exitCode `
+                    -Message ((@($output) | Select-Object -Last 1) -join "")
+            }
+        } catch {
+            $result.Failed++
+            $result.Items += New-UpdateItemResult -Name "WSL $($plan.Name)" -Status "Failed" -Message $_.Exception.Message
+        }
+    }
+    $result.Success = ($result.Failed -eq 0)
+    $result.Status = if ($result.Failed -gt 0 -and $result.Installed -gt 0) { "Partial" } elseif ($result.Failed -gt 0) { "Failed" } elseif ($result.Installed -gt 0) { "Succeeded" } else { "Skipped" }
+    $result.Message = "WSL package sources: installed $($result.Installed), failed $($result.Failed), skipped $($result.Skipped)"
+    return $result
+}
+
+function Invoke-PackageManagerUpgrades {
+    $result = @{
+        Success = $true; Status = "Succeeded"; RebootRequired = $false
+        Available = 0; Attempted = 0; Installed = 0; Failed = 0; Skipped = 0
+        ExitCode = $null; HResult = $null; Items = @(); Evidence = @(); Message = ""
+        Managers = @()
+    }
+    $result.Managers = @(Get-PackageManagerAvailability)
+    $storeResult = Invoke-WingetStoreUpgrade
+    $wslResult = Invoke-WSLPackageManagerUpdates
+    $result.Items += @($storeResult.Items) + @($wslResult.Items)
+    foreach ($subResult in @($storeResult, $wslResult)) {
+        $result.Available += [int]$subResult.Available
+        $result.Attempted += [int]$subResult.Attempted
+        $result.Installed += [int]$subResult.Installed
+        $result.Failed += [int]$subResult.Failed
+        $result.Skipped += [int]$subResult.Skipped
+    }
+
+    foreach ($manager in @($result.Managers)) {
+        if ($manager.Status -ne "Ready") {
+            $result.Skipped++
+            $result.Items += New-UpdateItemResult -Name ([string]$manager.Name) -Status "Skipped" -Message ([string]$manager.Reason)
+            continue
+        }
+        try {
+            if ([string]$manager.Name -eq "Chocolatey") {
+                $queryOutput = @(& ([string]$manager.Path) outdated --limit-output --no-color 2>&1)
+                if ($DryRun) {
+                    $packages = @($queryOutput | Where-Object { [string]$_ -match "\|" })
+                    $result.Available += $packages.Count
+                    foreach ($package in $packages) {
+                        $result.Items += New-UpdateItemResult -Name ([string]$package) -Status "Available" -Message "Chocolatey outdated package"
+                    }
+                } else {
+                    $output = @(& ([string]$manager.Path) upgrade all -y --no-progress --limit-output 2>&1)
+                    $exitCode = $LASTEXITCODE
+                    $result.Attempted++
+                    $result.ExitCode = $exitCode
+                    if ($exitCode -eq 0) { $result.Installed++; $result.Items += New-UpdateItemResult -Name "Chocolatey packages" -Status "Installed" -ProviderCode $exitCode }
+                    else { $result.Failed++; $result.Items += New-UpdateItemResult -Name "Chocolatey packages" -Status "Failed" -ProviderCode $exitCode -Message ((@($output) | Select-Object -Last 1) -join "") }
+                }
+            } else {
+                $queryOutput = @(& ([string]$manager.Path) status 2>&1)
+                if ($DryRun) {
+                    $packages = @($queryOutput | Where-Object { [string]$_ -match "\S" -and [string]$_ -notmatch "(?i)Everything is up to date|Name" })
+                    $result.Available += $packages.Count
+                    foreach ($package in $packages) { $result.Items += New-UpdateItemResult -Name ([string]$package) -Status "Available" -Message "Scoop outdated package" }
+                } else {
+                    $output = @(& ([string]$manager.Path) update * 2>&1)
+                    $exitCode = $LASTEXITCODE
+                    $result.Attempted++
+                    $result.ExitCode = $exitCode
+                    if ($exitCode -eq 0) { $result.Installed++; $result.Items += New-UpdateItemResult -Name "Scoop packages" -Status "Installed" -ProviderCode $exitCode }
+                    else { $result.Failed++; $result.Items += New-UpdateItemResult -Name "Scoop packages" -Status "Failed" -ProviderCode $exitCode -Message ((@($output) | Select-Object -Last 1) -join "") }
+                }
+            }
+        } catch {
+            $result.Failed++
+            $result.Items += New-UpdateItemResult -Name ([string]$manager.Name) -Status "Failed" -Message $_.Exception.Message
+        }
+    }
+    $result.Success = ($result.Failed -eq 0)
+    $result.Status = if ($result.Failed -gt 0 -and $result.Installed -gt 0) { "Partial" } elseif ($result.Failed -gt 0) { "Failed" } elseif ($result.Installed -gt 0) { "Succeeded" } else { "Succeeded" }
+    $result.Message = "Package managers: installed $($result.Installed), available $($result.Available), failed $($result.Failed), skipped $($result.Skipped)"
+    return $result
+}
+
 # ============================================================================
 # POWERSHELL MODULE MANAGEMENT
 # ============================================================================
@@ -7845,14 +8095,394 @@ function Invoke-AdditionalOEMUpdate {
 # WINDOWS UPDATE
 # ============================================================================
 
+function Get-WindowsUpdatePolicy {
+    param(
+        [string]$Path = [string]$script:PolicyPath,
+        [int]$FeatureDeferralDays = [int]$script:FeatureDeferralDays,
+        [bool]$SecurityOnly = [bool]$script:SecurityOnly,
+        [bool]$PreStage = [bool]$script:PreStage
+    )
+
+    $policy = [ordered]@{
+        SchemaVersion = 1
+        FeatureDeferralDays = [math]::Max(0, [math]::Min(3650, $FeatureDeferralDays))
+        SecurityOnly = $SecurityOnly
+        PreStage = $PreStage
+        AllowFeatureUpdates = $false
+        DriverAllow = @()
+        DriverDeny = @()
+        CatalogFallback = $true
+        ADMXSnapshot = $true
+        Sources = @()
+        Errors = @()
+    }
+    try {
+        $document = Get-PolicyDocument -Path $Path
+        if ($document.Contains("windows_update") -and $document.windows_update -is [System.Collections.IDictionary]) {
+            $document = $document.windows_update
+        }
+        if ($document.Contains("feature_deferral_days")) {
+            $parsedDays = 0
+            if ([int]::TryParse([string]$document.feature_deferral_days, [ref]$parsedDays)) {
+                $policy.FeatureDeferralDays = [math]::Max(0, [math]::Min(3650, $parsedDays))
+            }
+        }
+        if ($document.Contains("security_only")) { $policy.SecurityOnly = [bool]$document.security_only }
+        if ($document.Contains("pre_stage")) { $policy.PreStage = [bool]$document.pre_stage }
+        if ($document.Contains("allow_feature_updates")) { $policy.AllowFeatureUpdates = [bool]$document.allow_feature_updates }
+        if ($document.Contains("driver_allow")) { $policy.DriverAllow = @($document.driver_allow | ForEach-Object { [string]$_ } | Where-Object { $_ }) }
+        if ($document.Contains("driver_deny")) { $policy.DriverDeny = @($document.driver_deny | ForEach-Object { [string]$_ } | Where-Object { $_ }) }
+        if ($document.Contains("catalog_fallback")) { $policy.CatalogFallback = [bool]$document.catalog_fallback }
+        if ($document.Contains("admx_snapshot")) { $policy.ADMXSnapshot = [bool]$document.admx_snapshot }
+        if (-not [string]::IsNullOrWhiteSpace($Path)) { $policy.Sources += "policy:$Path" }
+    } catch {
+        $policy.Errors += Protect-EvidenceText -Text $_.Exception.Message
+    }
+    if ([int]$policy.FeatureDeferralDays -gt 0) { $policy.AllowFeatureUpdates = $true }
+    $policy.DriverAllow = @($policy.DriverAllow | Select-Object -Unique)
+    $policy.DriverDeny = @($policy.DriverDeny | Select-Object -Unique)
+    return [PSCustomObject]$policy
+}
+
+function Get-WindowsUpdateItemIdentity {
+    param([Parameter(Mandatory = $true)][object]$Item)
+
+    $id = [string](Get-ResultValue -Result $Item -Names @("UpdateID", "UpdateId", "Id", "Identity") -Default "")
+    if ($Item.Identity) { $id = [string](Get-ResultValue -Result $Item.Identity -Names @("UpdateID", "UpdateId") -Default $id) }
+    $kb = Get-ResultValue -Result $Item -Names @("KB", "KBArticleIDs", "ArticleID", "ArticleIds") -Default ""
+    $kbText = (@($kb) | ForEach-Object { [string]$_ }) -join ","
+    $title = [string](Get-ResultValue -Result $Item -Names @("Title", "Name") -Default $kbText)
+    if ([string]::IsNullOrWhiteSpace($id)) { $id = $kbText }
+    if ([string]::IsNullOrWhiteSpace($id)) { $id = $title }
+    return [PSCustomObject][ordered]@{ Id = $id; KB = $kbText; Title = $title }
+}
+
+function Test-WindowsUpdateItemPolicy {
+    param(
+        [Parameter(Mandatory = $true)][object]$Item,
+        [AllowNull()][object]$Policy = $null
+    )
+
+    if ($null -eq $Policy) { $Policy = Get-WindowsUpdatePolicy }
+    $identity = Get-WindowsUpdateItemIdentity -Item $Item
+    $categories = @($Item.Categories | ForEach-Object {
+        [string](Get-ResultValue -Result $_ -Names @("Name", "Title") -Default $_)
+    })
+    $categoryText = $categories -join "; "
+    $title = [string]$identity.Title
+    $isDriver = ([bool](Get-ResultValue -Result $Item -Names @("IsDriver") -Default $false)) -or
+        $categoryText -match "(?i)driver" -or $title -match "(?i)driver"
+    $isFeature = ([bool](Get-ResultValue -Result $Item -Names @("IsFeature") -Default $false)) -or
+        $categoryText -match "(?i)feature\s*packs?" -or $title -match "(?i)feature update|upgrade to windows|enablement package"
+    $isSecurity = ([bool](Get-ResultValue -Result $Item -Names @("IsSecurity", "Security") -Default $false)) -or
+        $categoryText -match "(?i)security|critical" -or $title -match "(?i)security|critical|defender|malicious software removal"
+    $releaseValue = Get-ResultValue -Result $Item -Names @("ReleaseDate", "Date", "LastDeploymentChangeTime") -Default $null
+    $releaseDate = [datetime]::MinValue
+    $hasReleaseDate = $null -ne $releaseValue -and [datetime]::TryParse([string]$releaseValue, [ref]$releaseDate)
+
+    $matchesPattern = {
+        param([object[]]$Patterns)
+        foreach ($pattern in @($Patterns)) {
+            if ([string]::IsNullOrWhiteSpace([string]$pattern)) { continue }
+            if ($identity.Id -like [string]$pattern -or $identity.KB -like [string]$pattern -or
+                $title -like [string]$pattern -or $categoryText -like [string]$pattern) { return $true }
+        }
+        return $false
+    }
+
+    $status = "Allowed"
+    $reason = "Update is allowed by the Windows Update policy"
+    if ($title -match "(?i)preview") {
+        $status = "Blocked"
+        $reason = "Preview updates are excluded by the enterprise-safe policy"
+    } elseif ($Policy.SecurityOnly -and -not $isSecurity) {
+        $status = "Blocked"
+        $reason = "Security-only mode excludes non-critical and non-security updates"
+    } elseif ($isDriver) {
+        $denied = & $matchesPattern @($Policy.DriverDeny)
+        $allowed = @($Policy.DriverAllow).Count -gt 0 -and (& $matchesPattern @($Policy.DriverAllow))
+        if ($denied) {
+            $status = "Blocked"
+            $reason = "Driver matched the administrator driver deny list"
+        } elseif (-not $allowed) {
+            $status = "Blocked"
+            $reason = "Drivers remain blocked unless matched by the administrator driver allow list"
+        }
+    } elseif ($isFeature -and -not [bool]$Policy.AllowFeatureUpdates) {
+        $status = "Blocked"
+        $reason = "Feature updates are disabled by the default enterprise-safe policy"
+    } elseif ($isFeature -and [int]$Policy.FeatureDeferralDays -gt 0) {
+        if (-not $hasReleaseDate) {
+            $status = "Deferred"
+            $reason = "Feature update release age is unknown; it is deferred fail-closed"
+        } elseif (((Get-Date) - $releaseDate).TotalDays -lt [int]$Policy.FeatureDeferralDays) {
+            $status = "Deferred"
+            $reason = "Feature update is younger than the configured $($Policy.FeatureDeferralDays)-day deferral"
+        }
+    }
+
+    return [PSCustomObject][ordered]@{
+        Id = [string]$identity.Id; KB = [string]$identity.KB; Title = $title
+        Categories = @($categories); IsDriver = $isDriver; IsFeature = $isFeature; IsSecurity = $isSecurity
+        ReleaseDate = if ($hasReleaseDate) { $releaseDate.ToString("o") } else { "" }
+        Status = $status; Allowed = ($status -eq "Allowed"); Deferred = ($status -eq "Deferred")
+        Reason = $reason
+    }
+}
+
+function Get-WindowsUpdatePlan {
+    param(
+        [AllowEmptyCollection()][object[]]$Updates = @(),
+        [AllowNull()][object]$Policy = $null
+    )
+
+    if ($null -eq $Policy) { $Policy = Get-WindowsUpdatePolicy }
+    $allowed = [System.Collections.ArrayList]::new()
+    $items = [System.Collections.ArrayList]::new()
+    foreach ($update in @($Updates)) {
+        $decision = Test-WindowsUpdateItemPolicy -Item $update -Policy $Policy
+        [void]$items.Add([PSCustomObject][ordered]@{
+            Update = $update; Decision = $decision
+        })
+        if ($decision.Allowed) { [void]$allowed.Add($update) }
+    }
+    return [PSCustomObject][ordered]@{
+        SchemaVersion = 1
+        Policy = $Policy
+        Items = @($items)
+        AllowedUpdates = @($allowed)
+        Blocked = @($items | Where-Object { $_.Decision.Status -eq "Blocked" })
+        Deferred = @($items | Where-Object { $_.Decision.Status -eq "Deferred" })
+    }
+}
+
+function Test-WindowsUpdatePrestageDocument {
+    param([AllowNull()][object]$Document)
+    if ($Document -isnot [System.Collections.IDictionary] -or [int]$Document.SchemaVersion -ne 1) {
+        return [PSCustomObject]@{ Valid = $false; Reason = "Windows Update pre-stage schema is invalid" }
+    }
+    if ($Document.Items -isnot [System.Collections.IEnumerable]) {
+        return [PSCustomObject]@{ Valid = $false; Reason = "Windows Update pre-stage items are missing" }
+    }
+    return [PSCustomObject]@{ Valid = $true; Reason = "" }
+}
+
+function Get-WindowsUpdatePrestagePath {
+    return Join-Path $script:DataPath "WindowsUpdatePrestage.json"
+}
+
+function Get-WindowsUpdatePrestagePlan {
+    $path = Get-WindowsUpdatePrestagePath
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        return [PSCustomObject]@{ Exists = $false; Valid = $true; Path = $path; Items = @(); Reason = "No pre-stage plan exists" }
+    }
+    $read = Read-ProtectedJsonFile -Path $path -ValidationScript ${function:Test-WindowsUpdatePrestageDocument}
+    if (-not $read.Success) {
+        return [PSCustomObject]@{ Exists = $true; Valid = $false; Path = $path; Items = @(); Reason = [string]$read.Error }
+    }
+    return [PSCustomObject]@{ Exists = $true; Valid = $true; Path = $path; Items = @($read.Data.Items); Reason = "Pre-stage plan loaded" }
+}
+
+function Save-WindowsUpdatePrestagePlan {
+    param(
+        [Parameter(Mandatory = $true)][object[]]$Items,
+        [bool]$DryRunMode = [bool]$script:DryRun
+    )
+
+    $path = Get-WindowsUpdatePrestagePath
+    $document = [ordered]@{
+        SchemaVersion = 1
+        RunId = [string]$script:RunId
+        CreatedAt = (Get-Date).ToUniversalTime().ToString("o")
+        Items = @($Items)
+    }
+    if ($DryRunMode) {
+        return [PSCustomObject]@{ Success = $true; Persisted = $false; Path = $path; Reason = "Dry run did not persist a pre-stage plan" }
+    }
+    try {
+        if (-not (Write-ProtectedAtomicJson -Path $path -Data $document -Depth 20 `
+            -DataValidationScript ${function:Test-WindowsUpdatePrestageDocument})) {
+            throw $script:LastEvidenceWriteError
+        }
+        return [PSCustomObject]@{ Success = $true; Persisted = $true; Path = $path; Reason = "Pre-stage plan persisted atomically" }
+    } catch {
+        return [PSCustomObject]@{ Success = $false; Persisted = $false; Path = $path; Reason = "Pre-stage plan could not be persisted: $($_.Exception.Message)" }
+    }
+}
+
+function Clear-WindowsUpdatePrestagePlan {
+    $path = Get-WindowsUpdatePrestagePath
+    if ($script:DryRun) { return $true }
+    try {
+        Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath "$path.previous" -Force -ErrorAction SilentlyContinue
+        return -not (Test-Path -LiteralPath $path)
+    } catch { return $false }
+}
+
+function Get-WindowsPolicySnapshot {
+    param(
+        [string[]]$Paths = @(
+            "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate",
+            "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU"
+        )
+    )
+
+    $entries = [System.Collections.ArrayList]::new()
+    $missing = [System.Collections.ArrayList]::new()
+    foreach ($path in @($Paths)) {
+        $keys = @()
+        try { $keys = @(Get-ChildItem -LiteralPath $path -Recurse -ErrorAction SilentlyContinue) } catch { $keys = @() }
+        if (Test-Path -LiteralPath $path) { $keys = @((Get-Item -LiteralPath $path -ErrorAction SilentlyContinue)) + $keys }
+        $keys = @($keys | Where-Object { $null -ne $_ } | Sort-Object PSPath -Unique)
+        if ($keys.Count -eq 0) { [void]$missing.Add($path); continue }
+        foreach ($key in $keys) {
+            try {
+                foreach ($name in @($key.Property)) {
+                    $snapshot = Get-RegistryValueSnapshot -Path ([string]$key.PSPath) -Name ([string]$name)
+                    [void]$entries.Add($snapshot)
+                }
+            } catch {
+                [void]$missing.Add("${path}: $($_.Exception.Message)")
+            }
+        }
+    }
+    return [PSCustomObject][ordered]@{
+        SchemaVersion = 1; CapturedAt = (Get-Date).ToUniversalTime().ToString("o")
+        Paths = @($Paths); Entries = @($entries); Missing = @($missing)
+        Status = if ($missing.Count -eq 0) { "Ready" } else { "Partial" }
+    }
+}
+
+function Save-WindowsPolicySnapshot {
+    param(
+        [AllowNull()][object]$Snapshot = $null,
+        [bool]$DryRunMode = [bool]$script:DryRun
+    )
+
+    if ($null -eq $Snapshot) { $Snapshot = Get-WindowsPolicySnapshot }
+    $path = Join-Path $script:DataPath "WindowsPolicySnapshot.json"
+    if ($DryRunMode) {
+        return [PSCustomObject]@{ Success = $true; Persisted = $false; Path = $path; Snapshot = $Snapshot; Reason = "Dry run retained the ADMX policy snapshot in memory only" }
+    }
+    try {
+        if (-not (Write-ProtectedAtomicJson -Path $path -Data $Snapshot -Depth 30)) {
+            throw $script:LastEvidenceWriteError
+        }
+        return [PSCustomObject]@{ Success = $true; Persisted = $true; Path = $path; Snapshot = $Snapshot; Reason = "Windows Update ADMX snapshot persisted atomically" }
+    } catch {
+        return [PSCustomObject]@{ Success = $false; Persisted = $false; Path = $path; Snapshot = $Snapshot; Reason = "Windows Update ADMX snapshot failed: $($_.Exception.Message)" }
+    }
+}
+
+function Invoke-WindowsPolicySnapshot {
+    param([bool]$DryRunMode = [bool]$script:DryRun)
+    $snapshot = Get-WindowsPolicySnapshot
+    return Save-WindowsPolicySnapshot -Snapshot $snapshot -DryRunMode $DryRunMode
+}
+
+function Invoke-WindowsUpdateCatalogFallback {
+    param(
+        [AllowEmptyCollection()][object[]]$Items = @(),
+        [string]$Reason = "Windows Update providers failed"
+    )
+
+    $result = @{
+        Success = $false; Status = "Failed"; RebootRequired = $false
+        Available = 0; Attempted = 0; Installed = 0; Failed = 0; Skipped = 0
+        ExitCode = $null; HResult = $null; Items = @(); Evidence = @(); Message = ""
+    }
+    $identities = @($Items | Where-Object { $null -ne $_ } | ForEach-Object { Get-WindowsUpdateItemIdentity -Item $_ } | Where-Object {
+        $_.KB -match "(?i)KB\d+" -or $_.Title -match "(?i)KB\d+"
+    })
+    if ($identities.Count -eq 0) {
+        $result.Failed = 1
+        $result.Message = "Catalog fallback could not identify a KB from the failed provider result"
+        return $result
+    }
+    if (-not (Test-DownloadAllowed)) {
+        $result.Success = $true; $result.Status = "Succeeded"; $result.Skipped = $identities.Count
+        $result.Message = "Catalog fallback deferred by the provider download policy"
+        foreach ($identity in $identities) {
+            $result.Items += New-UpdateItemResult -Name $identity.Title -Id $identity.KB -Status "Skipped" -Message $result.Message
+        }
+        return $result
+    }
+
+    $seen = @{}
+    foreach ($identity in $identities) {
+        $kbMatches = [regex]::Matches("$($identity.KB) $($identity.Title)", "(?i)KB\d+") | ForEach-Object { $_.Value.ToUpperInvariant() }
+        foreach ($kb in @($kbMatches | Select-Object -Unique)) {
+            if ($seen.ContainsKey($kb)) { continue }
+            $seen[$kb] = $true
+            $queryUri = "https://www.catalog.update.microsoft.com/Search.aspx?q=$kb"
+            try {
+                $page = Invoke-WebRequest -Uri $queryUri -UseBasicParsing -TimeoutSec ([int]$script:SourceTimeoutSeconds) -ErrorAction Stop
+                $content = [string](Get-ResultValue -Result $page -Names @("Content", "RawContent") -Default "")
+                $directUri = @([regex]::Matches($content, 'https://catalog\.s\.download\.windowsupdate\.com/[^"''<>\s]+\.(?:msu|cab)', "IgnoreCase") | ForEach-Object { $_.Value } | Select-Object -First 1)
+                if ($script:DryRun) {
+                    $result.Available++
+                    $result.Items += New-UpdateItemResult -Name $identity.Title -Id $kb -Status "Available" `
+                        -Message "Catalog checked; no package was downloaded in dry-run mode" -Evidence @($queryUri)
+                    continue
+                }
+                if ($directUri.Count -eq 0 -or -not (Test-AcquisitionUri -Uri $directUri[0] -AllowedHosts @("catalog.s.download.windowsupdate.com"))) {
+                    $result.Skipped++
+                    $result.Items += New-UpdateItemResult -Name $identity.Title -Id $kb -Status "Skipped" `
+                        -Message "Catalog search completed but no approved Microsoft package URL was exposed" -Evidence @($queryUri)
+                    continue
+                }
+                $temporaryDirectory = New-SystemUpdateProTemporaryDirectory -Purpose "Catalog"
+                $packagePath = Join-Path $temporaryDirectory "$kb.msu"
+                try {
+                    Invoke-WebRequest -Uri $directUri[0] -OutFile $packagePath -UseBasicParsing `
+                        -TimeoutSec ([int]$script:SourceTimeoutSeconds) -ErrorAction Stop
+                    $process = Start-Process -FilePath (Join-Path $script:WindowsRoot "System32\wusa.exe") `
+                        -ArgumentList @($packagePath, "/quiet", "/norestart") -Wait -NoNewWindow -PassThru -ErrorAction Stop
+                    $result.Attempted++
+                    $result.ExitCode = $process.ExitCode
+                    if ($process.ExitCode -in @(0, 3010, 1641)) {
+                        $result.Installed++
+                        $result.Success = $true
+                        if ($process.ExitCode -in @(3010, 1641)) { $result.RebootRequired = $true }
+                        $result.Items += New-UpdateItemResult -Name $identity.Title -Id $kb -Status "Installed" `
+                            -ProviderCode $process.ExitCode -RebootRequired ($process.ExitCode -in @(3010, 1641)) `
+                            -Message "Installed from Microsoft Update Catalog" -Evidence @($queryUri, $directUri[0])
+                    } else {
+                        $result.Failed++
+                        $result.Items += New-UpdateItemResult -Name $identity.Title -Id $kb -Status "Failed" `
+                            -ProviderCode $process.ExitCode -Message "Catalog package installer exited with $($process.ExitCode)"
+                    }
+                } finally { Remove-SystemUpdateProTemporaryDirectory -Path $temporaryDirectory }
+            } catch {
+                $result.Failed++
+                $result.Items += New-UpdateItemResult -Name $identity.Title -Id $kb -Status "Failed" `
+                    -Message "Catalog fallback failed: $($_.Exception.Message)" -Evidence @($queryUri)
+            }
+        }
+    }
+    if ($script:DryRun) { $result.Success = ($result.Failed -eq 0); $result.Status = "Succeeded" }
+    elseif ($result.Failed -eq 0 -and $result.Installed -gt 0) { $result.Success = $true; $result.Status = "Succeeded" }
+    elseif ($result.Installed -gt 0) { $result.Success = $false; $result.Status = "Partial" }
+    $result.Message = if ($script:DryRun) {
+        "Catalog fallback identified $($result.Available) package(s) after provider failure"
+    } else {
+        "Catalog fallback: installed $($result.Installed), failed $($result.Failed), skipped $($result.Skipped)"
+    }
+    return $result
+}
+
 function Invoke-WindowsUpdateWUA {
     $result = @{
         Success = $false; RebootRequired = $false
         Available = 0; Attempted = 0; Installed = 0; Failed = 0; Skipped = 0
         ExitCode = $null; HResult = $null; Items = @(); Evidence = @(); Message = ""
+        CandidateUpdates = @(); Policy = $null; PreStage = $null
     }
 
     try {
+        $policy = Get-WindowsUpdatePolicy
+        $result.Policy = $policy
         $session = New-Object -ComObject Microsoft.Update.Session
         $searcher = $session.CreateUpdateSearcher()
 
@@ -7864,17 +8494,30 @@ function Invoke-WindowsUpdateWUA {
             return $result
         }
 
-        $updatesToInstall = New-Object -ComObject Microsoft.Update.UpdateColl
-
-        foreach ($update in $searchResult.Updates) {
-            $dominated = ($update.Title -match "Feature Update|Upgrade to Windows|Preview")
-            if (-not $dominated) {
-                foreach ($cat in $update.Categories) {
-                    if ($cat.Name -eq "Drivers") { $dominated = $true; break }
-                }
-            }
-            if (-not $dominated) { $updatesToInstall.Add($update) | Out-Null }
+        $allUpdates = @($searchResult.Updates)
+        $result.CandidateUpdates = @($allUpdates)
+        $plan = Get-WindowsUpdatePlan -Updates $allUpdates -Policy $policy
+        foreach ($planned in @($plan.Items | Where-Object { -not $_.Decision.Allowed })) {
+            $result.Skipped++
+            $result.Items += New-UpdateItemResult -Name $planned.Decision.Title -Id $planned.Decision.Id -Status "Skipped" `
+                -Message $planned.Decision.Reason -Evidence @("policy-status:$($planned.Decision.Status)")
         }
+
+        $allowedUpdates = @($plan.AllowedUpdates)
+        $preStagePlan = Get-WindowsUpdatePrestagePlan
+        if ($preStagePlan.Exists -and $preStagePlan.Valid -and -not $policy.PreStage) {
+            $pendingIds = @($preStagePlan.Items | ForEach-Object { [string](Get-ResultValue -Result $_ -Names @("Id", "UpdateID") -Default "") })
+            if ($pendingIds.Count -gt 0) {
+                $allowedUpdates = @($allowedUpdates | Where-Object {
+                    $identity = Get-WindowsUpdateItemIdentity -Item $_
+                    $pendingIds -contains [string]$identity.Id
+                })
+                $result.Evidence += $preStagePlan.Path
+            }
+        }
+
+        $updatesToInstall = New-Object -ComObject Microsoft.Update.UpdateColl
+        foreach ($update in @($allowedUpdates)) { [void]$updatesToInstall.Add($update) }
 
         if ($updatesToInstall.Count -eq 0) {
             $result.Success = $true
@@ -7892,7 +8535,8 @@ function Invoke-WindowsUpdateWUA {
                 $uTitle = $update.Title
                 Write-Log "  -- $uTitle" "INFO"
                 [void]$script:WindowsUpdates.Add($uTitle)
-                $result.Items += New-UpdateItemResult -Name $uTitle -Id $update.Identity.UpdateID -Status "Available"
+                $result.Items += New-UpdateItemResult -Name $uTitle -Id $update.Identity.UpdateID -Status "Available" `
+                    -Message $(if ($policy.PreStage) { "Would download and persist a pre-stage plan" } else { "Policy-approved update" })
             }
             return $result
         }
@@ -7905,6 +8549,29 @@ function Invoke-WindowsUpdateWUA {
             $result.HResult = $downloadResult.HResult
             $result.Failed = $updatesToInstall.Count
             $result.Message = "WUA download failed (result: $($downloadResult.ResultCode), HRESULT: $($downloadResult.HResult))"
+            return $result
+        }
+
+        if ($policy.PreStage) {
+            $stageItems = @($allowedUpdates | ForEach-Object {
+                $identity = Get-WindowsUpdateItemIdentity -Item $_
+                [ordered]@{ Id = $identity.Id; KB = $identity.KB; Title = $identity.Title; Provider = "WUA" }
+            })
+            $saved = Save-WindowsUpdatePrestagePlan -Items $stageItems
+            $result.PreStage = $saved
+            if (-not $saved.Success) {
+                $result.Failed = $updatesToInstall.Count
+                $result.Message = $saved.Reason
+                return $result
+            }
+            $result.Attempted = $updatesToInstall.Count
+            $result.Success = $true
+            foreach ($update in @($allowedUpdates)) {
+                $identity = Get-WindowsUpdateItemIdentity -Item $update
+                $result.Items += New-UpdateItemResult -Name $identity.Title -Id $identity.Id -Status "Available" `
+                    -Message "Downloaded and staged for a later install window"
+            }
+            $result.Message = "Downloaded and staged: $($updatesToInstall.Count)"
             return $result
         }
 
@@ -7928,6 +8595,7 @@ function Invoke-WindowsUpdateWUA {
 
         $result.Success = ($result.Failed -eq 0 -and $installResult.ResultCode -in @(2, 3))
         $result.RebootRequired = $installResult.RebootRequired
+        if ($result.Success -and $preStagePlan.Exists) { [void](Clear-WindowsUpdatePrestagePlan) }
         $result.Message = "Installed: $($result.Installed), Failed: $($result.Failed)"
 
     } catch {
@@ -7944,16 +8612,19 @@ function Invoke-WindowsUpdatePSWU {
         Success = $false; RebootRequired = $false
         Available = 0; Attempted = 0; Installed = 0; Failed = 0; Skipped = 0
         ExitCode = $null; HResult = $null; Items = @(); Evidence = @(); Message = ""
+        CandidateUpdates = @(); Policy = $null; PreStage = $null
     }
 
     try {
+        $policy = Get-WindowsUpdatePolicy
+        $result.Policy = $policy
         $psWindowsUpdatePath = Get-VerifiedPSModulePath -ModuleName "PSWindowsUpdate"
         if (-not $psWindowsUpdatePath) {
             throw "The pinned PSWindowsUpdate module failed installed-payload verification"
         }
         Import-Module $psWindowsUpdatePath -Force -ErrorAction Stop
 
-        $updates = @(Get-WindowsUpdate -MicrosoftUpdate -NotCategory "Drivers","Feature Packs" -NotTitle "Preview" -ErrorAction Stop)
+        $updates = @(Get-WindowsUpdate -MicrosoftUpdate -ErrorAction Stop)
 
         if (-not $updates -or $updates.Count -eq 0) {
             $result.Success = $true
@@ -7961,22 +8632,78 @@ function Invoke-WindowsUpdatePSWU {
             return $result
         }
 
-        $result.Available = $updates.Count
+        $result.CandidateUpdates = @($updates)
+        $plan = Get-WindowsUpdatePlan -Updates $updates -Policy $policy
+        foreach ($planned in @($plan.Items | Where-Object { -not $_.Decision.Allowed })) {
+            $result.Skipped++
+            $result.Items += New-UpdateItemResult -Name $planned.Decision.Title -Id $planned.Decision.Id -Status "Skipped" `
+                -Message $planned.Decision.Reason -Evidence @("policy-status:$($planned.Decision.Status)")
+        }
+        $allowedUpdates = @($plan.AllowedUpdates)
+        $result.Available = $allowedUpdates.Count
 
         if ($DryRun) {
-            $result.Success = $true
-            $result.Message = "$($updates.Count) updates available (dry run - not installed)"
-            foreach ($u in $updates) {
+            $result.Success = ($result.Available -ge 0)
+            $result.Message = "$($result.Available) updates available (dry run - not installed)"
+            foreach ($u in $allowedUpdates) {
                 $uTitle = if ($u.Title) { $u.Title } else { $u.KB }
                 Write-Log "  -- $uTitle" "INFO"
                 [void]$script:WindowsUpdates.Add($uTitle)
-                $result.Items += New-UpdateItemResult -Name $uTitle -Id ([string]($u.KB -join ",")) -Status "Available"
+                $identity = Get-WindowsUpdateItemIdentity -Item $u
+                $result.Items += New-UpdateItemResult -Name $uTitle -Id $identity.Id -Status "Available" `
+                    -Message $(if ($policy.PreStage) { "Would download and persist a pre-stage plan" } else { "Policy-approved update" })
             }
             return $result
         }
 
-        $result.Attempted = $updates.Count
-        $installResults = @(Install-WindowsUpdate -MicrosoftUpdate -AcceptAll -IgnoreReboot -NotCategory "Drivers","Feature Packs" -NotTitle "Preview" -Confirm:$false -ErrorAction Stop)
+        if ($allowedUpdates.Count -eq 0) {
+            $result.Success = $true
+            $result.Message = "No updates remain after Windows Update policy filtering"
+            return $result
+        }
+
+        if ($policy.PreStage) {
+            $downloadResults = @(Get-WindowsUpdate -Update $allowedUpdates -Download -AcceptAll -IgnoreReboot -Confirm:$false -ErrorAction Stop)
+            $stageItems = @($allowedUpdates | ForEach-Object {
+                $identity = Get-WindowsUpdateItemIdentity -Item $_
+                [ordered]@{ Id = $identity.Id; KB = $identity.KB; Title = $identity.Title; Provider = "PSWindowsUpdate" }
+            })
+            $saved = Save-WindowsUpdatePrestagePlan -Items $stageItems
+            $result.PreStage = $saved
+            if (-not $saved.Success) {
+                $result.Failed = $allowedUpdates.Count
+                $result.Message = $saved.Reason
+                return $result
+            }
+            $result.Attempted = $allowedUpdates.Count
+            $result.Success = $true
+            $result.Message = "Downloaded and staged: $($allowedUpdates.Count)"
+            foreach ($u in $allowedUpdates) {
+                $identity = Get-WindowsUpdateItemIdentity -Item $u
+                $result.Items += New-UpdateItemResult -Name $identity.Title -Id $identity.Id -Status "Available" `
+                    -Message "Downloaded and staged for a later install window"
+            }
+            return $result
+        }
+
+        $preStagePlan = Get-WindowsUpdatePrestagePlan
+        if ($preStagePlan.Exists -and $preStagePlan.Valid) {
+            $pendingIds = @($preStagePlan.Items | ForEach-Object { [string](Get-ResultValue -Result $_ -Names @("Id", "UpdateID") -Default "") })
+            $allowedUpdates = @($allowedUpdates | Where-Object {
+                $identity = Get-WindowsUpdateItemIdentity -Item $_
+                $pendingIds -contains [string]$identity.Id
+            })
+            $result.Available = $allowedUpdates.Count
+            if ($allowedUpdates.Count -eq 0) {
+                $result.Success = $true
+                $result.Message = "No updates from the persisted pre-stage plan remain applicable"
+                return $result
+            }
+            $result.Evidence += $preStagePlan.Path
+        }
+
+        $result.Attempted = $allowedUpdates.Count
+        $installResults = @(Install-WindowsUpdate -Update $allowedUpdates -MicrosoftUpdate -AcceptAll -IgnoreReboot -Confirm:$false -ErrorAction Stop)
 
         if ($installResults.Count -gt 0) {
             foreach ($r in $installResults) {
@@ -7996,15 +8723,17 @@ function Invoke-WindowsUpdatePSWU {
             }
         } else {
             $result.Failed = $result.Attempted
-            foreach ($u in $updates) {
+            foreach ($u in $allowedUpdates) {
                 $itemName = if ($u.Title) { $u.Title } else { [string]($u.KB -join ",") }
                 $result.Items += New-UpdateItemResult -Name $itemName -Id ([string]($u.KB -join ",")) `
                     -Status "Failed" -Message "PSWindowsUpdate returned no installation result"
             }
         }
 
-        $result.Success = ($result.Failed -eq 0 -and $result.Items.Count -eq $result.Attempted)
+        $installationItems = @($result.Items | Where-Object { $_.Status -in @("Installed", "Failed") })
+        $result.Success = ($result.Failed -eq 0 -and $installationItems.Count -eq $result.Attempted)
         $result.RebootRequired = (Get-WURebootStatus -Silent -ErrorAction SilentlyContinue)
+        if ($result.Success -and $preStagePlan.Exists) { [void](Clear-WindowsUpdatePrestagePlan) }
         $result.Message = "Installed: $($result.Installed), Failed: $($result.Failed)"
 
     } catch {
@@ -8028,13 +8757,51 @@ function Invoke-WindowsUpdate {
     Write-Log "========== WINDOWS UPDATE ==========" "HEADER"
 
     $usePSWU = Install-PSModuleWithRetry -ModuleName "PSWindowsUpdate"
+    $policy = Get-WindowsUpdatePolicy
+    $script:WindowsUpdatePolicy = $policy
     $providerSucceeded = $true
 
     for ($pass = 1; $pass -le $MaxPasses; $pass++) {
         Write-Log "Pass $pass of $MaxPasses" "INFO"
         $result.Passes = $pass
 
-        $passResult = if ($usePSWU) { Invoke-WindowsUpdatePSWU } else { Invoke-WindowsUpdateWUA }
+        $providerNames = if ($usePSWU) { @("PSWindowsUpdate", "WUA") } else { @("WUA") }
+        $passResult = $null
+        $providerFailureMessages = [System.Collections.ArrayList]::new()
+        foreach ($providerName in $providerNames) {
+            $candidateResult = if ($providerName -eq "PSWindowsUpdate") {
+                Invoke-WindowsUpdatePSWU
+            } else {
+                Invoke-WindowsUpdateWUA
+            }
+            if ($candidateResult.Success) {
+                $passResult = $candidateResult
+                break
+            }
+            $passResult = $candidateResult
+            [void]$providerFailureMessages.Add("${providerName}: $($candidateResult.Message)")
+            if ($providerName -eq "PSWindowsUpdate") {
+                $hasCandidateContract = ($candidateResult -is [System.Collections.IDictionary] -and $candidateResult.Contains("CandidateUpdates")) -or
+                    ($candidateResult.PSObject.Properties["CandidateUpdates"] -and $null -ne $candidateResult.CandidateUpdates)
+                if (-not $hasCandidateContract) { break }
+            }
+        }
+
+        if ($null -eq $passResult) {
+            $passResult = @{ Success = $false; Available = 0; Attempted = 0; Installed = 0; Failed = 1; Skipped = 0; Items = @(); Evidence = @(); Message = "No Windows Update provider returned a result" }
+        }
+        if (-not $passResult.Success -and [bool]$policy.CatalogFallback) {
+            $fallbackResult = Invoke-WindowsUpdateCatalogFallback -Items @($passResult.CandidateUpdates) `
+                -Reason (@($providerFailureMessages) -join "; ")
+            if ($fallbackResult.Success) {
+                $passResult = $fallbackResult
+                $passResult.Message = "$($fallbackResult.Message); provider failures: $(@($providerFailureMessages) -join '; ')"
+            } else {
+                $passResult.Items = @($passResult.Items) + @($fallbackResult.Items)
+                $passResult.Failed = [int]$passResult.Failed + [int]$fallbackResult.Failed
+                $passResult.Message = "Provider failures: $(@($providerFailureMessages) -join '; '); $($fallbackResult.Message)"
+            }
+        }
 
         $result.Available += [int]$passResult.Available
         $result.Attempted += [int]$passResult.Attempted
@@ -9704,6 +10471,7 @@ function New-WebhookPayload {
         download_policy = $RunData.DownloadPolicy
         winget_scopes = @($RunData.WingetScopes)
         rollout_decision = $RunData.RolloutDecision
+        windows_update_policy = $RunData.WindowsUpdatePolicy
     })
 }
 
@@ -11601,6 +12369,15 @@ try {
             -Evidence @("network-cost:$($networkCost.Status)", "audited-override:$($script:DownloadPolicy.AuditedOverride)", "dry-run:$DryRun")))
 
         $script:PackagePolicy = Get-WingetPackagePolicy -Path ([string]$PolicyPath)
+        $script:WindowsUpdatePolicy = Get-WindowsUpdatePolicy -Path ([string]$PolicyPath)
+        [void]$preflightItems.Add((New-UpdateItemResult -Name "Windows Update policy" -Status "Succeeded" `
+            -Message "Feature deferral: $($script:WindowsUpdatePolicy.FeatureDeferralDays) day(s); security-only: $($script:WindowsUpdatePolicy.SecurityOnly); pre-stage: $($script:WindowsUpdatePolicy.PreStage)" `
+            -Evidence @(
+                "driver-allow:$(@($script:WindowsUpdatePolicy.DriverAllow) -join ',')",
+                "driver-deny:$(@($script:WindowsUpdatePolicy.DriverDeny) -join ',')",
+                "catalog-fallback:$($script:WindowsUpdatePolicy.CatalogFallback)",
+                "admx-snapshot:$($script:WindowsUpdatePolicy.ADMXSnapshot)"
+            )))
         $script:RolloutPolicy = Get-RolloutPolicy -Path ([string]$RolloutPolicyPath)
         $deviceIdentity = if (-not [string]::IsNullOrWhiteSpace([string]$sysInfo.SerialNumber)) {
             [string]$sysInfo.SerialNumber
@@ -11738,8 +12515,26 @@ try {
         Write-Host ""
 
         if (-not $script:ContinuationActive) {
+            $policySnapshotReady = $true
+            $policySnapshotStart = Get-Date
+            if ($script:WindowsUpdatePolicy.ADMXSnapshot -and ($RepairWindowsUpdate -or $BypassWSUS)) {
+                $policySnapshot = Invoke-WindowsPolicySnapshot -DryRunMode ([bool]$DryRun)
+                $policySnapshotReady = [bool]$policySnapshot.Success
+                [void](Add-StageResult (ConvertTo-StageResult -Name "WindowsPolicySnapshot" `
+                    -Provider "Windows Update ADMX" -Result @{ Success = $policySnapshot.Success; Message = $policySnapshot.Reason; Evidence = @($policySnapshot.Path) } `
+                    -StartedAt $policySnapshotStart))
+                if (-not $policySnapshotReady) {
+                    $script:ExitCode = 2
+                    Write-Log $policySnapshot.Reason "ERROR"
+                }
+            }
             $repairStart = Get-Date
-            if ($RepairWindowsUpdate -and -not $servicingCapability.Supported) {
+            if (($RepairWindowsUpdate -or $BypassWSUS) -and -not $policySnapshotReady) {
+                if ($RepairWindowsUpdate) {
+                    [void](Add-StageResult (New-StageResult -Name "WindowsUpdateRepair" -Provider "Windows servicing" `
+                        -Status "Skipped" -Skipped 1 -Message "Windows Update component repair was blocked because the ADMX snapshot failed" -StartedAt $repairStart))
+                }
+            } elseif ($RepairWindowsUpdate -and -not $servicingCapability.Supported) {
                 [void](Add-StageResult (New-StageResult -Name "WindowsUpdateRepair" `
                     -Provider "Windows servicing" -Status "Skipped" -Skipped 1 `
                     -Message $servicingCapability.Reason -StartedAt $repairStart))
@@ -11757,7 +12552,10 @@ try {
             }
 
             $wsusStart = Get-Date
-            if ($BypassWSUS -and -not $windowsCapability.Supported) {
+            if ($BypassWSUS -and -not $policySnapshotReady) {
+                [void](Add-StageResult (New-StageResult -Name "WSUSBypass" -Provider "Windows Update policy" `
+                    -Status "Skipped" -Skipped 1 -Message "WSUS bypass was blocked because the ADMX snapshot failed" -StartedAt $wsusStart))
+            } elseif ($BypassWSUS -and -not $windowsCapability.Supported) {
                 [void](Add-StageResult (New-StageResult -Name "WSUSBypass" `
                     -Provider "Windows Update policy" -Status "Skipped" -Skipped 1 `
                     -Message $windowsCapability.Reason -StartedAt $wsusStart))
@@ -11920,11 +12718,32 @@ try {
                 if ($wingetStage.Status -in @("Failed", "Partial")) { $script:ExitCode = 2 }
                 Write-Host ""
             }
-            if (-not (Set-ContinuationCursor -StageCursor "Cleanup")) {
+            if (-not (Set-ContinuationCursor -StageCursor "PackageManagers")) {
                 throw "Failed to persist continuation cursor after WinGet"
             }
         } else {
             Write-Log "WinGet stage already completed before continuation resumed" "INFO"
+        }
+
+        if (Test-ShouldRunContinuationStage -Stage "PackageManagers") {
+            $packageStart = Get-Date
+            if ($SkipWinget) {
+                [void](Add-StageResult (New-StageResult -Name "PackageManagers" -Provider "Chocolatey/Scoop/StoreEdgeFD/WSL" `
+                    -Status "Skipped" -Skipped 1 -Message "Additional package managers skipped with -SkipWinget" -StartedAt $packageStart))
+            } else {
+                $packageResult = Invoke-PackageManagerUpgrades
+                $packageStage = ConvertTo-StageResult -Name "PackageManagers" `
+                    -Provider "Chocolatey/Scoop/StoreEdgeFD/WSL" -Result $packageResult `
+                    -ItemNames @($packageResult.Items | ForEach-Object { [string]$_.Name }) -StartedAt $packageStart
+                [void](Add-StageResult $packageStage)
+                if ($packageStage.Status -in @("Failed", "Partial")) { $script:ExitCode = 2 }
+                Write-Host ""
+            }
+            if (-not (Set-ContinuationCursor -StageCursor "Cleanup")) {
+                throw "Failed to persist continuation cursor after package managers"
+            }
+        } else {
+            Write-Log "Package manager stage already completed before continuation resumed" "INFO"
         }
 
         if (Test-ShouldRunContinuationStage -Stage "Cleanup") {

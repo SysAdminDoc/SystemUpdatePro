@@ -168,6 +168,25 @@ BeforeAll {
         "Restore-RegistryValueSnapshot",
         "Invoke-ComponentCleanup",
         "Invoke-WindowsUpdate",
+        "Get-WindowsUpdatePolicy",
+        "Get-WindowsUpdateItemIdentity",
+        "Test-WindowsUpdateItemPolicy",
+        "Get-WindowsUpdatePlan",
+        "Test-WindowsUpdatePrestageDocument",
+        "Get-WindowsUpdatePrestagePath",
+        "Get-WindowsUpdatePrestagePlan",
+        "Save-WindowsUpdatePrestagePlan",
+        "Clear-WindowsUpdatePrestagePlan",
+        "Get-WindowsPolicySnapshot",
+        "Save-WindowsPolicySnapshot",
+        "Invoke-WindowsPolicySnapshot",
+        "Invoke-WindowsUpdateCatalogFallback",
+        "Get-PackageManagerAvailability",
+        "Get-WingetStoreSourceAvailability",
+        "Invoke-WingetStoreUpgrade",
+        "Get-WSLPackageManagerPlan",
+        "Invoke-WSLPackageManagerUpdates",
+        "Invoke-PackageManagerUpgrades",
         "New-HTMLReport",
         "Initialize-EventLog",
         "Write-EventLogEntry",
@@ -241,7 +260,7 @@ BeforeAll {
         $script:OEMUpdates = [System.Collections.ArrayList]::new()
         $script:WindowsUpdates = [System.Collections.ArrayList]::new()
         $script:WingetUpdates = [System.Collections.ArrayList]::new()
-        $script:StateSchemaVersion = 5
+        $script:StateSchemaVersion = 6
         $script:MaxContinuationAttempts = 3
         $script:RunStartedAt = Get-Date
         $stateTestDirectory = Join-Path $TestDrive ([guid]::NewGuid().ToString("N"))
@@ -265,12 +284,16 @@ BeforeAll {
         $script:AllowMeteredNetwork = $false
         $script:PolicyPath = ""
         $script:RolloutPolicyPath = ""
+        $script:FeatureDeferralDays = 0
+        $script:SecurityOnly = $false
+        $script:PreStage = $false
         $script:DependencyReadiness = $null
         $script:DownloadPolicy = $null
         $script:CurrentSystemInfo = $null
         $script:WingetScopeResults = @()
         $script:RolloutDecision = $null
         $script:PackagePolicy = $null
+        $script:WindowsUpdatePolicy = $null
         $script:AcquisitionManifestVersion = 1
         $script:AcquisitionManifest = Get-AcquisitionManifest
         $script:AcquisitionProvenance = [System.Collections.ArrayList]::new()
@@ -541,6 +564,76 @@ Describe "Additional OEM and GPU provider plans" {
         $result.Skipped | Should -Be 1
         $result.Items[0].Status | Should -Be "Skipped"
         Should -Invoke Get-AdditionalOEMProviderPlan -Times 1 -Exactly
+    }
+}
+
+Describe "Windows Update policy and package-manager planning" {
+    BeforeEach {
+        Initialize-SystemUpdateProTestState
+        Mock Write-Log {}
+    }
+
+    It "defers a recent feature update and blocks drivers unless explicitly allowed" {
+        $script:FeatureDeferralDays = 30
+        $policy = Get-WindowsUpdatePolicy
+        $feature = [PSCustomObject]@{
+            Title = "Feature Update to Windows 11"
+            Categories = @([PSCustomObject]@{ Name = "Feature Packs" })
+            ReleaseDate = (Get-Date).AddDays(-2)
+            Identity = [PSCustomObject]@{ UpdateID = "feature-1" }
+        }
+        $driver = [PSCustomObject]@{
+            Title = "NVIDIA display driver"
+            Categories = @([PSCustomObject]@{ Name = "Drivers" })
+            Identity = [PSCustomObject]@{ UpdateID = "driver-1" }
+        }
+
+        (Test-WindowsUpdateItemPolicy -Item $feature -Policy $policy).Status | Should -Be "Deferred"
+        (Test-WindowsUpdateItemPolicy -Item $driver -Policy $policy).Status | Should -Be "Blocked"
+        $policy.AllowFeatureUpdates | Should -BeTrue
+    }
+
+    It "honors wildcard driver allow and deny rules" {
+        $policy = [PSCustomObject]@{
+            FeatureDeferralDays = 0; SecurityOnly = $false; AllowFeatureUpdates = $false
+            DriverAllow = @("NVIDIA*"); DriverDeny = @("*Preview*")
+        }
+        $allowed = [PSCustomObject]@{ Title = "NVIDIA display driver"; Categories = @(@{ Name = "Drivers" }); Identity = @{ UpdateID = "nvidia-1" } }
+        $denied = [PSCustomObject]@{ Title = "NVIDIA Preview driver"; Categories = @(@{ Name = "Drivers" }); Identity = @{ UpdateID = "nvidia-2" } }
+
+        (Test-WindowsUpdateItemPolicy -Item $allowed -Policy $policy).Status | Should -Be "Allowed"
+        (Test-WindowsUpdateItemPolicy -Item $denied -Policy $policy).Status | Should -Be "Blocked"
+    }
+
+    It "keeps pre-stage persistence out of dry-run state" {
+        $script:DryRun = [switch]$true
+        $saved = Save-WindowsUpdatePrestagePlan -Items @(@{ Id = "KB5000001"; Title = "Security update" })
+
+        $saved.Success | Should -BeTrue
+        $saved.Persisted | Should -BeFalse
+        Test-Path -LiteralPath $saved.Path | Should -BeFalse
+    }
+
+    It "uses the Microsoft catalog as a bounded dry-run fallback query" {
+        $script:DryRun = [switch]$true
+        Mock Invoke-WebRequest { [PSCustomObject]@{ Content = "catalog response"; RawContent = "catalog response" } }
+        $result = Invoke-WindowsUpdateCatalogFallback -Items @([PSCustomObject]@{
+            Title = "Security Update KB5000001"; KB = @("KB5000001")
+        })
+
+        $result.Success | Should -BeTrue
+        $result.Available | Should -Be 1
+        $result.Items[0].Status | Should -Be "Available"
+        Should -Invoke Invoke-WebRequest -Times 1 -Exactly
+    }
+
+    It "reports optional package managers without inventing installed coverage" {
+        $availability = @(Get-PackageManagerAvailability)
+
+        @($availability).Count | Should -Be 2
+        $availability.Name | Should -Contain "Chocolatey"
+        $availability.Name | Should -Contain "Scoop"
+        $availability.Status | Should -Not -Contain "Installed"
     }
 }
 
@@ -1032,7 +1125,7 @@ Describe "Protected local evidence store" {
             Should -Be 1
     }
 
-    It "migrates a v3 continuation state through v5 with evidence and secret-source defaults" {
+    It "migrates a v3 continuation state through v6 with evidence and secret-source defaults" {
         $legacy = New-ContinuationState -StageCursor "WindowsUpdate" `
             -ScriptPath $script:SourceScriptPath
         $legacy.SchemaVersion = 3
@@ -1045,14 +1138,14 @@ Describe "Protected local evidence store" {
 
         $loaded = Get-State
 
-        $loaded.SchemaVersion | Should -Be 5
+        $loaded.SchemaVersion | Should -Be 6
         $loaded.Parameters.EvidenceMaxSizeMB | Should -Be 512
         $loaded.Parameters.RedactionMode | Should -Be "SecretsAndSerials"
         $loaded.Parameters.WebhookSecretReference | Should -Be ""
         $loaded.ResolvedWebhookUrl | Should -Be "https://example.invalid/legacy-secret"
         $loaded.Contains("_MigrationSourceSchema") | Should -BeFalse
         ((Get-Content -LiteralPath $script:StateFile -Raw | ConvertFrom-Json).SchemaVersion) |
-            Should -Be 5
+            Should -Be 6
     }
 
     It "migrates and redacts legacy history without leaving sensitive backup data" {
@@ -1545,10 +1638,10 @@ Describe "PowerShell 5.1 continuation state machine" {
         if (-not $secondSave) { throw "Second atomic save failed: $script:LastStateError" }
         $loaded = Get-State
 
-        $loaded.SchemaVersion | Should -Be 5
+        $loaded.SchemaVersion | Should -Be 6
         $loaded.Phase | Should -Be "AwaitingReboot"
         $loaded.RunId | Should -Be "11111111-1111-1111-1111-111111111111"
-        $loaded.Parameters.Count | Should -Be 30
+        $loaded.Parameters.Count | Should -Be 33
         $loaded.AcquisitionProvenance.Count | Should -Be 1
         $loaded.AcquisitionProvenance[0].Name | Should -Be "LSUClient"
         $loaded.Parameters.SkipOEM | Should -BeTrue
