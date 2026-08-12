@@ -62,6 +62,7 @@ SystemUpdatePro is a fully automated, self-healing PowerShell script that handle
 - **Evidence Retention**: Applies age and total-size limits across logs, transcripts, reports, OEM output, quarantine files, and driver backups
 - **HTML Reports**: Responsive operations-dashboard report with update channels, dependency provenance, retention evidence, device profile, exceptions, and print styles
 - **Webhook Notifications**: Send a versioned, idempotent completion contract to Slack, Teams Workflows/Adaptive Cards, legacy Teams connectors, or a generic HTTPS endpoint with durable retry evidence
+- **Observability Contracts**: Includes Azure Monitor/Sentinel-friendly webhook data, an atomic Prometheus textfile at `C:\ProgramData\SystemUpdatePro\metrics.prom`, and parseable XML payloads in Application event log messages
 - **Update History**: Schema-versioned JSON history with stage/item outcomes, provider codes, platform/provider capabilities, dependency provenance, and evidence-delivery status
 
 ---
@@ -312,7 +313,7 @@ Preflight records the capability schema, OS build/edition, installation type, ar
 
 ## Event Log Integration
 
-SystemUpdatePro writes to the Windows Application event log under source **"SystemUpdatePro"**:
+SystemUpdatePro writes structured XML payloads to the Windows Application event log under source **"SystemUpdatePro"**. The same run correlation, stage, and aggregate metrics are available in webhook payloads and the Prometheus textfile:
 
 | Event ID | Meaning |
 |----------|---------|

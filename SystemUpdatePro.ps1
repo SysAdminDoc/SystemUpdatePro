@@ -1172,7 +1172,12 @@ function Write-Log {
         $displayMsg = "[DRY RUN] $displayMsg"
     }
 
-    Write-Host $displayMsg -ForegroundColor $colors[$Level]
+    $consoleColor = Get-ConsoleColorCapability
+    if ($consoleColor.SupportsColor) {
+        Write-Host $displayMsg -ForegroundColor $colors[$Level]
+    } else {
+        Write-Host $displayMsg
+    }
 
     # Track warnings and errors
     if ($Level -eq "WARNING") { [void]$script:Warnings.Add($safeMessage) }
@@ -1524,6 +1529,7 @@ function New-RunData {
         WindowsUpdatePolicy = $script:WindowsUpdatePolicy
         MaintenanceDecision = $script:MaintenanceDecision
         PowerPlanState = $script:PowerPlanState
+        Metrics = @{}
         EvidenceDelivery = @{}
     }
 }
@@ -2964,6 +2970,7 @@ function Save-UpdateHistory {
             windows_update_policy = $RunData.WindowsUpdatePolicy
             maintenance_decision = $RunData.MaintenanceDecision
             power_plan_state = $RunData.PowerPlanState
+            metrics = $RunData.Metrics
             evidence_delivery = $RunData.EvidenceDelivery
             parameters        = Protect-EvidenceObject -InputObject (
                 Get-EffectiveRunParameter
@@ -10750,6 +10757,128 @@ function Get-WebhookEvidenceUri {
     return ""
 }
 
+function New-AzureMonitorEvent {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSUseShouldProcessForStateChangingFunctions", "", Justification = "Creates an in-memory Azure Monitor/Sentinel event contract.")]
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$RunData
+    )
+    $completedAt = [string](Get-ResultValue -Result $RunData -Names @("CompletedAt", "completed_at") -Default (Get-Date).ToUniversalTime().ToString("o"))
+    return [ordered]@{
+        time = $completedAt
+        resourceId = "SystemUpdatePro/$env:COMPUTERNAME"
+        category = "SystemUpdatePro"
+        operationName = "system_update.completed"
+        resultType = [string]$RunData.Status
+        resultSignature = [string]$RunData.ExitCode
+        correlationId = [string]$RunData.RunId
+        dataVersion = "1.0"
+        properties = [ordered]@{
+            run_id = [string]$RunData.RunId
+            hostname = [string]$env:COMPUTERNAME
+            status = [string]$RunData.Status
+            dry_run = [bool]$DryRun
+            exit_code = [int]$RunData.ExitCode
+            total_installed = [int]$RunData.TotalInstalled
+            total_available = [int]$RunData.TotalAvailable
+            total_failed = [int]$RunData.TotalFailed
+            reboot_required = [bool]$RunData.RebootRequired
+            duration_seconds = [int]$RunData.DurationSeconds
+            stages = @($RunData.Stages)
+            errors = @($RunData.Errors)
+            warnings = @($RunData.Warnings)
+        }
+    }
+}
+
+function New-StructuredEventLogXml {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSUseShouldProcessForStateChangingFunctions", "", Justification = "Creates an in-memory structured event payload.")]
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$RunData
+    )
+    try {
+        $document = New-Object System.Xml.XmlDocument
+        $root = $document.CreateElement("SystemUpdateProEvent")
+        [void]$document.AppendChild($root)
+        foreach ($field in @(
+            @{ Name = "SchemaVersion"; Value = "1" },
+            @{ Name = "RunId"; Value = [string]$RunData.RunId },
+            @{ Name = "Status"; Value = [string]$RunData.Status },
+            @{ Name = "ExitCode"; Value = [string]$RunData.ExitCode },
+            @{ Name = "DryRun"; Value = [string][bool]$DryRun },
+            @{ Name = "TotalInstalled"; Value = [string]$RunData.TotalInstalled },
+            @{ Name = "TotalAvailable"; Value = [string]$RunData.TotalAvailable },
+            @{ Name = "TotalFailed"; Value = [string]$RunData.TotalFailed },
+            @{ Name = "RebootRequired"; Value = [string]$RunData.RebootRequired }
+        )) {
+            $node = $document.CreateElement($field.Name)
+            $node.InnerText = [string]$field.Value
+            [void]$root.AppendChild($node)
+        }
+        $stagesNode = $document.CreateElement("Stages")
+        foreach ($stage in @($RunData.Stages)) {
+            $stageNode = $document.CreateElement("Stage")
+            foreach ($field in @("Name", "Provider", "Status", "Attempted", "Available", "Installed", "Failed", "Skipped")) {
+                $attribute = $document.CreateAttribute($field)
+                $attribute.Value = [string](Get-ResultValue -Result $stage -Names @($field) -Default "")
+                [void]$stageNode.Attributes.Append($attribute)
+            }
+            [void]$stagesNode.AppendChild($stageNode)
+        }
+        [void]$root.AppendChild($stagesNode)
+        return $document.OuterXml
+    } catch {
+        return ""
+    }
+}
+
+function Write-PrometheusMetrics {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSUseShouldProcessForStateChangingFunctions", "", Justification = "Writes an explicitly scoped Prometheus textfile artifact.")]
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$RunData,
+        [string]$Path = (Join-Path $script:DataPath "metrics.prom"),
+        [bool]$DryRunMode = [bool]$script:DryRun
+    )
+    $result = [ordered]@{ Success = $false; Persisted = $false; Path = $Path; Reason = "" }
+    if ($DryRunMode) {
+        $result.Success = $true
+        $result.Reason = "Dry run did not persist Prometheus metrics"
+        return [PSCustomObject]$result
+    }
+    try {
+        $root = [IO.Path]::GetFullPath($script:DataPath).TrimEnd("\", "/")
+        $target = [IO.Path]::GetFullPath($Path).TrimEnd("\", "/")
+        if (-not $target.StartsWith("$root$([IO.Path]::DirectorySeparatorChar)", [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Prometheus path must remain under the protected data directory"
+        }
+        $statusValue = if ([int]$RunData.ExitCode -le 1) { 1 } else { 0 }
+        $labels = 'computer="' + ($env:COMPUTERNAME -replace '[^A-Za-z0-9_.-]', '_') + '"'
+        $lines = @(
+            "# HELP systemupdatepro_run_success Whether the latest run completed without a failure.",
+            "# TYPE systemupdatepro_run_success gauge",
+            "systemupdatepro_run_success{$labels} $statusValue",
+            "# HELP systemupdatepro_updates_installed Updates installed by the latest run.",
+            "# TYPE systemupdatepro_updates_installed gauge",
+            "systemupdatepro_updates_installed{$labels} $([int]$RunData.TotalInstalled)",
+            "# HELP systemupdatepro_updates_available Updates discovered by the latest run.",
+            "# TYPE systemupdatepro_updates_available gauge",
+            "systemupdatepro_updates_available{$labels} $([int]$RunData.TotalAvailable)",
+            "# HELP systemupdatepro_updates_failed Updates that failed in the latest run.",
+            "# TYPE systemupdatepro_updates_failed gauge",
+            "systemupdatepro_updates_failed{$labels} $([int]$RunData.TotalFailed)",
+            "# HELP systemupdatepro_reboot_required Whether the latest run requires a reboot.",
+            "# TYPE systemupdatepro_reboot_required gauge",
+            "systemupdatepro_reboot_required{$labels} $([int][bool]$RunData.RebootRequired)"
+        )
+        if (-not (Write-ProtectedAtomicFile -Path $target -Content (($lines -join "`r`n") + "`r`n") -KeepLastKnownGood:$true)) {
+            throw $script:LastEvidenceWriteError
+        }
+        $result.Success = $true; $result.Persisted = $true; $result.Reason = "Prometheus textfile written atomically"
+    } catch {
+        $result.Reason = "Prometheus textfile failed: $($_.Exception.Message)"
+    }
+    return [PSCustomObject]$result
+}
+
 function New-WebhookPayload {
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSUseShouldProcessForStateChangingFunctions", "", Justification = "Creates an in-memory webhook contract only.")]
     param(
@@ -10814,6 +10943,8 @@ function New-WebhookPayload {
         windows_update_policy = $RunData.WindowsUpdatePolicy
         maintenance_decision = $RunData.MaintenanceDecision
         power_plan_state = $RunData.PowerPlanState
+        metrics = $RunData.Metrics
+        azure_monitor_event = New-AzureMonitorEvent -RunData $RunData
     })
 }
 
@@ -11260,16 +11391,10 @@ function Invoke-TerminalEvidence {
 
     try {
         [void](Initialize-EventLog)
-        $eventMessage = @"
-SystemUpdatePro completed$(if ($DryRun) { ' (DRY RUN)' })
-Run ID: $($RunData.RunId)
-Status: $($RunData.Status)
-System: $($SysInfo.Manufacturer) $($SysInfo.Model)
-Updates $(if ($DryRun) { 'Available' } else { 'Applied' }): $(if ($DryRun) { $RunData.TotalAvailable } else { $RunData.TotalInstalled })
-Updates Failed: $($RunData.TotalFailed)
-Reboot Required: $($RunData.RebootRequired)
-Duration: $($RunData.DurationSeconds) seconds
-"@
+        $eventMessage = New-StructuredEventLogXml -RunData $RunData
+        if ([string]::IsNullOrWhiteSpace($eventMessage)) {
+            $eventMessage = "SystemUpdatePro completed; Run ID: $($RunData.RunId); Status: $($RunData.Status); Exit code: $($RunData.ExitCode)"
+        }
         $eventType = if ($RunData.ExitCode -eq 0) { "Information" } elseif ($RunData.ExitCode -le 2) { "Warning" } else { "Error" }
         if (Write-EventLogEntry -Message $eventMessage -EntryType $eventType -EventId (1000 + $RunData.ExitCode)) {
             $delivery.Event.Status = "Succeeded"
@@ -13308,6 +13433,7 @@ try {
 
     $completedAt = Get-Date
     $runData = New-RunData -StartedAt $scriptStart -CompletedAt $completedAt -RequestedExitCode $script:ExitCode
+    $runData.Metrics = Write-PrometheusMetrics -RunData $runData -DryRunMode ([bool]$DryRun)
     $script:ExitCode = $runData.ExitCode
     $script:RebootRequired = $runData.RebootRequired
     $script:UpdatesInstalled = $runData.TotalInstalled

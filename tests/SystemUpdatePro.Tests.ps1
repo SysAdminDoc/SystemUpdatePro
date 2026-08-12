@@ -201,6 +201,9 @@ BeforeAll {
         "New-HTMLReport",
         "Initialize-EventLog",
         "Write-EventLogEntry",
+        "New-AzureMonitorEvent",
+        "New-StructuredEventLogXml",
+        "Write-PrometheusMetrics",
         "Get-WebhookIdempotencyKey",
         "Get-WebhookEvidenceUri",
         "New-WebhookPayload",
@@ -2529,6 +2532,44 @@ Describe "Explicit component cleanup safety" {
 
         $report | Should -Match "Component rollback"
         $report | Should -Match "Disabled by irreversible /ResetBase"
+    }
+}
+
+Describe "Observability contracts" {
+    BeforeEach {
+        Initialize-SystemUpdateProTestState
+    }
+
+    It "emits an Azure Monitor event with run correlation and stage data" {
+        [void]$script:StageResults.Add((New-StageResult -Name "WindowsUpdate" -Provider "WUA" -Status "Succeeded" -Installed 2))
+        $run = New-RunData -StartedAt (Get-Date).AddMinutes(-1) -CompletedAt (Get-Date)
+        $event = New-AzureMonitorEvent -RunData $run
+
+        $event.operationName | Should -Be "system_update.completed"
+        $event.correlationId | Should -Be $script:RunId
+        $event.properties.total_installed | Should -Be 2
+        @($event.properties.stages).Count | Should -Be 1
+    }
+
+    It "builds parseable XML event payloads with stage attributes" {
+        [void]$script:StageResults.Add((New-StageResult -Name "Winget" -Provider "WinGet" -Status "Succeeded" -Installed 1))
+        $run = New-RunData -StartedAt (Get-Date).AddMinutes(-1) -CompletedAt (Get-Date)
+        $xmlText = New-StructuredEventLogXml -RunData $run
+        $xml = [xml]$xmlText
+
+        $xml.SystemUpdateProEvent.RunId | Should -Be $script:RunId
+        $xml.SystemUpdateProEvent.Stages.Stage.Name | Should -Be "Winget"
+        $xml.SystemUpdateProEvent.Stages.Stage.Installed | Should -Be "1"
+    }
+
+    It "does not persist Prometheus metrics during a dry run" {
+        $script:DryRun = [switch]$true
+        $run = New-RunData -StartedAt (Get-Date).AddMinutes(-1) -CompletedAt (Get-Date)
+        $metrics = Write-PrometheusMetrics -RunData $run -Path (Join-Path $script:DataPath "metrics.prom") -DryRunMode $true
+
+        $metrics.Success | Should -BeTrue
+        $metrics.Persisted | Should -BeFalse
+        Test-Path -LiteralPath $metrics.Path | Should -BeFalse
     }
 }
 
