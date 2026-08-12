@@ -54,6 +54,7 @@ SystemUpdatePro is a fully automated, self-healing PowerShell script that handle
 - **Package Manager Sources**: Auto-detects Chocolatey and Scoop, checks the StoreEdgeFD-backed Microsoft Store source, and limits Flatpak/Snap updates to WSL GUI environments
 - **Execution Controls**: Honors protected or Intune-detected maintenance windows, records deterministic cluster reboot coordination, temporarily selects High performance power mode and restores the original scheme, and exposes stage progress
 - **Dry-Run Contract**: Tracks Windows Update policy, WSUS, pre-stage, lock, and power-plan state before and after preview runs and fails closed if any tracked persistent state changes
+- **Servicing Health Gates**: Records bounded CBS.log evidence plus DISM `/CheckHealth` and SFC `/verifyonly` before and after work; only a healthy-to-degraded transition fails the run
 
 ### Enterprise Integration
 - **Event Log**: Writes to Windows Application log for RMM/SIEM visibility
@@ -150,6 +151,8 @@ cd SystemUpdatePro
 ```
 
 Driver exports use DISM `/Online /Export-Driver` when available and are retained under `C:\ProgramData\SystemUpdatePro\DriverBackups`. `-RollbackDrivers` selects the newest `Backup_yyyyMMdd_HHmmss` directory and invokes DISM `/Online /Add-Driver /Recurse`; use `-DryRun -RollbackDrivers` to inspect the plan without changing the driver store.
+
+Every normal run records a pre-run servicing-health baseline. The post-run check is compared with that baseline and fails the run only when a previously healthy servicing state becomes degraded; an already-degraded or incomplete baseline is retained as evidence without blocking unrelated updates.
 
 ### Webhook Notifications
 ```powershell
@@ -358,7 +361,7 @@ Get-EventLog -LogName Application -Source "SystemUpdatePro" -Newest 10
 | `C:\ProgramData\SystemUpdatePro\webhook.json` | Optional operator-provisioned webhook config (SYSTEM/Administrators ACL required) |
 | `C:\ProgramData\SystemUpdatePro\HPIA\` | HP Image Assistant installation |
 
-Continuation state is atomically replaced and restricted to SYSTEM and Administrators. It preserves the run ID, effective parameters, result history, attempt count, next stage cursor, webhook reference, and resolved endpoint needed after reboot; task command lines contain only the script path. Schema v3/v4 state migrates to v5 with explicit evidence-policy and secret-source defaults. Invalid, incompatible, or broadly writable state is quarantined instead of being executed. A continuation can resume at most three times, and terminal success or failure removes its one-shot task and active state.
+Continuation state is atomically replaced and restricted to SYSTEM and Administrators. It preserves the run ID, effective parameters, result history, attempt count, next stage cursor, webhook reference, resolved endpoint, and pre-run health baseline needed after reboot; task command lines contain only the script path. Older state schemas migrate forward with explicit evidence-policy, secret-source, interactive-mode, and rollback defaults. Invalid, incompatible, or broadly writable state is quarantined instead of being executed. A continuation can resume at most three times, and terminal success or failure removes its one-shot task and active state.
 
 Privileged mutations use a separate atomic journal with the same protected access model. WSUS policy, service status/startup mode, cleanmgr flags, update-cache directory swaps, and continuation-task replacement are verified and restored in reverse order. An interrupted journal is recovered before a new run can mutate the machine; recovery failure stops the run.
 

@@ -134,6 +134,8 @@ BeforeAll {
         "Get-LatestDriverBackupPath",
         "Invoke-DriverRollback",
         "Invoke-DriverBackup",
+        "Invoke-SystemHealthCheck",
+        "Compare-SystemHealthRegression",
         "Get-WingetScopePlan",
         "ConvertFrom-WingetPackageOutput",
         "Get-WingetScopeInventory",
@@ -308,6 +310,9 @@ BeforeAll {
         $script:PreStage = $false
         $script:Interactive = $false
         $script:RollbackDrivers = $false
+        $script:PreHealthCheck = $null
+        $script:PostHealthCheck = $null
+        $script:HealthRegression = $null
         $script:DependencyReadiness = $null
         $script:DownloadPolicy = $null
         $script:CurrentSystemInfo = $null
@@ -2612,6 +2617,57 @@ Describe "Restore point and driver rollback safety" {
         Should -Invoke Invoke-CapturedCommand -Times 1 -Exactly -ParameterFilter {
             $ArgumentList -contains "/Online" -and $ArgumentList -contains "/Add-Driver"
         }
+    }
+}
+
+Describe "System health checks" {
+    BeforeEach {
+        Initialize-SystemUpdateProTestState
+        Mock Get-Command {
+            [PSCustomObject]@{ Source = $Name }
+        } -ParameterFilter { $Name -in @("dism.exe", "sfc.exe") }
+        Mock Test-Path { $true } -ParameterFilter { [string]$LiteralPath -match "(?i)(dism|sfc)\.exe$" }
+        $cbsDirectory = Join-Path $script:WindowsRoot "Logs\CBS"
+        New-Item -ItemType Directory -Path $cbsDirectory -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $cbsDirectory "CBS.log") -Value "CBS health baseline"
+    }
+
+    It "reports a healthy baseline when DISM and SFC pass" {
+        Mock Invoke-CapturedCommand {
+            [PSCustomObject]@{ ExitCode = 0; StandardOutput = "healthy"; StandardError = ""; Error = "" }
+        }
+
+        $result = Invoke-SystemHealthCheck -Phase "PreRun"
+
+        $result.Status | Should -Be "Healthy"
+        $result.Commands.Count | Should -Be 2
+        $result.Failed | Should -Be 0
+    }
+
+    It "marks a servicing baseline degraded when SFC reports corruption" {
+        Mock Invoke-CapturedCommand {
+            if ($FilePath -eq "sfc.exe") {
+                [PSCustomObject]@{ ExitCode = 0; StandardOutput = "Windows Resource Protection found corrupt files"; StandardError = ""; Error = "" }
+            } else {
+                [PSCustomObject]@{ ExitCode = 0; StandardOutput = "No component store corruption detected"; StandardError = ""; Error = "" }
+            }
+        }
+
+        $result = Invoke-SystemHealthCheck -Phase "PreRun"
+
+        $result.Status | Should -Be "Degraded"
+        $result.Failed | Should -Be 1
+    }
+
+    It "fails only when post-run health is worse than a healthy pre-run baseline" {
+        $comparison = Compare-SystemHealthRegression `
+            -Before @{ Status = "Healthy" } -After @{ Status = "Degraded" }
+
+        $comparison.Regressed | Should -BeTrue
+        $comparison.Status | Should -Be "Regressed"
+
+        (Compare-SystemHealthRegression -Before @{ Status = "Degraded" } -After @{ Status = "Degraded" }).Regressed |
+            Should -BeFalse
     }
 }
 

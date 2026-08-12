@@ -285,6 +285,9 @@ $script:RolloutPolicy = $null
 $script:WindowsUpdatePolicy = $null
 $script:MaintenanceDecision = $null
 $script:PowerPlanState = $null
+$script:PreHealthCheck = $null
+$script:PostHealthCheck = $null
+$script:HealthRegression = $null
 $script:DryRunMutationBaseline = $null
 $script:MaxRetries = [int]$MaxRetries
 $script:EvidenceMaxSizeMB = [int]$EvidenceMaxSizeMB
@@ -1534,6 +1537,11 @@ function New-RunData {
         WindowsUpdatePolicy = $script:WindowsUpdatePolicy
         MaintenanceDecision = $script:MaintenanceDecision
         PowerPlanState = $script:PowerPlanState
+        Health = [ordered]@{
+            PreRun = $script:PreHealthCheck
+            PostRun = $script:PostHealthCheck
+            Regression = $script:HealthRegression
+        }
         Metrics = @{}
         EvidenceDelivery = @{}
     }
@@ -1936,6 +1944,7 @@ function New-ContinuationState {
         WindowsUpdatePolicy = $script:WindowsUpdatePolicy
         MaintenanceDecision = $script:MaintenanceDecision
         PowerPlanState = $script:PowerPlanState
+        PreHealthCheck = $script:PreHealthCheck
         Errors         = @($script:Errors)
         Warnings       = @($script:Warnings)
     }
@@ -2023,6 +2032,9 @@ function Import-ContinuationState {
     $script:PowerPlanState = if ($State.Contains("PowerPlanState")) {
         ConvertTo-Hashtable -InputObject $State.PowerPlanState
     } else { $null }
+    $script:PreHealthCheck = if ($State.Contains("PreHealthCheck")) {
+        ConvertTo-Hashtable -InputObject $State.PreHealthCheck
+    } else { $null }
     $script:AcquisitionProvenance = [System.Collections.ArrayList]::new()
     foreach ($dependency in @($State.AcquisitionProvenance)) {
         [void]$script:AcquisitionProvenance.Add([PSCustomObject]$dependency)
@@ -2068,6 +2080,7 @@ function Set-ContinuationCursor {
     $script:ContinuationState.WindowsUpdatePolicy = $script:WindowsUpdatePolicy
     $script:ContinuationState.MaintenanceDecision = $script:MaintenanceDecision
     $script:ContinuationState.PowerPlanState = $script:PowerPlanState
+    $script:ContinuationState.PreHealthCheck = $script:PreHealthCheck
     $script:ContinuationState.Errors = @($script:Errors)
     $script:ContinuationState.Warnings = @($script:Warnings)
     $script:ContinuationState.Parameters = Get-EffectiveRunParameter
@@ -2984,6 +2997,7 @@ function Save-UpdateHistory {
             windows_update_policy = $RunData.WindowsUpdatePolicy
             maintenance_decision = $RunData.MaintenanceDecision
             power_plan_state = $RunData.PowerPlanState
+            health = $RunData.Health
             metrics = $RunData.Metrics
             evidence_delivery = $RunData.EvidenceDelivery
             parameters        = Protect-EvidenceObject -InputObject (
@@ -3354,6 +3368,137 @@ function Invoke-DriverBackup {
     } catch {
         Write-Log "Driver backup failed: $($_.Exception.Message)" "WARNING"
         return $null
+    }
+}
+
+# ============================================================================
+# SYSTEM HEALTH CHECKS
+# ============================================================================
+
+function Invoke-SystemHealthCheck {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSUseShouldProcessForStateChangingFunctions", "", Justification = "Runs read-only DISM, SFC, and bounded CBS evidence checks.")]
+    param(
+        [ValidateSet("PreRun", "PostRun")][string]$Phase = "PreRun",
+        [ValidateRange(1, 900)][int]$TimeoutSeconds = 120
+    )
+
+    $commands = [System.Collections.ArrayList]::new()
+    foreach ($definition in @(
+        @{ Name = "DISM"; File = "dism.exe"; Arguments = @("/Online", "/Cleanup-Image", "/CheckHealth") },
+        @{ Name = "SFC"; File = "sfc.exe"; Arguments = @("/verifyonly") }
+    )) {
+        $commandInfo = $null
+        try { $commandInfo = Get-Command -Name $definition.File -ErrorAction SilentlyContinue | Select-Object -First 1 } catch { }
+        $commandPath = if ($null -ne $commandInfo) {
+            if (-not [string]::IsNullOrWhiteSpace([string]$commandInfo.Source)) {
+                [string]$commandInfo.Source
+            } else { [string]$commandInfo.Path }
+        } else {
+            Join-Path $script:WindowsRoot ("System32\{0}" -f $definition.File)
+        }
+        if ([string]::IsNullOrWhiteSpace($commandPath) -or
+            -not (Test-Path -LiteralPath $commandPath -PathType Leaf)) {
+            [void]$commands.Add([PSCustomObject][ordered]@{
+                Name = $definition.Name; File = $definition.File; Status = "Unknown"
+                Success = $false; ExitCode = -1; Output = ""; Error = "Executable unavailable"
+            })
+            continue
+        }
+        try {
+            $commandResult = Invoke-CapturedCommand -FilePath $commandPath `
+                -ArgumentList $definition.Arguments -TimeoutSeconds $TimeoutSeconds
+            $exitCode = -1
+            try { $exitCode = [int]$commandResult.ExitCode } catch { }
+            $output = "$(Protect-EvidenceText -Text $commandResult.StandardOutput)`r`n$(Protect-EvidenceText -Text $commandResult.StandardError)"
+            $status = if ($exitCode -eq 0) { "Healthy" } else { "Degraded" }
+            if ($definition.Name -eq "SFC" -and $output -match "(?i)(found corrupt files|could not repair|integrity violations were found|repair service failed)") {
+                $status = "Degraded"
+            }
+            [void]$commands.Add([PSCustomObject][ordered]@{
+                Name = $definition.Name; File = $definition.File; Status = $status
+                Success = ($status -eq "Healthy"); ExitCode = $exitCode
+                Output = $output.Trim(); Error = [string]$commandResult.Error
+            })
+        } catch {
+            [void]$commands.Add([PSCustomObject][ordered]@{
+                Name = $definition.Name; File = $definition.File; Status = "Unknown"
+                Success = $false; ExitCode = -1; Output = ""
+                Error = Protect-EvidenceText -Text $_.Exception.Message
+            })
+        }
+    }
+
+    $cbsPath = Join-Path $script:WindowsRoot "Logs\CBS\CBS.log"
+    $cbs = [ordered]@{
+        Path = $cbsPath; Status = "Unknown"; ErrorCount = 0; Truncated = $false; Reason = "CBS.log was not available"
+    }
+    if (Test-Path -LiteralPath $cbsPath -PathType Leaf) {
+        $cbsRead = Read-BoundedEvidenceText -Path $cbsPath -MaximumBytes 1048576
+        if ($cbsRead.Success) {
+            $cbsText = [string]$cbsRead.Text
+            $cbsMatches = @([regex]::Matches($cbsText, "(?im)(cannot repair|repair.*failed|error 0x[0-9a-f]+|corrupt component)"))
+            $cbs.Status = if ($cbsMatches.Count -gt 0) { "Degraded" } else { "Healthy" }
+            $cbs.ErrorCount = $cbsMatches.Count
+            $cbs.Truncated = [bool]$cbsRead.Truncated
+            $cbs.Reason = if ($cbsMatches.Count -gt 0) {
+                "CBS.log contains $($cbsMatches.Count) bounded repair-error indicator(s)"
+            } else { "CBS.log contains no bounded repair-error indicators" }
+        } else {
+            $cbs.Reason = "CBS.log could not be read: $($cbsRead.Error)"
+        }
+    }
+
+    $degraded = @($commands | Where-Object { $_.Status -eq "Degraded" }).Count -gt 0 -or
+        $cbs.Status -eq "Degraded"
+    $unknown = @($commands | Where-Object { $_.Status -eq "Unknown" }).Count -gt 0 -or
+        $cbs.Status -eq "Unknown"
+    $overallStatus = if ($degraded) { "Degraded" } elseif ($unknown) { "Unknown" } else { "Healthy" }
+    $reason = switch ($overallStatus) {
+        "Healthy" { "$Phase health checks completed without a detected servicing-integrity problem" }
+        "Degraded" { "$Phase health checks detected a servicing-integrity problem" }
+        default { "$Phase health checks were incomplete because one or more evidence sources were unavailable" }
+    }
+    return [PSCustomObject][ordered]@{
+        SchemaVersion = 1
+        Phase = $Phase
+        Status = $overallStatus
+        Success = ($overallStatus -ne "Degraded")
+        Commands = @($commands)
+        CBS = [PSCustomObject]$cbs
+        Attempted = @($commands | Where-Object { $_.Status -ne "Unknown" }).Count
+        Failed = @($commands | Where-Object { $_.Status -eq "Degraded" }).Count + [int]($cbs.Status -eq "Degraded")
+        Skipped = @($commands | Where-Object { $_.Status -eq "Unknown" }).Count + [int]($cbs.Status -eq "Unknown")
+        Reason = $reason
+        Evidence = @(
+            $commands | ForEach-Object { "$($_.Name):$($_.Status):exit=$($_.ExitCode)" }
+            "CBS:$($cbs.Status):errors=$($cbs.ErrorCount):truncated=$($cbs.Truncated)"
+        )
+    }
+}
+
+function Compare-SystemHealthRegression {
+    param(
+        [AllowNull()][object]$Before,
+        [AllowNull()][object]$After
+    )
+
+    $beforeStatus = [string](Get-ResultValue -Result $Before -Names @("Status") -Default "Unknown")
+    $afterStatus = [string](Get-ResultValue -Result $After -Names @("Status") -Default "Unknown")
+    $regressed = $beforeStatus -eq "Healthy" -and $afterStatus -eq "Degraded"
+    $comparisonStatus = if ($regressed) { "Regressed" } elseif ($beforeStatus -eq "Healthy" -and $afterStatus -eq "Unknown") {
+        "Indeterminate"
+    } elseif ($afterStatus -eq "Healthy") { "Healthy" } else { "NotComparable" }
+    return [PSCustomObject][ordered]@{
+        SchemaVersion = 1
+        Before = $beforeStatus
+        After = $afterStatus
+        Regressed = $regressed
+        Status = $comparisonStatus
+        Reason = if ($regressed) {
+            "Post-run servicing health regressed from Healthy to Degraded"
+        } elseif ($comparisonStatus -eq "Indeterminate") {
+            "Post-run health could not be compared because the post-run check was incomplete"
+        } else { "No servicing health regression was established" }
     }
 }
 
@@ -11198,6 +11343,7 @@ function New-WebhookPayload {
         windows_update_policy = $RunData.WindowsUpdatePolicy
         maintenance_decision = $RunData.MaintenanceDecision
         power_plan_state = $RunData.PowerPlanState
+        health = $RunData.Health
         metrics = $RunData.Metrics
         azure_monitor_event = New-AzureMonitorEvent -RunData $RunData
     })
@@ -13258,6 +13404,22 @@ try {
         Write-Host ""
 
         if (-not $script:ContinuationActive) {
+            $preHealthStart = Get-Date
+            $script:PreHealthCheck = Invoke-SystemHealthCheck -Phase "PreRun" -TimeoutSeconds 120
+            $preHealthStatus = switch ([string]$script:PreHealthCheck.Status) {
+                "Healthy" { "Succeeded" }
+                "Unknown" { "Skipped" }
+                default { "Succeeded" }
+            }
+            if ($script:PreHealthCheck.Status -eq "Degraded") {
+                Write-Log "Pre-run health baseline is degraded; post-run comparison will only fail on a new regression" "WARNING"
+            }
+            [void](Add-StageResult (New-StageResult -Name "PreHealth" -Provider "DISM/SFC/CBS" `
+                -Status $preHealthStatus -Attempted ([int]$script:PreHealthCheck.Attempted) `
+                -Skipped ([int]$script:PreHealthCheck.Skipped) -Message ([string]$script:PreHealthCheck.Reason) `
+                -Items @($script:PreHealthCheck.Commands) -Evidence @($script:PreHealthCheck.Evidence) `
+                -StartedAt $preHealthStart))
+
             $restorePointStart = Get-Date
             $restorePointResult = Invoke-RestorePointIfNeeded -RunId $script:RunId `
                 -DryRunMode ([bool]$DryRun)
@@ -13726,6 +13888,41 @@ try {
             $message = "Dry-run mutation contract could not be verified: $($_.Exception.Message)"
             [void]$script:Errors.Add($message)
             $script:ExitCode = 3
+        }
+    }
+
+    if ($null -ne $script:PreHealthCheck) {
+        $postHealthStart = Get-Date
+        try {
+            $script:PostHealthCheck = Invoke-SystemHealthCheck -Phase "PostRun" -TimeoutSeconds 120
+            $script:HealthRegression = Compare-SystemHealthRegression `
+                -Before $script:PreHealthCheck -After $script:PostHealthCheck
+            $postHealthStatus = if ($script:HealthRegression.Regressed) {
+                "Failed"
+            } elseif ($script:PostHealthCheck.Status -eq "Unknown") {
+                "Skipped"
+            } else { "Succeeded" }
+            $postHealthFailed = if ($script:HealthRegression.Regressed) { 1 } else { 0 }
+            [void](Add-StageResult (New-StageResult -Name "PostHealth" -Provider "DISM/SFC/CBS" `
+                -Status $postHealthStatus -Attempted ([int]$script:PostHealthCheck.Attempted) `
+                -Failed $postHealthFailed -Skipped ([int]$script:PostHealthCheck.Skipped) `
+                -Message ([string]$script:HealthRegression.Reason) `
+                -Items @($script:PostHealthCheck.Commands) -Evidence @(
+                    $script:PostHealthCheck.Evidence + "before:$($script:HealthRegression.Before)" +
+                    "after:$($script:HealthRegression.After)"
+                ) -StartedAt $postHealthStart))
+            if ($script:HealthRegression.Regressed) {
+                $message = "Post-run health regression detected: $($script:PostHealthCheck.Reason)"
+                if (-not ($script:Errors -contains $message)) { [void]$script:Errors.Add($message) }
+                $script:ExitCode = 3
+            } elseif ($script:PostHealthCheck.Status -eq "Degraded") {
+                Write-Log "Post-run health remains degraded but no regression from the pre-run baseline was established" "WARNING"
+            }
+        } catch {
+            $message = "Post-run health check failed to complete: $($_.Exception.Message)"
+            [void](Add-StageResult (New-StageResult -Name "PostHealth" -Provider "DISM/SFC/CBS" `
+                -Status "Skipped" -Skipped 1 -Message $message -StartedAt $postHealthStart))
+            Write-Log $message "WARNING"
         }
     }
 
